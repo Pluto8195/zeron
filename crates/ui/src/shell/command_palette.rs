@@ -41,6 +41,8 @@ enum Entry {
     NewChat,
     NewProject,
     Settings,
+    Overview,
+    ImportSessionCanvasSessions,
     Theme(AppearanceMode),
     Chat(String),
 }
@@ -51,6 +53,11 @@ impl Entry {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
+            Self::Overview => Some(("Open overview", icons::WIDGET)),
+            Self::ImportSessionCanvasSessions => Some((
+                "Import all sessions from session_canvas",
+                icons::FOLDER_WITH_FILES,
+            )),
             Self::Theme(mode) => Some((
                 match mode {
                     AppearanceMode::System => "Switch to system theme",
@@ -74,6 +81,8 @@ fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
         Entry::NewChat,
         Entry::NewProject,
         Entry::Settings,
+        Entry::Overview,
+        Entry::ImportSessionCanvasSessions,
         Entry::Theme(if is_dark {
             AppearanceMode::Light
         } else {
@@ -194,6 +203,10 @@ impl Shell {
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
+            Entry::Overview => self.open_overview(cx),
+            Entry::ImportSessionCanvasSessions => {
+                self.bulk_import_session_canvas_sessions(cx)
+            }
             Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
@@ -542,6 +555,8 @@ mod tests {
                 Entry::NewChat,
                 Entry::NewProject,
                 Entry::Settings,
+                Entry::Overview,
+                Entry::ImportSessionCanvasSessions,
                 Entry::Theme(AppearanceMode::Light)
             ]
         );

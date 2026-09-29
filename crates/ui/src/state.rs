@@ -1699,8 +1699,22 @@ impl AppState {
     /// on any device — idle included — in pure recency order (status drives
     /// the dot, never the position; see [`sort_active`]).
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
+        self.overview_chats_with_archived(now, false)
+    }
+
+    /// [`Self::overview_chats`], optionally including archived rows too (the
+    /// multichat overview's "Show archived" toggle — matches the reference
+    /// `session_canvas` tool's own default-off `showArchived` behavior).
+    pub fn overview_chats_with_archived(
+        &self,
+        now: DateTime<Utc>,
+        include_archived: bool,
+    ) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
-            .visible_chats()
+            .chats
+            .iter()
+            .filter(|c| c.parent_chat_id.is_none())
+            .filter(|c| include_archived || !c.archived)
             .filter(|c| match c.space_id.as_deref() {
                 // Project-less sessions are first-class rows.
                 None => true,
@@ -3297,6 +3311,10 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            linked_pr_url: None,
+            linked_pr_source: None,
+            linked_ticket_id: None,
+            linked_ticket_source: None,
         }
     }
 

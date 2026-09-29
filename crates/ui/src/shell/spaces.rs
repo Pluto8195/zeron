@@ -1877,6 +1877,30 @@ impl Render for SidebarViewOptionsTooltip {
     }
 }
 
+struct SidebarOverviewTooltip;
+
+impl Render for SidebarOverviewTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let shortcut = if cfg!(target_os = "macos") {
+            "⌘⇧O"
+        } else {
+            "Ctrl+Shift+O"
+        };
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(crate::typography::ui_rems(11.0))
+            .text_color(theme.text)
+            .child(format!("Overview  {shortcut}"))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
     ByProject,
@@ -2054,7 +2078,7 @@ pub(super) struct RenameSpaceDialog {
 }
 
 /// Dot color for a chat's display status (tab dots + Sessions rows).
-pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Preset activity tone, not warning amber: running is routine.
         // Non-done statuses sit well below full
@@ -3801,6 +3825,41 @@ impl Shell {
             view_trigger
         };
 
+        // Multi-chat overview entry point — sits beside the view-options
+        // trigger since it's the other "how do I look at my chats" control.
+        // Same 29px glass-hover button idiom; lit while the overview is the
+        // current route.
+        let overview_active = self.is_overview_route();
+        let overview_trigger = div()
+            .id("sidebar-open-overview")
+            .role(gpui::Role::Button)
+            .aria_label("Open overview")
+            .size(px(29.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .bg(if overview_active {
+                theme.glass_hover()
+            } else {
+                theme.glass_hover().opacity(0.0)
+            })
+            .hover(|el| el.bg(theme.glass_hover()))
+            .on_click(cx.listener(|this, _, _, cx| this.open_overview(cx)))
+            .tooltip(|_, cx| cx.new(|_| SidebarOverviewTooltip).into())
+            .tooltip_show_delay(std::time::Duration::from_millis(350))
+            .child(
+                icon(icons::WIDGET)
+                    .size(px(15.0))
+                    .text_color(if overview_active {
+                        theme.text
+                    } else {
+                        theme.text_muted.opacity(0.6)
+                    }),
+            );
+
         div()
             .flex_none()
             .flex()
@@ -3811,6 +3870,7 @@ impl Shell {
             .pt(px(8.0))
             .pb(px(4.0))
             .child(trigger)
+            .child(overview_trigger)
             .child(view_trigger)
             .into_any_element()
     }
@@ -6345,6 +6405,10 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            linked_pr_url: None,
+            linked_pr_source: None,
+            linked_ticket_id: None,
+            linked_ticket_source: None,
         }
     }
 

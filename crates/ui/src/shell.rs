@@ -65,7 +65,7 @@ mod files_panel;
 mod project_icon;
 mod sidebar_pins;
 mod sidebar_sections;
-mod spaces;
+pub(crate) mod spaces;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
@@ -84,7 +84,8 @@ actions!(
         OpenSettings,
         NextSession,
         PrevSession,
-        ArchiveSession
+        ArchiveSession,
+        OpenOverview
     ]
 );
 
@@ -387,6 +388,9 @@ pub fn apply_keymap(
         // Fixed: ⌘K summons the command palette.
         // Pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), ToggleCommandPalette, None),
+        // Fixed: ⌘⇧O (Ctrl+Shift+O elsewhere) opens the multi-chat overview.
+        // Not (yet) a customizable `ShortcutId` — same tier as ⌘K above.
+        KeyBinding::new(&platform_combo("mod-shift-o"), OpenOverview, None),
         KeyBinding::new(
             &valid_or_default(&keymap.open_model_picker, "mod-/"),
             OpenModelPicker,
@@ -462,6 +466,8 @@ impl SettingsSection {
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+    /// Multi-chat overview (ticket 002): every chat at once, not one at a time.
+    Overview,
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
@@ -567,6 +573,7 @@ pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
     Settings(SettingsSection),
+    Overview,
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
@@ -1436,7 +1443,9 @@ impl Render for SidebarPane {
             let theme = Theme::of(cx).clone();
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
-                Route::Chat => shell.render_chat_sidebar(&theme, cx),
+                // Overview keeps the normal chat sidebar — clicking any other
+                // chat there is still the fastest way out of the overview.
+                Route::Chat | Route::Overview => shell.render_chat_sidebar(&theme, cx),
             }
         });
         div().size_full().child(inner).into_any_element()
@@ -1537,6 +1546,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    overview_page: Option<Entity<crate::overview::Overview>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
@@ -1620,6 +1630,11 @@ pub struct Shell {
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
+    /// The one-time session_canvas bulk-import migration stream, if running —
+    /// a dedicated field rather than reusing `mutate_task`/`import_task`
+    /// (those belong to unrelated single-call actions and the local→synced
+    /// wizard respectively) since this is its own long-running stream.
+    bulk_import_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
     runtime_change_error: Option<SharedString>,
@@ -1878,6 +1893,7 @@ impl Shell {
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
+            Route::Overview => NavEntry::Overview,
         });
         // Parent notifications carry presentation changes (session status,
         // elapsed labels, menus); sibling animation/caret ticks do not.
@@ -1936,6 +1952,7 @@ impl Shell {
             route,
             nav,
             devices_page: None,
+            overview_page: None,
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
@@ -1989,6 +2006,7 @@ impl Shell {
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
+            bulk_import_task: None,
             auth_task: None,
             runtime_change_task: None,
             runtime_change_error: None,
@@ -2871,6 +2889,7 @@ impl Shell {
                 LinkAction::Primary | LinkAction::Internal
             ) && self.open_workspace_file_link(&activation.target.original, window, cx)
             {
+                self.leave_overview_for_chat(cx);
                 LinkOutcome::Internal
             } else {
                 LinkOutcome::Rejected
@@ -2886,6 +2905,7 @@ impl Shell {
         }
         let outcome = resolved.web_outcome(cfg!(any(target_os = "macos", target_os = "linux")));
         if outcome == LinkOutcome::Internal {
+            self.leave_overview_for_chat(cx);
             self.set_surfaces_open(true, cx);
             self.add_browser_surface(activation.target.navigation.clone().ok(), window, cx);
         }
@@ -3170,6 +3190,7 @@ impl Shell {
                 title,
                 frozen,
             } => {
+                self.leave_overview_for_chat(cx);
                 self.add_subagent_surface(
                     chat_id.clone(),
                     doc_id.clone(),
@@ -3815,6 +3836,79 @@ impl Shell {
         cx.notify();
     }
 
+    /// Whether the overview is the route on screen right now — lets the
+    /// overview's own idle-refresh timer skip ticks while it's mounted but
+    /// hidden behind another route.
+    pub(crate) fn is_overview_route(&self) -> bool {
+        matches!(self.route, Route::Overview)
+    }
+
+    /// The overview's "View full chat →": select `chat_id` so the shared
+    /// transcript/composer bind to it, WITHOUT leaving `Route::Overview`.
+    /// Sending, queueing, the question wizard, interrupt and resume all key
+    /// off the selection, not the route. No history entry: the nav push in
+    /// `on_state_changed` is gated on `Route::Chat`.
+    pub(crate) fn preview_chat_in_overview(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.focus_composer(cx);
+        if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+            self.state
+                .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        }
+        cx.notify();
+    }
+
+    /// Something the overview's chat panel triggered (subagent tab, file or
+    /// web link) opens in the right pane, which only exists on the chat
+    /// route — go there first so it isn't opened somewhere nobody can see.
+    fn leave_overview_for_chat(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Overview) {
+            self.route = Route::Chat;
+            self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_overview(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Overview;
+        self.nav.push(NavEntry::Overview);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    /// Lazily create the overview entity on first visit, same pattern as
+    /// `settings_outlet`'s per-section pages.
+    fn overview_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_overview_page(cx).into_any_element()
+    }
+
+    fn ensure_overview_page(&mut self, cx: &mut Context<Self>) -> Entity<crate::overview::Overview> {
+        if let Some(page) = &self.overview_page {
+            return page.clone();
+        }
+        let state = self.state.clone();
+        let weak = cx.entity().downgrade();
+        // The overview's chat panel renders these SAME entities (never a
+        // second transcript/composer) — safe because routes are exclusive:
+        // `render_main` returns before the chat stack on this route.
+        let transcript = self.transcript.clone();
+        let composer = self.composer.clone();
+        let page = cx.new(|cx| crate::overview::Overview::new(state, weak, transcript, composer, cx));
+        self.overview_page = Some(page.clone());
+        page
+    }
+
+    /// Chat menu "Link PR / ticket…": the link editor lives in the
+    /// overview's expanded detail, so switch there and open it for this
+    /// chat (expanded, focused, scrolled/framed into view).
+    fn link_chat_from_menu(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_chat_menu(cx);
+        self.open_overview(cx);
+        let page = self.ensure_overview_page(cx);
+        page.update(cx, |overview, cx| overview.open_link_editor(chat_id, true, window, cx));
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.focus_composer(cx);
@@ -3852,6 +3946,9 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
+            }
+            NavEntry::Overview => {
+                self.route = Route::Overview;
             }
         }
         self.close_user_menu(cx);
@@ -4156,6 +4253,147 @@ impl Shell {
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.set_chat_archived(chat_id, true, cx);
+    }
+
+    /// Catch an imported chat up on new messages its source session
+    /// accumulated since the last import/sync (`SyncExternalSession`).
+    /// Only meaningful for a chat that came from the external-session import
+    /// flow — for any other chat the RPC just fails server-side (no import
+    /// cursor recorded), which we surface as a plain notice rather than
+    /// trying to predict client-side which chats qualify.
+    fn sync_external_session(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.sidebar_notice = Some("Syncing…".into());
+        cx.notify();
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::SYNC_EXTERNAL_SESSION,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.sidebar_notice = Some(match result {
+                    Ok(value) => {
+                        let new_count = value
+                            .get("newMessageCount")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        if new_count == 0 {
+                            "No new messages".into()
+                        } else if new_count == 1 {
+                            "Synced — 1 new message".into()
+                        } else {
+                            format!("Synced — {new_count} new messages").into()
+                        }
+                    }
+                    Err(err) => format!("Sync failed: {err}").into(),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// One-time migration: import every Claude Code session `session_canvas`
+    /// (the `agent-mode-tools` stopgap tool this overview effort replaces)
+    /// still has on disk, carrying over its archive state so already-dead
+    /// sessions don't flood the new overview as active chats
+    /// (`BulkImportSessionCanvasSessions`). Streamed — this can process
+    /// hundreds of files — progress rides `sidebar_notice` rather than a
+    /// dedicated progress surface, matching `sync_external_session`'s
+    /// transient-feedback convention.
+    pub(crate) fn bulk_import_session_canvas_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.bulk_import_task.is_some() {
+            return; // one run at a time
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.sidebar_notice = Some("Importing session_canvas sessions…".into());
+        cx.notify();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let stream = Tokio::spawn(cx, async move {
+            let mut items = engine
+                .client()
+                .subscribe(
+                    methods::BULK_IMPORT_SESSION_CANVAS_SESSIONS,
+                    serde_json::json!({}),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            while let Some(item) = items.recv().await {
+                let _ = tx.send(item);
+            }
+            Ok::<(), String>(())
+        });
+        self.bulk_import_task = Some(cx.spawn(async move |this, cx| {
+            let _stream = stream; // keep the subscribing task alive until the loop below ends
+            loop {
+                let Some(item) = rx.recv().await else {
+                    this.update(cx, |shell, cx| {
+                        shell.bulk_import_task = None;
+                        // A stream that ends without a summary item (dropped
+                        // connection, engine restart mid-run) is a failure —
+                        // idempotent, so just say so; re-running picks up
+                        // wherever it left off.
+                        shell.sidebar_notice =
+                            Some("Bulk import stream ended before finishing.".into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                };
+                let is_summary = item.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("summary");
+                let ended = this
+                    .update(cx, |shell, cx| {
+                        match item.get("kind").and_then(serde_json::Value::as_str) {
+                            Some("item") => {
+                                let index = item
+                                    .get("index")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    + 1;
+                                let total = item
+                                    .get("total")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0);
+                                shell.sidebar_notice =
+                                    Some(format!("Importing {index} of {total}…").into());
+                            }
+                            Some("summary") => {
+                                let get_u64 = |k: &str| {
+                                    item.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0)
+                                };
+                                let imported = get_u64("imported");
+                                let archived = get_u64("archived");
+                                let failed = get_u64("failed");
+                                shell.sidebar_notice = Some(
+                                    format!(
+                                        "Imported {imported} ({archived} archived, {failed} failed)"
+                                    )
+                                    .into(),
+                                );
+                                shell.bulk_import_task = None;
+                            }
+                            _ => {}
+                        }
+                        cx.notify();
+                    })
+                    .is_err();
+                if ended || is_summary {
+                    return;
+                }
+            }
+        }));
     }
 
     fn reconcile_sidebar_pins(&mut self, cx: &mut Context<Self>) {
@@ -5174,6 +5412,25 @@ impl Shell {
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
             }
+            Route::Overview => {
+                let theme = Theme::of(cx).clone();
+                let inner = div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pl(px(self.title_bar_content_start()))
+                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Overview")),
+                    );
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+                self.titlebar_drag_region("overview-header-titlebar", bar, cx)
+                    .into_any_element()
+            }
         }
     }
 
@@ -5361,6 +5618,33 @@ impl Shell {
             matches!(self.route, Route::Chat),
             self.state.read(cx).selected_chat.is_some(),
         )
+    }
+
+    /// The overview's own "New chat" button delegates to the exact same
+    /// new-session flow as the titlebar `+` and `mod-n`/`NewSession`
+    /// (`open_new_session`, `crate::shell::tabs`) — one action, reachable
+    /// from wherever the user is, rather than a second, subtly different
+    /// entrypoint. `open_new_session` itself is `pub(super)` (visible to
+    /// `crate::shell` only); this thin `pub(crate)` wrapper is what lets
+    /// `Overview` (a sibling module) invoke it through `self.shell.update`.
+    pub(crate) fn open_new_session_from_overview(&mut self, cx: &mut Context<Self>) {
+        self.open_new_session(cx);
+    }
+
+    /// Human-readable badge for the current `NewSession` keybinding (e.g.
+    /// `⌘N` / `ctrl-shift-n`), for the overview's "New chat" button tooltip.
+    /// Falls back to the shortcut's default combo the same way
+    /// `apply_keymap`'s own `valid_or_default` does, so a stale/invalid
+    /// persisted combo never surfaces as a broken-looking tooltip.
+    pub(crate) fn new_session_shortcut_label(&self) -> String {
+        let combo = &self.settings.keymap.new_session;
+        let default = ShortcutId::NewSession.default_combo();
+        let resolved = if Keystroke::parse(&platform_combo(combo)).is_ok() {
+            combo.as_str()
+        } else {
+            default
+        };
+        badge_combo(resolved)
     }
 
     /// Native Windows caption controls integrated into Zeron's unified
@@ -7856,6 +8140,8 @@ impl Shell {
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let sync_id = chat_id.clone();
+            let link_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -7895,6 +8181,33 @@ impl Shell {
                                     .text_color(theme.text_muted),
                             )
                             .child(SharedString::from("Archive")),
+                    )
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-sync-{chat_id}"))
+                            .id("chat-menu-sync")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.sync_external_session(sync_id.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::REFRESH)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Sync imported session")),
+                    )
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-link-{chat_id}"))
+                            .id("chat-menu-link")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.link_chat_from_menu(link_id.clone(), window, cx)
+                            }))
+                            .child(
+                                icon(icons::PAPERCLIP)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Link PR / ticket…")),
                     )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
@@ -8249,6 +8562,22 @@ impl Shell {
         // underlaps: pad below the overlaid titlebar.
         if let Route::Settings(section) = self.route {
             let outlet = self.settings_outlet(section, window, cx);
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+
+        // Overview route: same shape as Settings (an outlet under the
+        // overlaid titlebar) — it isn't the single-chat transcript/composer
+        // stack below, by design.
+        if let Route::Overview = self.route {
+            let outlet = self.overview_outlet(cx);
             return div()
                 .flex_1()
                 .min_w_0()
@@ -10696,6 +11025,14 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.toggle_command_palette(window, cx);
             }))
+            // Works from any route, like New session: the overview is a
+            // top-level surface, not chat-scoped. Quiet under an open
+            // picker/palette so it never navigates out from underneath one.
+            .on_action(cx.listener(|this, _: &OpenOverview, _, cx| {
+                if !this.overlay_owns_keyboard(cx) {
+                    this.open_overview(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
                 if matches!(this.route, Route::Chat) && !this.overlay_owns_keyboard(cx) {
                     let pickers = this.composer.read(cx).pickers().clone();
@@ -10801,10 +11138,22 @@ impl Render for Shell {
                     self.bottom_stack_has_composer.get(),
                     expected_has_composer,
                 );
+                let on_overview = matches!(self.route, Route::Overview);
                 self.transcript.update(cx, |t, cx| {
-                    t.set_rail_enabled(rail::rail_visible(main_width), cx);
-                    if bottom_stack_ready && expected_has_composer {
-                        t.set_bottom_clearance(stack_h, cx);
+                    if on_overview {
+                        // The overview's chat panel: a narrow column with the
+                        // composer BELOW the transcript, not overlaying it.
+                        // Its header sits above the transcript (nothing
+                        // overlays the top), so no titlebar inset either.
+                        t.set_rail_enabled(false, cx);
+                        t.set_bottom_clearance(0.0, cx);
+                        t.set_top_inset(crate::overview::CHAT_PANEL_TRANSCRIPT_TOP_INSET, cx);
+                    } else {
+                        t.set_top_inset(crate::transcript::OWN_SEND_TOP_INSET_PX, cx);
+                        t.set_rail_enabled(rail::rail_visible(main_width), cx);
+                        if bottom_stack_ready && expected_has_composer {
+                            t.set_bottom_clearance(stack_h, cx);
+                        }
                     }
                 });
 
@@ -12519,6 +12868,74 @@ mod exit_regressions {
             })
             .unwrap();
         }
+    }
+
+    /// The overview's chat panel selects a chat without leaving the route or
+    /// recording history; "Open full chat →" on that already-selected chat
+    /// still records the chat entry, so Back returns to the overview.
+    #[gpui::test]
+    fn overview_chat_preview_keeps_route_and_history(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.open_overview(cx);
+                shell.preview_chat_in_overview("existing-session".into(), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(matches!(shell.route, Route::Overview));
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("existing-session")
+                );
+                assert_eq!(shell.active_chat, "existing-session");
+                assert_eq!(*shell.nav.current(), NavEntry::Overview);
+                shell.open_chat("existing-session".into(), cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(matches!(shell.route, Route::Chat));
+                assert_eq!(
+                    *shell.nav.current(),
+                    NavEntry::Chat("existing-session".into())
+                );
+                shell.navigate_back(cx);
+                assert!(matches!(shell.route, Route::Overview));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

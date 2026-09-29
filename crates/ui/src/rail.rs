@@ -445,7 +445,7 @@ impl Transcript {
         // leaving the raw top row — the pre-fix behavior.
         let mut top_row = self.list_state().logical_scroll_top().item_ix;
         let read_top = f32::from(self.list_state().viewport_bounds().top())
-            + crate::transcript::OWN_SEND_TOP_INSET_PX
+            + self.top_inset()
             + 0.5;
         while let Some(bounds) = self.list_state().bounds_for_item(top_row + 1) {
             if f32::from(bounds.top()) <= read_top {

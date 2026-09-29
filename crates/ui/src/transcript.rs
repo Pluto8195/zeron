@@ -216,7 +216,9 @@ pub const SPRING_SETTLE_GRACE_MS: u64 = 500;
 pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// A freshly-sent prompt rests this far below the transcript viewport's top.
 /// The titlebar overlays the full-height list, so its height is part of the
-/// inset; the extra 10px matches the first row's breathing room.
+/// inset; the extra 10px matches the first row's breathing room. This is the
+/// default `Transcript::top_inset` (the full-window chat route); embeddings
+/// whose chrome doesn't overlay the list override it via `set_top_inset`.
 pub(crate) const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
 /// Epsilon of extra height under the reservation. The runway ends AT the
 /// app's bottom — this is not scroll room (24px of it read as a janky
@@ -2869,6 +2871,12 @@ pub struct Transcript {
     /// transcript's bottom (measured last frame): the last row pads past it
     /// so pinned content rests above the glass chrome it scrolls under.
     bottom_clearance: f32,
+    /// Chrome inset at the transcript's top (shell-driven per frame): the
+    /// own-turn resting spot sits this far below the viewport top and the
+    /// first row's gap is this plus `SPACE_LG`. Defaults to the titlebar
+    /// inset (`OWN_SEND_TOP_INSET_PX`); the overview's chat panel, whose
+    /// header sits above rather than over the list, sets a small one.
+    top_inset: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
@@ -3087,6 +3095,7 @@ impl Transcript {
             selection_scroll_task: None,
             rail_enabled,
             bottom_clearance: 0.0,
+            top_inset: OWN_SEND_TOP_INSET_PX,
             rail_hover: None,
             hovered_entry: None,
             copied_code: None,
@@ -3135,6 +3144,29 @@ impl Transcript {
             }
             cx.notify();
         }
+    }
+
+    /// Shell-driven: the chrome inset at the transcript's top (see the
+    /// `top_inset` field). Feeds BOTH the first row's top gap and the
+    /// own-turn resting spot, so the two can't disagree.
+    pub fn set_top_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        if (self.top_inset - inset).abs() > 0.5 {
+            self.top_inset = inset;
+            if !self.rows.is_empty() {
+                // Row 0's height carries the inset in its top gap.
+                self.list.remeasure_items(0..1);
+                self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
+            }
+            if self.own_turn.is_some() {
+                self.remeasure_last_row();
+                self.own_turn_kick = true;
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn top_inset(&self) -> f32 {
+        self.top_inset
     }
 
     pub(crate) fn rail_hover(&self) -> Option<usize> {
@@ -3347,7 +3379,7 @@ impl Transcript {
                     let at_hold = this.own_turn_anchor_ix().is_some_and(|ix| {
                         this.list.bounds_for_item(ix).is_some_and(|bounds| {
                             f32::from(bounds.top() - this.list.viewport_bounds().top())
-                                >= Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - 2.0
+                                >= this.own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - 2.0
                         })
                     });
                     if !released_own_turn && at_hold && Self::should_restick(distance, previous) {
@@ -3626,11 +3658,27 @@ impl Transcript {
     /// carries the titlebar chrome inside its own box (the first row's
     /// top gap), so the hold adds nothing — adding the inset on top parked
     /// a new chat's first prompt a double-chrome ~66px low (user report).
-    fn own_send_inset(anchor_ix: usize) -> f32 {
+    fn own_send_inset(&self, anchor_ix: usize) -> f32 {
+        Self::own_send_inset_for(anchor_ix, self.top_inset)
+    }
+
+    fn own_send_inset_for(anchor_ix: usize, top_inset: f32) -> f32 {
         if anchor_ix == 0 {
             0.0
         } else {
-            OWN_SEND_TOP_INSET_PX
+            top_inset
+        }
+    }
+
+    /// Row 0's top gap. An override instance (right pane) already pads for
+    /// the titlebar, so it keeps only the ordinary turn gap; the primary
+    /// transcript adds its top inset. With the default inset this is exactly
+    /// `TITLEBAR_HEIGHT + SPACE_LG + 10`.
+    fn first_row_top_gap(has_doc_override: bool, top_inset: f32) -> f32 {
+        if has_doc_override {
+            Theme::SPACE_LG
+        } else {
+            top_inset + Theme::SPACE_LG
         }
     }
 
@@ -3695,7 +3743,7 @@ impl Transcript {
             });
             self.list.set_tail_reservation(Some((
                 ix,
-                px(Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - expansion),
+                px(self.own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - expansion),
             )));
         } else if self.own_turn.is_none() {
             self.list.set_tail_reservation(None);
@@ -3742,7 +3790,7 @@ impl Transcript {
             cx.notify();
             return;
         }
-        let inset = Self::own_send_inset(anchor_ix);
+        let inset = self.own_send_inset(anchor_ix);
         if self.is_glued() && self.own_turn.as_ref().is_some_and(|anchor| anchor.held) {
             self.list.scroll_by(px(-viewport_height));
         }
@@ -5802,12 +5850,10 @@ impl Transcript {
         // rests below the chrome it fades under. The right pane already pads
         // for the titlebar — an override instance's first row keeps only the
         // ordinary turn gap, or the content sits double-chrome low.
+        // (`top_inset` defaults to the titlebar inset; the overview's chat
+        // panel sets a small one — its header doesn't overlay the list.)
         let top_gap = if ix == 0 {
-            if self.doc_override.is_some() {
-                Theme::SPACE_LG
-            } else {
-                Theme::TITLEBAR_HEIGHT + Theme::SPACE_LG + 10.0
-            }
+            Self::first_row_top_gap(self.doc_override.is_some(), self.top_inset)
         } else {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
         };
@@ -8186,6 +8232,38 @@ mod tests {
         assert!(!jump_visibility(shown, AT_BOTTOM_PX));
         assert!(!jump_visibility(false, 319.0));
         assert!(jump_visibility(false, 321.0));
+    }
+
+    #[test]
+    fn top_inset_feeds_first_row_gap_and_resting_spot_consistently() {
+        // Default (chat route): pixel-identical to the pre-configurable values.
+        assert_eq!(
+            Transcript::first_row_top_gap(false, OWN_SEND_TOP_INSET_PX),
+            Theme::TITLEBAR_HEIGHT + Theme::SPACE_LG + 10.0
+        );
+        assert_eq!(
+            Transcript::own_send_inset_for(3, OWN_SEND_TOP_INSET_PX),
+            Theme::TITLEBAR_HEIGHT + 10.0
+        );
+        // Row 0 carries the inset in its own gap; the hold adds nothing.
+        assert_eq!(Transcript::own_send_inset_for(0, OWN_SEND_TOP_INSET_PX), 0.0);
+        assert_eq!(Transcript::own_send_inset_for(0, 8.0), 0.0);
+        // Override instances ignore the inset for row 0.
+        assert_eq!(Transcript::first_row_top_gap(true, 8.0), Theme::SPACE_LG);
+        assert_eq!(
+            Transcript::first_row_top_gap(true, OWN_SEND_TOP_INSET_PX),
+            Theme::SPACE_LG
+        );
+        // A small panel inset drops the titlebar from BOTH, by the same amount.
+        let panel = crate::overview::CHAT_PANEL_TRANSCRIPT_TOP_INSET;
+        assert_eq!(Transcript::first_row_top_gap(false, panel), panel + Theme::SPACE_LG);
+        assert_eq!(Transcript::own_send_inset_for(3, panel), panel);
+        assert_eq!(
+            Transcript::first_row_top_gap(false, OWN_SEND_TOP_INSET_PX)
+                - Transcript::first_row_top_gap(false, panel),
+            Transcript::own_send_inset_for(3, OWN_SEND_TOP_INSET_PX)
+                - Transcript::own_send_inset_for(3, panel)
+        );
     }
 
     #[gpui::test]
@@ -11300,7 +11378,7 @@ mod tests {
                         .bounds_for_item(anchor)
                         .unwrap()
                         .top();
-                    assert!(previous > px(Transcript::own_send_inset(anchor) + 40.0));
+                    assert!(previous > px(Transcript::own_send_inset_for(anchor, OWN_SEND_TOP_INSET_PX) + 40.0));
                     for _ in 0..80 {
                         tick(&transcript, window, cx);
                         let top = transcript
@@ -11311,7 +11389,7 @@ mod tests {
                             .top();
                         assert!(top <= previous + px(0.5), "repeat send reversed");
                         assert!(
-                            top >= px(Transcript::own_send_inset(anchor) - 2.5),
+                            top >= px(Transcript::own_send_inset_for(anchor, OWN_SEND_TOP_INSET_PX) - 2.5),
                             "repeat send overshot"
                         );
                         assert!(previous - top < px(150.0), "repeat send jumped");
@@ -11684,7 +11762,7 @@ mod tests {
                 draw(window, cx);
                 let start_top = transcript.read(cx).list.bounds_for_item(11).unwrap().top();
                 assert!(
-                    start_top > px(Transcript::own_send_inset(11) + 100.0),
+                    start_top > px(Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX) + 100.0),
                     "installing the runway must preserve the start of the glide"
                 );
                 let mut previous_top = start_top;
@@ -11706,7 +11784,7 @@ mod tests {
                     );
                     previous_top = bounds.top();
                     let target =
-                        this.list.viewport_bounds().top() + px(Transcript::own_send_inset(11));
+                        this.list.viewport_bounds().top() + px(Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX));
                     assert!(
                         bounds.top() >= target - px(0.5),
                         "send overshot: {:?} < {:?}",
@@ -11718,7 +11796,7 @@ mod tests {
                 let bounds = this.list.bounds_for_item(11).unwrap();
                 assert!(
                     (f32::from(bounds.top() - this.list.viewport_bounds().top())
-                        - Transcript::own_send_inset(11))
+                        - Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX))
                     .abs()
                         <= 1.0
                 );

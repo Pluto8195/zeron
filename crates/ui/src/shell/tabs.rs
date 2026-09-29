@@ -123,10 +123,18 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
+        let was_chat = matches!(self.route, Route::Chat);
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.state
-            .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+            .update(cx, |s, cx| s.select_chat(Some(chat_id.clone()), cx));
+        // Coming from another route (the overview's "Open full chat →" on
+        // the chat its panel already selected), no selection change fires,
+        // so `on_state_changed` records no history entry — record it here.
+        // `push` dedups against the entry a real selection change adds.
+        if !was_chat {
+            self.nav.push(NavEntry::Chat(chat_id));
+        }
         cx.notify();
     }
 

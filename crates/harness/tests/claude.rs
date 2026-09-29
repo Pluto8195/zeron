@@ -625,10 +625,10 @@ async fn live_real_cli_single_turn() {
 #[tokio::test]
 async fn commands_come_from_the_initialize_control_request() {
     let h = harness();
-    let commands = h.commands().await.expect("discovery succeeds");
+    let commands = h.commands("").await.expect("discovery succeeds");
     assert_eq!(
         commands.len(),
-        2,
+        3,
         "nameless entries are dropped: {commands:?}"
     );
     assert_eq!(commands[0].name, "review");
@@ -636,12 +636,63 @@ async fn commands_come_from_the_initialize_control_request() {
     assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));
     assert_eq!(commands[1].name, "compact");
     assert_eq!(commands[1].input_hint, None, "empty hint reads as None");
+    assert_eq!(commands[2].name, "cwd-marker");
 
     // Cached: the second call reuses the first probe's result (the fake has
     // exited; a re-probe against a dead binary path would still work here,
     // but object identity of the cached list is the cheap assertion).
-    let again = h.commands().await.expect("cache hit");
+    let again = h.commands("").await.expect("cache hit");
     assert_eq!(again, commands);
+}
+
+/// Pins the fix: discovery must run in the CALLING CHAT'S cwd (project-scoped
+/// `.claude/commands`/skills live there), not the engine's own inherited
+/// directory. The fake CLI's "cwd-marker" command carries its OWN `pwd`, so
+/// this exercises the real spawn-args seam (`ClaudeHarness::probe_initialize`
+/// setting `Command::current_dir`), not just a mocked request struct.
+#[tokio::test]
+async fn commands_discover_in_the_given_cwd() {
+    let h = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let want = dir.path().canonicalize().unwrap();
+
+    let commands = h
+        .commands(dir.path().to_str().unwrap())
+        .await
+        .expect("discovery succeeds");
+    let marker = commands
+        .iter()
+        .find(|c| c.name == "cwd-marker")
+        .expect("fake CLI reports its own cwd");
+    assert_eq!(PathBuf::from(&marker.description), want);
+}
+
+/// Two chats in different repos/worktrees must each see their OWN commands:
+/// the engine-side cache is keyed by cwd (see `discovery::CommandsCache`),
+/// not just by credentials/binary, so probing one cwd never shadows another.
+#[tokio::test]
+async fn commands_cache_does_not_mix_up_different_cwds() {
+    let h = harness();
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+
+    let marker_for = |commands: &[zeron_proto::SlashCommand]| {
+        commands
+            .iter()
+            .find(|c| c.name == "cwd-marker")
+            .unwrap()
+            .description
+            .clone()
+    };
+
+    let a = h.commands(dir_a.path().to_str().unwrap()).await.unwrap();
+    let b = h.commands(dir_b.path().to_str().unwrap()).await.unwrap();
+    assert_ne!(marker_for(&a), marker_for(&b));
+
+    // Re-fetching dir_a's (cached) commands still reports dir_a, not the
+    // most-recently-probed dir_b.
+    let a_again = h.commands(dir_a.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(marker_for(&a_again), marker_for(&a));
 }
 
 /// Live smoke against the real CLI: `cargo test -p zeron-harness --test
@@ -650,7 +701,7 @@ async fn commands_come_from_the_initialize_control_request() {
 #[ignore]
 async fn live_commands_discovery() {
     let h = ClaudeHarness::new();
-    let commands = h.commands().await.expect("live discovery");
+    let commands = h.commands("").await.expect("live discovery");
     assert!(!commands.is_empty());
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }

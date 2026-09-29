@@ -692,7 +692,7 @@ async fn antigravity_sign_in_reports_the_browser_url_and_authenticates() {
 
 #[tokio::test]
 async fn antigravity_commands_include_logout() {
-    let commands = antigravity_harness().commands().await.expect("commands");
+    let commands = antigravity_harness().commands("").await.expect("commands");
     let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"plan"), "{names:?}");
     assert!(names.contains(&"logout"), "{names:?}");
@@ -1772,7 +1772,7 @@ async fn antigravity_stdout_sign_in_and_sibling_environment_on_every_spawn() {
     );
     harness.sign_out().await.unwrap();
     assert!(!harness.models().await.unwrap().is_empty());
-    assert!(!harness.commands().await.unwrap().is_empty());
+    assert!(!harness.commands("").await.unwrap().is_empty());
     let (ctl, _steer, _) = controls();
     let mut req = request("hello");
     req.model = None;
@@ -1925,7 +1925,7 @@ async fn antigravity_detection_subprocess() {
         Err(HarnessError::NotInstalled(_))
     ));
     assert!(matches!(
-        harness.commands().await,
+        harness.commands("").await,
         Err(HarnessError::NotInstalled(_))
     ));
     assert!(matches!(

@@ -116,7 +116,13 @@ pub trait Harness: Send + Sync {
     }
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
     /// for harnesses without them. May spawn a short-lived discovery process.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// `cwd` is the calling chat's working directory (empty when none is
+    /// known yet, e.g. a blank new-chat screen); drivers whose commands are
+    /// project-scoped (Claude Code's `.claude/commands` and skills) should
+    /// discover from it so a chat sees ITS repo/worktree's commands rather
+    /// than whatever directory the engine process happened to start in.
+    /// Drivers without project-scoped discovery may ignore it.
+    async fn commands(&self, _cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(Vec::new())
     }
     /// Run an isolated title request. Drivers must opt in with title-specific

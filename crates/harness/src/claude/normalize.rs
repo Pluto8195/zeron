@@ -68,7 +68,12 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
 }
 
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
-pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
+/// Claude tool name → [`ToolCall`]. `pub` (not `pub(crate)`): the same
+/// mapping is needed outside the live wire path — `zeron_engine::external_import`
+/// applies it to an already-complete `tool_use` block read from an on-disk
+/// transcript, where the block shape carries the same `name`/`input` this
+/// takes.
+pub fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
         "Bash" => ToolCall::Exec {
             command: str_field(input, "command"),

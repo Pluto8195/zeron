@@ -5936,6 +5936,10 @@ rename to new_name.rs
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            linked_pr_url: None,
+            linked_pr_source: None,
+            linked_ticket_id: None,
+            linked_ticket_source: None,
         }
     }
 

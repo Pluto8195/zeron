@@ -131,6 +131,106 @@ pub mod methods {
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).
     pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
+    /// Claude Code sessions found on disk (`~/.claude/projects`) that this
+    /// workspace hasn't already imported, newest first. No params; IPC-only
+    /// (device-local filesystem, never relay-forwarded — forwarding would
+    /// scan the wrong machine's `~/.claude`).
+    pub const SCAN_EXTERNAL_SESSIONS: &str = "ScanExternalSessions";
+    /// Import one scanned candidate into a brand-new chat. `{chatId,
+    /// externalSessionId, path}` → `ImportedSession`. IPC-only, same reason.
+    pub const IMPORT_EXTERNAL_SESSION: &str = "ImportExternalSession";
+    /// Whether a scanned candidate looks like it might still be actively
+    /// running elsewhere. `{path, sessionId, cwd}` →
+    /// `{recentlyModified, liveProcessMatch}`. IPC-only: reads this
+    /// machine's processes and files, never relay-forwarded.
+    pub const CHECK_SESSION_LIVENESS: &str = "CheckSessionLiveness";
+    /// Catch an already-imported chat up on new messages its source session
+    /// accumulated since the last import/sync. `{chatId}` → `SyncResult`.
+    /// IPC-only, same reason as the other external-import methods.
+    pub const SYNC_EXTERNAL_SESSION: &str = "SyncExternalSession";
+    /// Cached PR/ticket/worktree status for one chat's branch+cwd (ticket 002
+    /// phases 2 and 4). `{chatId}` → `ChatLinkStatus { pr, ticket,
+    /// isWorktree, diffStat, prSource, ticketSource }`. `isWorktree` is a
+    /// pure inline check (no cache); `pr`/`ticket`/`diffStat` are pure cache
+    /// reads — never block on a live `gh`/`linear`/`git` call; a miss is
+    /// registered for the background sweep and reads back populated on a
+    /// later call. `prSource`/`ticketSource` are `"manual" | "created_in_chat"
+    /// | "mentioned" | null` — the provenance of a chat-row-DURABLE link
+    /// (ticket 0xx's `SET_CHAT_LINK`/mining tap), `null` meaning the shown
+    /// PR/ticket instead came from the branch/title inference this method
+    /// always fell back to before durable links existed. IPC-only: reads
+    /// this machine's `gh`/`linear` CLI state and local git worktrees, never
+    /// relay-forwarded.
+    pub const CHAT_LINK_STATUS: &str = "ChatLinkStatus";
+    /// Durable PR/ticket link write (ticket 0xx) — layered over
+    /// `CHAT_LINK_STATUS`'s branch/title inference: `{chatId, kind: "pr" |
+    /// "ticket", value: string | null}` → the chat's updated link fields
+    /// (`{linkedPrUrl, linkedPrSource, linkedTicketId, linkedTicketSource}`).
+    /// Always writes source `"manual"` (the only writer allowed to CLEAR a
+    /// slot — `value: null` unlinks); a mined write (`created_in_chat`/
+    /// `mentioned`, from the live per-event tap or the transcript backfill
+    /// repair) never rides this RPC, it calls `WorkspaceHost::set_chat_link`
+    /// directly. IPC-only, same reason as `CHAT_LINK_STATUS`.
+    pub const SET_CHAT_LINK: &str = "SetChatLink";
+    /// Subagents a chat's source Claude Code session spawned, on disk
+    /// (ticket 002 phase 3, overview wiring). `{chatId}` → `SubagentSummary[]`
+    /// (empty for a chat with no resolvable transcript or no subagents).
+    /// Resolves the chat's transcript path server-side — via its
+    /// external-import cursor if it has one, else its recorded harness
+    /// session id (covers a chat Zeron itself launched/resumed, never
+    /// imported; same two-source resolution `CHAT_CONTEXT_USAGE` uses,
+    /// `ContextUsageProvider::transcript_path_for_chat`) — and delegates to
+    /// `crate::subagent_scan::scan_subagents`: a `chatId`-keyed convenience
+    /// so the UI never needs to know the on-disk path convention. IPC-only,
+    /// same reason as its sibling methods.
+    pub const SCAN_CHAT_SUBAGENTS: &str = "ScanChatSubagents";
+    /// Full turn history for one subagent's own on-disk transcript (session
+    /// canvas web parity: `session_canvas_server.py`'s `build_transcript_turns`,
+    /// the side-panel chat view's data source there). `{chatId, agentId}` →
+    /// `{turns: [{role, text, timestamp, tools: [{name, inputPreview,
+    /// resultPreview}]}], model}`. Re-resolves the PARENT chat's transcript
+    /// path server-side (same two-source resolution `SCAN_CHAT_SUBAGENTS`
+    /// uses) and derives the subagent file from it — a client-supplied path
+    /// is never trusted. An unknown `chatId`/`agentId` replies with empty
+    /// turns, not an error, matching `SCAN_CHAT_SUBAGENTS`'s own
+    /// empty-not-error stance. IPC-only, same reason as its sibling
+    /// external-import/subagent methods (device-local filesystem reads).
+    pub const READ_SUBAGENT_TRANSCRIPT: &str = "ReadSubagentTranscript";
+    /// Every open PR the signed-in `gh` account authored, across every repo
+    /// it can see (ticket 002 phase 5, "My PRs" pane). No params →
+    /// `MyPrItem[]`. Pure cache read — populated by its own background sweep
+    /// (bulk list search + one throttled per-PR detail fetch per tick), never
+    /// blocks on a live call. IPC-only, same reason as its sibling methods.
+    pub const MY_OPEN_PRS: &str = "MyOpenPrs";
+    /// One-time migration: import every remaining Claude Code session on disk
+    /// (same underlying scan `ScanExternalSessions` uses), carrying over
+    /// archive status from the `session_canvas` stopgap tool this ticket
+    /// effort is replacing. No params; streams `BulkImportEvent` items
+    /// (`Start`/`Item`-per-candidate/`Summary`), same shape as
+    /// `ImportLocalWorkspace`'s progress stream. Idempotent — safe to
+    /// re-run, only processes what `ScanExternalSessions` still finds.
+    /// IPC-only, same reason as its sibling external-import methods.
+    pub const BULK_IMPORT_SESSION_CANVAS_SESSIONS: &str = "BulkImportSessionCanvasSessions";
+    /// An already-imported chat's recorded task category / launch origin
+    /// (ticket 002 overview grouping/color-coding). `{chatId}` →
+    /// `{category, origin}` (each `null` for a chat with no import cursor,
+    /// i.e. never went through the external-import flow). Pure read of what
+    /// `ImportExternalSession` already computed and persisted at import
+    /// time — never re-parses the transcript. IPC-only, same reason as its
+    /// sibling external-import methods.
+    pub const CHAT_CLASSIFICATION: &str = "ChatClassification";
+    /// Context-window occupancy for the overview's tile sizing (session-
+    /// canvas parity): `{chatId}` → `{contextPct: number | null}`, `0.0..=1.0`
+    /// (the UI maps this to pixels). A separate lazy-per-chat method rather
+    /// than folding onto `ChatLinkStatus`/`ChatClassification` — this value
+    /// changes far more often (live while a chat is actively running) than
+    /// either of those, so it wants its own polling cadence rather than
+    /// riding piggyback on a cache tuned for GH/Linear TTLs or a one-time
+    /// import-time classification. IPC-only: the live source is this
+    /// engine's own doc store, and the fallback reads this machine's
+    /// `~/.claude/projects` transcripts — neither makes sense forwarded to
+    /// another device.
+    pub const CHAT_CONTEXT_USAGE: &str = "ChatContextUsage";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -161,6 +261,27 @@ pub mod methods {
     pub const WATCH_WORKSPACE_FILES: &str = "WatchWorkspaceFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    /// Smart-worktree judgment for a new chat's first message: `{message,
+    /// cwd}` → `{needsWorktree, probability, source}`. A TypeSafe/Jev `Noul`
+    /// call (`needsWorktree = probability >= 0.5`) with a text-heuristic
+    /// fallback when TypeSafe is unavailable/errors/times out (`source`
+    /// reports which one answered: `"jev" | "heuristic"`). Pure judgment, no
+    /// side effects, nothing cached (one call per new chat). IPC-only: the
+    /// call itself is device-agnostic, but it's paired 1:1 with
+    /// `CreateChatWorktree`'s device-local filesystem work, so it stays in
+    /// the same non-forwarded group rather than round-tripping the relay for
+    /// no benefit.
+    pub const PLAN_CHAT_WORKSPACE: &str = "PlanChatWorkspace";
+    /// Materialize an isolated git worktree for a new chat, using the
+    /// `agent-mode-tools/agent-mode.sh` on-disk convention (NOT `CreateWorktree`'s
+    /// own `~/.zeron/worktrees` layout — see `chat_workspace_plan` module docs):
+    /// `{chatId, repoPath, name}` → `{worktreePath, branch}`, or a structured
+    /// error (nested-under-a-submodule, path-already-exists, not-a-git-repo,
+    /// etc). Also stamps the chat row's `cwd` to the new worktree path
+    /// (`WorkspaceHost::set_chat_cwd`, the same durable field `SetChatCwd`/
+    /// `Mutate` writes) so the chat's next dispatch runs there automatically.
+    /// IPC-only: device-local filesystem + git state.
+    pub const CREATE_CHAT_WORKTREE: &str = "CreateChatWorktree";
     // Project Actions are private state on the device that owns the project.
     pub const LIST_PROJECT_ACTIONS: &str = "ListProjectActions";
     pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";

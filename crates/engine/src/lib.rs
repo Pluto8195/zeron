@@ -19,13 +19,19 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
+mod chat_links;
 mod chat_persistence;
+pub mod chat_workspace_plan;
+pub mod context_usage;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod external_import;
 mod http_error;
 pub mod instance_lock;
+pub mod liveness;
 pub mod local_import;
 mod model_catalogs;
+pub mod pr_ticket_cache;
 pub mod profile;
 pub mod project_actions;
 pub mod registry;
@@ -35,6 +41,8 @@ pub mod run_journal;
 pub mod sessions;
 pub mod source_control;
 pub mod spaces;
+pub mod subagent_scan;
+pub mod subagent_transcript;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;
@@ -142,6 +150,18 @@ pub struct EngineCore {
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
+    /// Import of a Claude Code session Zeron didn't launch itself (any
+    /// profile scope — unlike `local_import`, not account-scoped).
+    pub external_import: external_import::ExternalSessionImporter,
+    /// PR/ticket linkage cache for the multi-chat overview (ticket 002 phase
+    /// 2) — a pure cache read; its background sweep is spawned once here and
+    /// runs for the process's lifetime.
+    pub pr_ticket_cache: pr_ticket_cache::PrTicketCache,
+    /// Per-chat context-window usage percent for the overview's tile sizing
+    /// (session-canvas parity) — a live-doc read backed by a transcript-tail
+    /// fallback, both bounded/cheap; no background sweep needed (see
+    /// `context_usage`'s module doc comment).
+    pub context_usage: context_usage::ContextUsageProvider,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -297,6 +317,109 @@ impl EngineCore {
                 uploads.clone(),
             )
         });
+        let external_import = external_import::ExternalSessionImporter::new(
+            store_for_import.clone(),
+            &device_id,
+            workspace.clone(),
+        );
+        // One-time, idempotent repair for chats imported before `last_message_at`
+        // stamping existed (see `repair_missing_timestamps`'s doc comment) —
+        // off the boot path since it's a blocking doc-store walk.
+        {
+            let importer = external_import.clone();
+            tokio::task::spawn_blocking(move || {
+                match importer.repair_missing_timestamps() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "repaired missing last_message_at on imported chats"),
+                    Err(err) => tracing::warn!(error = %err, "last_message_at repair pass failed"),
+                }
+            });
+        }
+        // Same reasoning, for chats imported before category/origin/branch
+        // classification existed (see `repair_missing_classification`'s doc
+        // comment) — a separate blocking walk since it re-parses transcripts.
+        {
+            let importer = external_import.clone();
+            tokio::task::spawn_blocking(move || {
+                match importer.repair_missing_classification() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "repaired missing classification on imported chats"),
+                    Err(err) => tracing::warn!(error = %err, "classification repair pass failed"),
+                }
+            });
+        }
+        // Same reasoning again, for chats imported before `scan()`/
+        // `bulk_import_from_session_canvas` learned to filter out
+        // classifier/title-gen throwaway transcripts (see
+        // `repair_junk_imports`'s doc comment) — hard-deletes the junk chats
+        // a bulk import from before this fix left behind.
+        {
+            let importer = external_import.clone();
+            tokio::task::spawn_blocking(move || {
+                match importer.repair_junk_imports() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "removed junk classifier/title-gen chats imported before this fix"),
+                    Err(err) => tracing::warn!(error = %err, "junk-import repair pass failed"),
+                }
+            });
+        }
+        // Same reasoning again, for chats imported before `import()` learned
+        // to stamp a Claude Code `ChatConfig` (see `repair_missing_config`'s
+        // doc comment) — without it, resuming one of these chats can dispatch
+        // on the wrong harness.
+        {
+            let importer = external_import.clone();
+            tokio::task::spawn_blocking(move || {
+                match importer.repair_missing_config() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "backfilled missing Claude Code config on imported chats"),
+                    Err(err) => tracing::warn!(error = %err, "config repair pass failed"),
+                }
+            });
+        }
+        // Shares the same store `external_import`/`doc_host` use — the live
+        // path is a bare snapshot peek, same store instance every chat doc
+        // is already persisted to. Built here (rather than after the repair
+        // block below, as it used to be) because `repair_missing_titles` now
+        // needs its two-source transcript resolution too.
+        let context_usage = context_usage::ContextUsageProvider::new(store_for_import.clone());
+        // Same reasoning again, for chats imported before `import()` learned
+        // the priority-chain title resolution (agent-mode task-name registry
+        // > ai-title > first real user message — see `repair_missing_titles`'s
+        // doc comment): without it, a chat with no `ai-title` record landed
+        // with `title: None`, rendered "New session" by every UI surface.
+        // Also covers chats with no import cursor at all but a recorded
+        // harness session (e.g. one Zeron itself launched) — same
+        // cursor-or-harness-session transcript resolution `repair_missing_links`
+        // uses, via `context_usage`.
+        {
+            let importer = external_import.clone();
+            let context_usage = context_usage.clone();
+            tokio::task::spawn_blocking(move || {
+                match importer.repair_missing_titles(&context_usage) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "resolved missing titles on imported chats"),
+                    Err(err) => tracing::warn!(error = %err, "title repair pass failed"),
+                }
+            });
+        }
+        let pr_ticket_cache = pr_ticket_cache::PrTicketCache::new();
+        pr_ticket_cache.spawn_sweep_loop();
+        // Same reasoning as the four repairs above (ticket 0xx design item
+        // 6): backfill durable PR/ticket links for chats whose transcript
+        // predates the feature — off the boot path, needs `context_usage`'s
+        // two-source transcript resolution so it's built after that.
+        {
+            let importer = external_import.clone();
+            let context_usage = context_usage.clone();
+            tokio::task::spawn_blocking(move || {
+                match importer.repair_missing_links(&context_usage) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "backfilled missing PR/ticket links on imported chats"),
+                    Err(err) => tracing::warn!(error = %err, "PR/ticket link repair pass failed"),
+                }
+            });
+        }
         let agent_accounts = AgentAccounts::new(agent_accounts_config);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
@@ -327,6 +450,9 @@ impl EngineCore {
             agent_accounts,
             device_id,
             local_import,
+            external_import,
+            pr_ticket_cache,
+            context_usage,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -459,7 +585,10 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_auth(self.auth())
-        .with_previews(self.previews.clone());
+        .with_previews(self.previews.clone())
+        .with_external_import(self.external_import.clone())
+        .with_pr_ticket_cache(self.pr_ticket_cache.clone())
+        .with_context_usage(self.context_usage.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

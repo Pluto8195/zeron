@@ -49,6 +49,10 @@ fn chat(id: &str, device_id: &str) -> Chat {
         space_id: None,
         last_seen_at: None,
         room_gen: None,
+        linked_pr_url: None,
+        linked_pr_source: None,
+        linked_ticket_id: None,
+        linked_ticket_source: None,
     }
 }
 

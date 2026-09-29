@@ -136,6 +136,14 @@ pub(crate) fn join_retry_jitter() -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(nanos) % 500)
 }
 
+/// Durable PR/ticket links (ticket 0xx): which slot a
+/// [`WorkspaceHost::set_chat_link`] write targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatLinkKind {
+    Pr,
+    Ticket,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceHostConfig {
     pub device_id: String,
@@ -953,6 +961,10 @@ impl WorkspaceHost {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                linked_pr_url: None,
+                linked_pr_source: None,
+                linked_ticket_id: None,
+                linked_ticket_source: None,
             })
         })?;
         Ok(())
@@ -1108,6 +1120,44 @@ impl WorkspaceHost {
     /// when the chat doesn't exist.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_config(chat_id, config))?)
+    }
+
+    /// LWW write of one durable link slot (`linkedPrUrl`/`linkedTicketId` +
+    /// its source), gated by write-time precedence — manual > created_in_chat
+    /// > mentioned (see [`zeron_proto::ChatLinkSource::can_overwrite`]).
+    /// `value: None` clears the slot; clearing is manual-only (a mined writer
+    /// passing `value: None` is refused outright — mining only ever adds a
+    /// link, never removes one). Returns `Ok(false)` when the write was
+    /// skipped: no such chat row, a mined clear attempt, or an existing
+    /// higher-or-equal-ranked source blocked it — none of these are errors,
+    /// matching every other best-effort registry write in this file.
+    pub fn set_chat_link(
+        &self,
+        chat_id: &str,
+        kind: ChatLinkKind,
+        value: Option<&str>,
+        source: zeron_proto::ChatLinkSource,
+    ) -> Result<bool, EngineError> {
+        if value.is_none() && source != zeron_proto::ChatLinkSource::Manual {
+            return Ok(false);
+        }
+        let Some(chat) = self.chat(chat_id)? else {
+            return Ok(false);
+        };
+        let current_source = match kind {
+            ChatLinkKind::Pr => chat.linked_pr_source,
+            ChatLinkKind::Ticket => chat.linked_ticket_source,
+        };
+        if !source.can_overwrite(current_source) {
+            return Ok(false);
+        }
+        // Clearing (value: None) stores no source either — "absent = fall
+        // back to inference" per the schema's own contract.
+        let stamped_source = value.map(|_| source);
+        Ok(self.mutate(|doc| match kind {
+            ChatLinkKind::Pr => doc.set_chat_pr_link(chat_id, value, stamped_source),
+            ChatLinkKind::Ticket => doc.set_chat_ticket_link(chat_id, value, stamped_source),
+        })?)
     }
 
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
@@ -1689,7 +1739,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_name_on_boot, linked_worktree_root};
+    use super::{ChatLinkKind, WorkspaceHost, device_name_on_boot, linked_worktree_root};
 
     #[tokio::test]
     async fn registry_http_sync_retains_dns_cause() {
@@ -1840,6 +1890,184 @@ mod tests {
         assert!(collapsed.revision > sections.revision);
         assert!(collapsed.sections[0].collapsed);
         assert_eq!(*preferences.borrow(), collapsed);
+    }
+
+    /// Shared setup for the `set_chat_link` precedence/set-clear tests below:
+    /// a fresh workspace with one chat row, ready to link.
+    fn linkable_test_host() -> (tempfile::TempDir, WorkspaceHost) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.create_chat("c1", None, Some("test-device"), None, None)
+            .unwrap();
+        (dir, host)
+    }
+
+    #[tokio::test]
+    async fn set_chat_link_precedence_manual_is_not_clobbered_by_mined_writes() {
+        use zeron_proto::ChatLinkSource;
+        let (_dir, host) = linkable_test_host();
+
+        assert!(host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/1"),
+                ChatLinkSource::Manual,
+            )
+            .unwrap());
+
+        // A mined `created_in_chat` write must NOT overwrite the manual link.
+        assert!(!host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/2"),
+                ChatLinkSource::CreatedInChat,
+            )
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+        assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
+
+        // Nor a mined `mentioned` write.
+        assert!(!host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/3"),
+                ChatLinkSource::Mentioned,
+            )
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+        assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
+    }
+
+    #[tokio::test]
+    async fn set_chat_link_precedence_created_in_chat_beats_mentioned_but_not_manual() {
+        use zeron_proto::ChatLinkSource;
+        let (_dir, host) = linkable_test_host();
+
+        assert!(host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/1"),
+                ChatLinkSource::CreatedInChat,
+            )
+            .unwrap());
+
+        // A later `mentioned` write must not overwrite it.
+        assert!(!host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/2"),
+                ChatLinkSource::Mentioned,
+            )
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+        assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::CreatedInChat));
+
+        // Another `created_in_chat` write (equal source) DOES overwrite —
+        // most-recent-wins among same-rank writers.
+        assert!(host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/3"),
+                ChatLinkSource::CreatedInChat,
+            )
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/3"));
+
+        // But `manual` still overwrites it outright.
+        assert!(host
+            .set_chat_link(
+                "c1",
+                ChatLinkKind::Pr,
+                Some("https://github.com/acme/widgets/pull/4"),
+                ChatLinkSource::Manual,
+            )
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/4"));
+        assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
+    }
+
+    #[tokio::test]
+    async fn set_chat_link_clear_is_manual_only() {
+        use zeron_proto::ChatLinkSource;
+        let (_dir, host) = linkable_test_host();
+
+        host.set_chat_link("c1", ChatLinkKind::Pr, Some("url-1"), ChatLinkSource::Mentioned)
+            .unwrap();
+
+        // A mined "clear" attempt (value: None, non-manual source) is
+        // refused outright — mining never removes a link.
+        assert!(!host
+            .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Mentioned)
+            .unwrap());
+        assert!(!host
+            .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::CreatedInChat)
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("url-1"));
+
+        // A manual clear works and drops the source too — "absent = fall
+        // back to inference", not "absent with a stale source".
+        assert!(host
+            .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Manual)
+            .unwrap());
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert!(chat.linked_pr_url.is_none());
+        assert!(chat.linked_pr_source.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_chat_link_the_pr_and_ticket_slots_are_independent() {
+        use zeron_proto::ChatLinkSource;
+        let (_dir, host) = linkable_test_host();
+
+        host.set_chat_link("c1", ChatLinkKind::Pr, Some("pr-url"), ChatLinkSource::Manual)
+            .unwrap();
+        host.set_chat_link("c1", ChatLinkKind::Ticket, Some("ENG-1"), ChatLinkSource::Mentioned)
+            .unwrap();
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert_eq!(chat.linked_pr_url.as_deref(), Some("pr-url"));
+        assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
+        assert_eq!(chat.linked_ticket_id.as_deref(), Some("ENG-1"));
+        assert_eq!(chat.linked_ticket_source, Some(ChatLinkSource::Mentioned));
+
+        // Clearing the PR slot must not touch the ticket slot.
+        host.set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Manual)
+            .unwrap();
+        let chat = host.chat("c1").unwrap().unwrap();
+        assert!(chat.linked_pr_url.is_none());
+        assert_eq!(chat.linked_ticket_id.as_deref(), Some("ENG-1"));
+    }
+
+    #[tokio::test]
+    async fn set_chat_link_on_a_missing_chat_row_is_a_quiet_no_op() {
+        use zeron_proto::ChatLinkSource;
+        let (_dir, host) = linkable_test_host();
+        assert!(!host
+            .set_chat_link("no-such-chat", ChatLinkKind::Pr, Some("url"), ChatLinkSource::Manual)
+            .unwrap());
     }
 
     #[test]

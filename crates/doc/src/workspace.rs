@@ -715,6 +715,14 @@ pub(crate) struct RawChat {
     room_gen: Option<u32>,
     #[serde(default)]
     parent_chat_id: Option<String>,
+    #[serde(default)]
+    linked_pr_url: Option<String>,
+    #[serde(default, deserialize_with = "lenient_chat_link_source")]
+    linked_pr_source: Option<zeron_proto::ChatLinkSource>,
+    #[serde(default)]
+    linked_ticket_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_chat_link_source")]
+    linked_ticket_source: Option<zeron_proto::ChatLinkSource>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -733,6 +741,19 @@ where
             None
         }
     }))
+}
+
+/// Same leniency as [`lenient_chat_config`], for `linked{Pr,Ticket}Source`: an
+/// unrecognized source string (a future variant from a newer peer) costs only
+/// the provenance tag, not the row — the link value itself still round-trips.
+fn lenient_chat_link_source<'de, D>(
+    deserializer: D,
+) -> Result<Option<zeron_proto::ChatLinkSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl From<RawChat> for Chat {
@@ -756,6 +777,10 @@ impl From<RawChat> for Chat {
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
+            linked_pr_url: raw.linked_pr_url,
+            linked_pr_source: raw.linked_pr_source,
+            linked_ticket_id: raw.linked_ticket_id,
+            linked_ticket_source: raw.linked_ticket_source,
         }
     }
 }
@@ -865,6 +890,10 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            linked_pr_url: None,
+            linked_pr_source: None,
+            linked_ticket_id: None,
+            linked_ticket_source: None,
         }
     }
 

@@ -126,9 +126,15 @@ case "$first" in
 *'"subtype":"initialize"'*)
   # Command discovery: the initialize control request arrives as the FIRST
   # stdin line (no user message ever follows). Shape mirrors 2.1.228's
-  # control_response: commands under response.response.
+  # control_response: commands under response.response. A synthetic
+  # "cwd-marker" command carries this process's OWN cwd (not the harness
+  # request's `cwd` — the fake has no idea what was asked for, only where it
+  # actually landed) so tests can pin that discovery spawns in the directory
+  # `ClaudeHarness::commands`/`discover_commands` were given, the way the
+  # real CLI's project-scoped commands/skills would depend on it.
   rid=$(printf '%s\n' "$first" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
-  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
+  here=$(pwd)
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"cwd-marker\",\"description\":\"$here\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
   # Stay alive until the driver tears us down, like the real CLI would.
   exec sleep 30
   ;;

@@ -915,6 +915,10 @@ impl RegistryDoc {
                 chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
             ),
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+            ("linkedPrUrl", opt_str(chat.linked_pr_url.as_deref())),
+            ("linkedPrSource", opt_source(chat.linked_pr_source)),
+            ("linkedTicketId", opt_str(chat.linked_ticket_id.as_deref())),
+            ("linkedTicketSource", opt_source(chat.linked_ticket_source)),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1128,6 +1132,57 @@ impl RegistryDoc {
             fields([
                 ("harnessSessionId", json!(session_id)),
                 ("harnessSessionCwd", json!(cwd)),
+            ]),
+        );
+        Ok(true)
+    }
+
+    /// LWW write of the durable PR link slot (`linkedPrUrl`/`linkedPrSource`)
+    /// — mechanism only, no precedence logic. The caller
+    /// (`WorkspaceHost::set_chat_link`, `crates/engine/src/workspace_host.rs`)
+    /// enforces the manual > created_in_chat > mentioned write-time gate
+    /// BEFORE calling this — by the time a write lands here it's already
+    /// cleared to go. `value: None` clears both fields together: a cleared
+    /// slot carries no source, matching "absent = fall back to inference".
+    pub fn set_chat_pr_link(
+        &mut self,
+        chat_id: &str,
+        value: Option<&str>,
+        source: Option<zeron_proto::ChatLinkSource>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("linkedPrUrl", opt_str(value)),
+                ("linkedPrSource", opt_source(source)),
+            ]),
+        );
+        Ok(true)
+    }
+
+    /// Sibling to [`Self::set_chat_pr_link`] for the ticket-id slot
+    /// (`linkedTicketId`/`linkedTicketSource`).
+    pub fn set_chat_ticket_link(
+        &mut self,
+        chat_id: &str,
+        value: Option<&str>,
+        source: Option<zeron_proto::ChatLinkSource>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("linkedTicketId", opt_str(value)),
+                ("linkedTicketSource", opt_source(source)),
             ]),
         );
         Ok(true)
@@ -1381,6 +1436,13 @@ fn opt_str(value: Option<&str>) -> Value {
 fn opt_ms(value: Option<DateTime<Utc>>) -> Value {
     match value {
         Some(at) => json!(at.timestamp_millis()),
+        None => Value::Null,
+    }
+}
+
+fn opt_source(value: Option<zeron_proto::ChatLinkSource>) -> Value {
+    match value {
+        Some(source) => json!(source),
         None => Value::Null,
     }
 }

@@ -25,7 +25,7 @@ async fn initialize_is_shared_and_curated_metadata_survives_the_live_union() {
             {"value":"sonnet", "displayName":"Unresolved alias"}
         ]
     }}));
-    let (catalog, commands) = tokio::join!(harness.model_catalog(true), harness.commands());
+    let (catalog, commands) = tokio::join!(harness.model_catalog(true), harness.commands(""));
     let catalog = catalog.unwrap();
     assert_eq!(catalog.source, "live");
     assert_eq!(commands.unwrap()[0].name, "review");
@@ -66,7 +66,7 @@ async fn initialize_is_shared_and_curated_metadata_survives_the_live_union() {
                 .count()
         );
     }
-    harness.commands().await.unwrap();
+    harness.commands("").await.unwrap();
     harness.model_catalog(true).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("calls")).unwrap(),

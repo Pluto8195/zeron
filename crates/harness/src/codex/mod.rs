@@ -611,7 +611,10 @@ impl Harness for CodexHarness {
 
     /// Skills from a short-lived `skills/list` probe (see
     /// [`Self::discover_commands`]); cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    // codex's `skills/list` probe boots without a chat cwd (see
+    // `discover_commands`'s own doc comment) — that's this harness's own
+    // existing, deliberate simplification, unchanged here.
+    async fn commands(&self, _cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands
             .get_or_try_init(|| self.discover_commands())
             .await

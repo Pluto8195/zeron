@@ -160,6 +160,47 @@ pub struct ChatConfig {
     pub sandbox: SandboxLevel,
 }
 
+/// Provenance of a durable PR/ticket link stamped on a [`Chat`] row —
+/// write-time precedence, most-authoritative first: `Manual` (explicit user
+/// action via `SET_CHAT_LINK`) beats `CreatedInChat` (the engine watched this
+/// very chat run `gh pr create` and mint the PR) beats `Mentioned` (a PR URL
+/// or ticket id merely appeared in a tool result/message). A writer may only
+/// overwrite a slot whose CURRENT source ranks equal-or-lower than its own —
+/// see [`Self::can_overwrite`]. `None` on the row (no variant stored at all)
+/// ranks below every variant here, so any writer can populate an empty slot;
+/// it also means "no durable link" for the CHAT_LINK_STATUS response, which
+/// then falls back to branch/title inference exactly as before this link
+/// existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatLinkSource {
+    Manual,
+    CreatedInChat,
+    Mentioned,
+}
+
+impl ChatLinkSource {
+    /// Higher ranks win ties against a lower-or-absent stored source.
+    fn rank(self) -> u8 {
+        match self {
+            ChatLinkSource::Mentioned => 0,
+            ChatLinkSource::CreatedInChat => 1,
+            ChatLinkSource::Manual => 2,
+        }
+    }
+
+    /// True when a write carrying `self` as its source may overwrite a slot
+    /// whose current stored source is `current` (`None` = no link stored
+    /// yet, or a manually-cleared slot — always overwritable). Manual always
+    /// wins; `created_in_chat` never overwrites `manual`; `mentioned` never
+    /// overwrites `created_in_chat` or `manual`. Equal sources DO overwrite
+    /// each other — this is what gives "most recent mention wins" among
+    /// repeated `mentioned` writes.
+    pub fn can_overwrite(self, current: Option<ChatLinkSource>) -> bool {
+        self.rank() >= current.map_or(0, ChatLinkSource::rank)
+    }
+}
+
 /// Immutable-at-run-start repository context owned by one conversation.
 ///
 /// This is deliberately separate from the live checkout snapshot: another
@@ -230,6 +271,25 @@ pub struct Chat {
     /// human started; a dangling id (parent deleted) is tolerated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// Durable PR link — layered over the branch-based `gh pr view` guess in
+    /// `pr_ticket_cache.rs`: when set, PR detail resolves against THIS url
+    /// instead of the branch. `None` (with `linked_pr_source` also `None`)
+    /// falls back to inference exactly as before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_pr_url: Option<String>,
+    /// Provenance of `linked_pr_url` — write-time precedence gate, see
+    /// [`ChatLinkSource`]. Always `Some` alongside a `Some` url and `None`
+    /// alongside a cleared (`None`) one; never meaningful on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_pr_source: Option<ChatLinkSource>,
+    /// Durable ticket-id link — layered over the branch-regex guess the same
+    /// way `linked_pr_url` layers over the branch-based PR guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ticket_id: Option<String>,
+    /// Provenance of `linked_ticket_id` — see [`ChatLinkSource`]/
+    /// `linked_pr_source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_ticket_source: Option<ChatLinkSource>,
 }
 
 impl Chat {
@@ -1134,6 +1194,50 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn chat_link_source_wire_shape_is_snake_case() {
+        // Deliberately snake_case (`created_in_chat`), unlike every other
+        // enum/field on `Chat` — the design fixes this exact spelling.
+        assert_eq!(serde_json::to_value(ChatLinkSource::Manual).unwrap(), serde_json::json!("manual"));
+        assert_eq!(
+            serde_json::to_value(ChatLinkSource::CreatedInChat).unwrap(),
+            serde_json::json!("created_in_chat")
+        );
+        assert_eq!(
+            serde_json::to_value(ChatLinkSource::Mentioned).unwrap(),
+            serde_json::json!("mentioned")
+        );
+    }
+
+    #[test]
+    fn chat_link_source_precedence_manual_beats_everything() {
+        use ChatLinkSource::*;
+        assert!(Manual.can_overwrite(None));
+        assert!(Manual.can_overwrite(Some(Mentioned)));
+        assert!(Manual.can_overwrite(Some(CreatedInChat)));
+        assert!(Manual.can_overwrite(Some(Manual)));
+    }
+
+    #[test]
+    fn chat_link_source_precedence_created_in_chat_never_overwrites_manual() {
+        use ChatLinkSource::*;
+        assert!(!CreatedInChat.can_overwrite(Some(Manual)));
+        assert!(CreatedInChat.can_overwrite(Some(Mentioned)));
+        assert!(CreatedInChat.can_overwrite(Some(CreatedInChat)));
+        assert!(CreatedInChat.can_overwrite(None));
+    }
+
+    #[test]
+    fn chat_link_source_precedence_mentioned_never_overwrites_created_in_chat_or_manual() {
+        use ChatLinkSource::*;
+        assert!(!Mentioned.can_overwrite(Some(Manual)));
+        assert!(!Mentioned.can_overwrite(Some(CreatedInChat)));
+        // Equal source DOES overwrite — this is what gives "most recent
+        // mention wins" among repeated `mentioned` writes.
+        assert!(Mentioned.can_overwrite(Some(Mentioned)));
+        assert!(Mentioned.can_overwrite(None));
+    }
 
     #[test]
     fn checkout_change_request_status_round_trips_all_states_as_camel_case() {

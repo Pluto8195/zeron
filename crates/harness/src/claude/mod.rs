@@ -36,6 +36,8 @@ mod discovery;
 mod normalize;
 mod wire;
 
+pub use normalize::decode_tool_use;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +96,10 @@ pub struct ClaudeHarness {
     kill_grace: Duration,
     initialize: discovery::InitializeCache,
     models_cache: crate::catalog::Catalog,
+    /// Slash commands, unlike models, depend on the cwd a probe runs in
+    /// (project-scoped `.claude/commands` and skills) — kept separate from
+    /// `initialize` for that reason; see [`discovery::CommandsCache`].
+    commands_cache: discovery::CommandsCache,
 }
 
 impl Default for ClaudeHarness {
@@ -104,6 +110,7 @@ impl Default for ClaudeHarness {
             kill_grace: Duration::from_secs(3),
             initialize: discovery::InitializeCache::default(),
             models_cache: crate::catalog::Catalog::default(),
+            commands_cache: discovery::CommandsCache::default(),
         }
     }
 }
@@ -224,24 +231,50 @@ impl ClaudeHarness {
         cmd
     }
 
-    /// Share the complete initialize response between model and command discovery.
-    /// No user message is written; the short-lived child is retired after initialize.
+    /// Share the complete initialize response for the MODEL catalog, which is
+    /// cwd-independent — the probe runs in whatever directory the engine
+    /// itself started in (equivalent to `cwd: ""`, see `probe_initialize`).
+    /// No user message is written; the short-lived child is retired after
+    /// initialize. Command discovery uses its own per-cwd probe/cache
+    /// instead (see [`Self::discover_commands`]) since project-scoped
+    /// commands/skills depend on the cwd the CLI is handed.
     async fn initialize(&self) -> Result<Value, HarnessError> {
         self.initialize
             .get(
                 || self.model_context().map(|c| c.unwrap().key()),
-                || self.probe_initialize(),
+                || self.probe_initialize(""),
             )
             .await
     }
 
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.initialize()
+    /// Slash commands for a SPECIFIC chat cwd: the CLI's `initialize`
+    /// handshake advertises project-scoped custom commands/skills discovered
+    /// from the directory it's spawned in (`<cwd>/.claude` alongside the
+    /// global `~/.claude`), so this must run in that chat's cwd rather than
+    /// the engine's own — the earlier bug: this used to fall through to the
+    /// cwd-independent `initialize()` above, which meant a chat's project
+    /// skills only ever showed up if they happened to match whatever
+    /// directory the engine process itself started in. Cached separately
+    /// per (credentials, cwd) — see [`discovery::CommandsCache`] — so
+    /// switching between chats in different repos/worktrees doesn't respawn
+    /// the CLI on every popup open.
+    async fn discover_commands(&self, cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
+        let context = self.model_context()?.unwrap().key();
+        self.commands_cache
+            .get_or_probe(context, cwd, || async {
+                self.probe_initialize(cwd)
+                    .await
+                    .map(|response| parse_initialize_commands(&response))
+            })
             .await
-            .map(|response| parse_initialize_commands(&response))
     }
 
-    async fn probe_initialize(&self) -> Result<Value, HarnessError> {
+    /// `cwd`: empty runs in the engine's own inherited directory (the model
+    /// catalog's use, which doesn't need a specific project); non-empty
+    /// spawns the CLI there instead, so its `initialize` response reflects
+    /// THAT directory's project-scoped commands/skills (command discovery's
+    /// use — see [`Self::discover_commands`]).
+    async fn probe_initialize(&self, cwd: &str) -> Result<Value, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         crate::compose_child_path(&mut cmd, &exe);
@@ -255,6 +288,12 @@ impl ClaudeHarness {
             // CLI exits immediately with a usage error.
             "--verbose",
         ]);
+        // Same convention as `build_command`: empty means "inherit the
+        // spawning process's cwd" rather than an explicit (and possibly
+        // nonexistent) path.
+        if !cwd.is_empty() {
+            cmd.current_dir(cwd);
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -419,9 +458,12 @@ impl Harness for ClaudeHarness {
     /// the same channel the Claude Agent SDK's `query()` opens. The response
     /// carries every command with description + argument hint and involves no
     /// model turn (verified live, 2.1.228: the control_response is the first
-    /// stdout line, well before any API traffic). Shared with models for two minutes.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.discover_commands().await
+    /// stdout line, well before any API traffic). Run with `cwd` so
+    /// project-scoped commands/skills for THAT chat's repo/worktree are
+    /// advertised (see [`Self::discover_commands`]); cached per (credentials,
+    /// cwd) for a few minutes.
+    async fn commands(&self, cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.discover_commands(cwd).await
     }
 
     async fn run(

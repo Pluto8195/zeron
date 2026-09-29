@@ -948,7 +948,7 @@ async fn models_discover_from_the_provider_catalog() {
     assert_eq!(models[0].id, "opencode/big-pickle");
     assert!(models[0].options.is_empty(), "v1 must not advertise agents");
     // Commands were primed off the same probe.
-    let commands = harness.commands().await.expect("commands");
+    let commands = harness.commands("").await.expect("commands");
     assert_eq!(commands[0].name, "init");
 }
 

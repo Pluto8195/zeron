@@ -76,6 +76,7 @@ pub struct DocsStore {
     failed_publications: Mutex<HashSet<String>>,
     /// Snapshot jobs wait here asynchronously before entering the blocking pool.
     pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
+    data_dir: std::path::PathBuf,
 }
 
 impl DocsStore {
@@ -92,7 +93,16 @@ impl DocsStore {
             conn: Mutex::new(conn),
             failed_publications: Mutex::new(HashSet::new()),
             snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            data_dir: data_dir.to_path_buf(),
         })
+    }
+
+    /// The directory this store was opened against (holds `docs.sqlite3`).
+    /// Lets callers that already hold a store (rather than the original
+    /// `data_dir` string) place their own sidecar files alongside it without
+    /// plumbing a second path through every constructor.
+    pub fn root(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Insert before sending. Stable IDs make crash-after-ACK replay idempotent.

@@ -388,7 +388,10 @@ impl Harness for OpencodeHarness {
         self.model_catalog(true).await.map(|c| c.models)
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    // opencode's probe server also boots without a chat cwd (see `server`'s
+    // own doc comment) — this harness's existing, deliberate simplification,
+    // unchanged here.
+    async fn commands(&self, _cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands_cache
             .get_or_try_init(|| self.probe_commands())
             .await

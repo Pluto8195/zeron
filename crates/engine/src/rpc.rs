@@ -94,6 +94,13 @@ struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
     force: bool,
+    /// `ListCommands` only: the calling chat's cwd, so project-scoped
+    /// commands/skills for THAT chat's repo/worktree are discovered (a
+    /// harness that doesn't discover per-cwd, e.g. codex/opencode/ACP
+    /// agents, ignores it). Absent/empty for `ListModels`, which doesn't
+    /// need one, and for a chat with no cwd yet (a blank new-chat screen).
+    #[serde(default)]
+    cwd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +146,74 @@ struct RelayCommandParams {
 struct TakeProjectActionSetupParams {
     chat_id: String,
     command_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportExternalSessionParams {
+    chat_id: String,
+    external_session_id: String,
+    /// The scanned candidate's own `path` field, round-tripped back verbatim
+    /// (see `ExternalSessionCandidate::path`'s doc comment for why).
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckSessionLivenessParams {
+    path: String,
+    session_id: String,
+    cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncExternalSessionParams {
+    chat_id: String,
+}
+
+/// `READ_SUBAGENT_TRANSCRIPT` request: `{chatId, agentId}` — never a path;
+/// see `methods::READ_SUBAGENT_TRANSCRIPT`'s doc comment for why.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadSubagentTranscriptParams {
+    chat_id: String,
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatLinkStatusParams {
+    chat_id: String,
+}
+
+/// `SET_CHAT_LINK` request: `{chatId, kind: "pr" | "ticket", value: string |
+/// null}`. Always writes source `manual` — the only writer allowed to CLEAR
+/// a slot (`value: null` unlinks); mined writes never ride this RPC.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetChatLinkParams {
+    chat_id: String,
+    kind: String,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// `PLAN_CHAT_WORKSPACE` request: `{message, cwd}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanChatWorkspaceParams {
+    message: String,
+    cwd: String,
+}
+
+/// `CREATE_CHAT_WORKTREE` request: `{chatId, repoPath, name}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateChatWorktreeParams {
+    chat_id: String,
+    repo_path: String,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +621,16 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     local_import: Option<crate::local_import::LocalImporter>,
+    external_import: Option<crate::external_import::ExternalSessionImporter>,
+    pr_ticket_cache: Option<crate::pr_ticket_cache::PrTicketCache>,
+    context_usage: Option<crate::context_usage::ContextUsageProvider>,
+    /// `(path, mtime)`-cached subagent transcript turn-building
+    /// (`READ_SUBAGENT_TRANSCRIPT`). Unlike `context_usage`/`pr_ticket_cache`,
+    /// this needs no shared wiring with the boot-time repair passes in
+    /// `lib.rs` — it's only ever read from this RPC handler — so it's a
+    /// plain field built fresh here rather than threaded through a
+    /// `with_*` builder from `EngineCore`.
+    subagent_transcript_cache: crate::subagent_transcript::TranscriptCache,
     engine_info: EngineInfo,
 }
 
@@ -590,6 +675,10 @@ impl EngineRpc {
             links: None,
             updater: None,
             local_import: None,
+            external_import: None,
+            pr_ticket_cache: None,
+            context_usage: None,
+            subagent_transcript_cache: crate::subagent_transcript::TranscriptCache::new(),
             engine_info,
         }
     }
@@ -623,6 +712,33 @@ impl EngineRpc {
         self
     }
 
+    /// Attach the external-session importer. Every runtime has one (unlike
+    /// `local_import`, not scope-gated) — `EngineCore::rpc_service` always
+    /// calls this.
+    pub fn with_external_import(
+        mut self,
+        importer: crate::external_import::ExternalSessionImporter,
+    ) -> Self {
+        self.external_import = Some(importer);
+        self
+    }
+
+    /// Attach the PR/ticket linkage cache (ticket 002 phase 2). Every
+    /// runtime has one (unconditional, like `external_import`) —
+    /// `EngineCore::rpc_service` always calls this.
+    pub fn with_pr_ticket_cache(mut self, cache: crate::pr_ticket_cache::PrTicketCache) -> Self {
+        self.pr_ticket_cache = Some(cache);
+        self
+    }
+
+    /// Attach the context-usage provider (`ChatContextUsage`). Every runtime
+    /// has one (unconditional, like `external_import`/`pr_ticket_cache`) —
+    /// `EngineCore::rpc_service` always calls this.
+    pub fn with_context_usage(mut self, provider: crate::context_usage::ContextUsageProvider) -> Self {
+        self.context_usage = Some(provider);
+        self
+    }
+
     fn auth(&self) -> Result<&Auth, RpcError> {
         self.auth
             .as_ref()
@@ -639,6 +755,24 @@ impl EngineRpc {
         self.local_import
             .as_ref()
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
+    }
+
+    fn external_importer(&self) -> Result<&crate::external_import::ExternalSessionImporter, RpcError> {
+        self.external_import
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("external import unavailable".into()))
+    }
+
+    fn pr_ticket_cache(&self) -> Result<&crate::pr_ticket_cache::PrTicketCache, RpcError> {
+        self.pr_ticket_cache
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("PR/ticket cache unavailable".into()))
+    }
+
+    fn context_usage(&self) -> Result<&crate::context_usage::ContextUsageProvider, RpcError> {
+        self.context_usage
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("context usage provider unavailable".into()))
     }
 
     fn local_project_action_space(&self, space_id: &str) -> Result<Space, RpcError> {
@@ -1418,14 +1552,16 @@ impl RpcService for EngineRpc {
                 // availableCommands, claude answers the initialize control
                 // request, codex lists skills; only harnesses whose wire has
                 // no listing (cursor, mock) fall through to the trait's
-                // empty default.
+                // empty default. `cwd` carries the calling chat's directory
+                // through to discovery (Claude's project-scoped
+                // commands/skills depend on it); other harnesses ignore it.
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
-                    .commands()
+                    .commands(&p.cwd)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
@@ -1813,6 +1949,305 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(Box::pin(futures::stream::poll_fn(
                     move |cx| rx.poll_recv(cx),
                 ))))
+            }
+            methods::SCAN_EXTERNAL_SESSIONS => {
+                let importer = self.external_importer()?.clone();
+                let candidates = tokio::task::spawn_blocking(move || importer.scan())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&candidates)
+            }
+            methods::IMPORT_EXTERNAL_SESSION => {
+                let p: ImportExternalSessionParams = parse_params(params)?;
+                let importer = self.external_importer()?.clone();
+                let imported = tokio::task::spawn_blocking(move || {
+                    importer.import(&p.chat_id, &p.external_session_id, std::path::Path::new(&p.path))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&imported)
+            }
+            methods::CHECK_SESSION_LIVENESS => {
+                let p: CheckSessionLivenessParams = parse_params(params)?;
+                let check = tokio::task::spawn_blocking(move || {
+                    crate::liveness::check_liveness(
+                        std::path::Path::new(&p.path),
+                        &p.session_id,
+                        &p.cwd,
+                    )
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // `LivenessCheck` isn't `Serialize` (owned by another pass,
+                // not touched here) — its two fields are `pub`, so build the
+                // reply value directly rather than widen that type.
+                RpcReply::value(&serde_json::json!({
+                    "recentlyModified": check.recently_modified,
+                    "liveProcessMatch": check.live_process_match,
+                }))
+            }
+            methods::SYNC_EXTERNAL_SESSION => {
+                let p: SyncExternalSessionParams = parse_params(params)?;
+                let importer = self.external_importer()?.clone();
+                let result = tokio::task::spawn_blocking(move || importer.sync(&p.chat_id))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&result)
+            }
+            methods::BULK_IMPORT_SESSION_CANVAS_SESSIONS => {
+                let importer = self.external_importer()?.clone();
+                // Same reasoning as IMPORT_LOCAL_WORKSPACE: this can process
+                // hundreds of files, so progress rides an unbounded channel
+                // rather than one blocking reply.
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+                tokio::task::spawn_blocking(move || {
+                    let emit = |event: crate::external_import::BulkImportEvent| {
+                        if let Ok(item) = serde_json::to_value(&event) {
+                            let _ = tx.send(item);
+                        }
+                    };
+                    if let Err(err) = importer.bulk_import_from_session_canvas(emit) {
+                        tracing::error!(error = %err, "bulk session-canvas import failed");
+                        let _ = tx.send(serde_json::json!({
+                            "kind": "summary",
+                            "total": 0, "imported": 0, "archived": 0, "failed": 0,
+                            "errors": [format!("{err}")],
+                        }));
+                    }
+                    // tx drops here — the stream ends after the summary item.
+                });
+                Ok(RpcReply::Stream(Box::pin(futures::stream::poll_fn(
+                    move |cx| rx.poll_recv(cx),
+                ))))
+            }
+            methods::CHAT_LINK_STATUS => {
+                let p: ChatLinkStatusParams = parse_params(params)?;
+                let chat = self.workspace.chat(&p.chat_id).map_err(|e| RpcError::Failed(e.to_string()))?;
+                let mut status = self.pr_ticket_cache()?.status_for(
+                    chat.as_ref().and_then(|c| c.cwd.as_deref()),
+                    chat.as_ref().and_then(|c| c.branch.as_deref()),
+                    chat.as_ref().and_then(|c| c.linked_pr_url.as_deref()),
+                    chat.as_ref().and_then(|c| c.linked_ticket_id.as_deref()),
+                );
+                if let Some(chat) = &chat {
+                    // `prSource`/`ticketSource`: the durable link's own
+                    // provenance when one is set, else `None` — the shown
+                    // value came from branch/title inference instead.
+                    status.pr_source = chat.linked_pr_url.as_ref().and(chat.linked_pr_source);
+                    status.ticket_source =
+                        chat.linked_ticket_id.as_ref().and(chat.linked_ticket_source);
+
+                    // Ticket-from-PR (design item 5): a chat with PR detail
+                    // (linked or inferred) but no ticket link and no regex
+                    // hit off its OWN branch/title gets one last shot — the
+                    // PR's own title/headRefName.
+                    let has_ticket_signal = chat.linked_ticket_id.is_some()
+                        || chat
+                            .branch
+                            .as_deref()
+                            .and_then(crate::pr_ticket_cache::extract_ticket_id)
+                            .is_some()
+                        || chat
+                            .title
+                            .as_deref()
+                            .and_then(crate::pr_ticket_cache::extract_ticket_id)
+                            .is_some();
+                    if !has_ticket_signal
+                        && let Some(pr) = &status.pr
+                        && let Some(ticket_id) = pr
+                            .title
+                            .as_deref()
+                            .and_then(crate::pr_ticket_cache::extract_ticket_id)
+                            .or_else(|| {
+                                pr.branch
+                                    .as_deref()
+                                    .and_then(crate::pr_ticket_cache::extract_ticket_id)
+                            })
+                    {
+                        match self.workspace.set_chat_link(
+                            &p.chat_id,
+                            crate::workspace_host::ChatLinkKind::Ticket,
+                            Some(&ticket_id),
+                            zeron_proto::ChatLinkSource::Mentioned,
+                        ) {
+                            Ok(true) => {
+                                status.ticket_source = Some(zeron_proto::ChatLinkSource::Mentioned);
+                            }
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(
+                                chat = %p.chat_id, error = %err,
+                                "ticket-from-PR link write failed"
+                            ),
+                        }
+                    }
+                }
+                RpcReply::value(&status)
+            }
+            methods::SET_CHAT_LINK => {
+                let p: SetChatLinkParams = parse_params(params)?;
+                let kind = match p.kind.as_str() {
+                    "pr" => crate::workspace_host::ChatLinkKind::Pr,
+                    "ticket" => crate::workspace_host::ChatLinkKind::Ticket,
+                    other => {
+                        return Err(RpcError::BadParams(format!("unknown link kind: {other}")));
+                    }
+                };
+                self.workspace
+                    .set_chat_link(
+                        &p.chat_id,
+                        kind,
+                        p.value.as_deref(),
+                        zeron_proto::ChatLinkSource::Manual,
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let chat = self.workspace.chat(&p.chat_id).map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({
+                    "linkedPrUrl": chat.as_ref().and_then(|c| c.linked_pr_url.clone()),
+                    "linkedPrSource": chat.as_ref().and_then(|c| c.linked_pr_source),
+                    "linkedTicketId": chat.as_ref().and_then(|c| c.linked_ticket_id.clone()),
+                    "linkedTicketSource": chat.as_ref().and_then(|c| c.linked_ticket_source),
+                }))
+            }
+            methods::SCAN_CHAT_SUBAGENTS => {
+                let p: ChatLinkStatusParams = parse_params(params)?;
+                let importer = self.external_importer()?.clone();
+                let provider = self.context_usage()?.clone();
+                let workspace = self.workspace.clone();
+                let subagents = tokio::task::spawn_blocking(move || {
+                    // Same two-source transcript resolution `CHAT_CONTEXT_USAGE`
+                    // uses (`ContextUsageProvider::transcript_path_for_chat`):
+                    // the import cursor alone only covers chats that went
+                    // through `ExternalSessionImporter::import` — a chat Zeron
+                    // itself launched (harness_session_id set directly by the
+                    // run loop, never imported) has no cursor at all, so
+                    // relying on the cursor exclusively silently returned no
+                    // subagents for exactly the chats most likely to have
+                    // spawned any.
+                    match provider.transcript_path_for_chat(&workspace, &importer, &p.chat_id)? {
+                        Some(path) => crate::subagent_scan::scan_subagents(&path),
+                        None => Ok(Vec::new()),
+                    }
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&subagents)
+            }
+            methods::READ_SUBAGENT_TRANSCRIPT => {
+                let p: ReadSubagentTranscriptParams = parse_params(params)?;
+                let importer = self.external_importer()?.clone();
+                let provider = self.context_usage()?.clone();
+                let workspace = self.workspace.clone();
+                let cache = self.subagent_transcript_cache.clone();
+                let transcript = tokio::task::spawn_blocking(move || {
+                    // Re-resolve the PARENT chat's transcript path server-side
+                    // — same two-source resolution `SCAN_CHAT_SUBAGENTS` uses
+                    // — then derive the subagent's own file from it. Never
+                    // trust a client-supplied path (see
+                    // `methods::READ_SUBAGENT_TRANSCRIPT`'s doc comment).
+                    let parent = provider.transcript_path_for_chat(&workspace, &importer, &p.chat_id)?;
+                    let subagent_path = parent
+                        .as_deref()
+                        .and_then(|parent| crate::subagent_scan::subagent_transcript_path(parent, &p.agent_id));
+                    match subagent_path {
+                        // An unknown chat/agent, or one whose transcript
+                        // hasn't been written (yet/anymore), resolves to a
+                        // path that just doesn't exist — the cache already
+                        // treats that as an empty transcript, not an error.
+                        Some(path) => cache.get_or_build(&path),
+                        None => Ok(std::sync::Arc::new(crate::subagent_transcript::SubagentTranscript::default())),
+                    }
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&*transcript)
+            }
+            methods::CHAT_CLASSIFICATION => {
+                let p: ChatLinkStatusParams = parse_params(params)?;
+                let importer = self.external_importer()?.clone();
+                let (classification, tool_usage) = tokio::task::spawn_blocking(move || {
+                    let classification = importer.classification_for(&p.chat_id)?;
+                    let tool_usage = importer.tool_usage_for(&p.chat_id)?;
+                    Ok::<_, crate::EngineError>((classification, tool_usage))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let (category, origin) = classification.unzip();
+                let (tool_counts, skills_loaded) = tool_usage.unzip();
+                RpcReply::value(&serde_json::json!({
+                    "category": category,
+                    "origin": origin,
+                    "toolCounts": tool_counts,
+                    "skillsLoaded": skills_loaded,
+                }))
+            }
+            methods::CHAT_CONTEXT_USAGE => {
+                let p: ChatLinkStatusParams = parse_params(params)?;
+                let provider = self.context_usage()?.clone();
+                let workspace = self.workspace.clone();
+                let importer = self.external_importer()?.clone();
+                let pct = tokio::task::spawn_blocking(move || {
+                    provider.context_pct_for_chat(&workspace, &importer, &p.chat_id)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "contextPct": pct }))
+            }
+            methods::MY_OPEN_PRS => {
+                let items = self.pr_ticket_cache()?.my_open_prs();
+                RpcReply::value(&items)
+            }
+            methods::PLAN_CHAT_WORKSPACE => {
+                let p: PlanChatWorkspaceParams = parse_params(params)?;
+                // Fresh, unpooled client: this fires at most once per new
+                // chat (see the method's own doc comment — "nothing
+                // cached"), so there's no benefit to threading a shared
+                // client through `EngineRpc` for it.
+                let http = reqwest::Client::new();
+                let plan =
+                    crate::chat_workspace_plan::plan_chat_workspace(&http, &p.message, &p.cwd).await;
+                RpcReply::value(&plan)
+            }
+            methods::CREATE_CHAT_WORKTREE => {
+                let p: CreateChatWorktreeParams = parse_params(params)?;
+                let repo_path = std::path::PathBuf::from(&p.repo_path);
+                let name = p.name.clone();
+                let worktree =
+                    tokio::task::spawn_blocking(move || {
+                        crate::chat_workspace_plan::create_chat_worktree(&repo_path, &name)
+                    })
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Stamp the chat's cwd so its next dispatch runs in the new
+                // worktree automatically (same durable field `SetChatCwd`/
+                // `Mutate` writes, and the same one `materialize_worktree`'s
+                // Run-time worktree spec stamps post-creation). Best-effort:
+                // a chat row that doesn't exist yet (`Ok(false)`) or a write
+                // error doesn't fail worktree creation itself — the worktree
+                // is real and usable either way, just not yet wired to this
+                // chat's next send.
+                match self.workspace.set_chat_cwd(&p.chat_id, &worktree.worktree_path) {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        chat = %p.chat_id,
+                        worktree = %worktree.worktree_path,
+                        "CreateChatWorktree: chat row does not exist yet, cwd not stamped"
+                    ),
+                    Err(err) => tracing::warn!(
+                        chat = %p.chat_id,
+                        worktree = %worktree.worktree_path,
+                        error = %err,
+                        "CreateChatWorktree: chat cwd stamp failed"
+                    ),
+                }
+                RpcReply::value(&worktree)
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
@@ -2719,6 +3154,85 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wire-contract pin: `SET_CHAT_LINK`'s request shape
+    /// (`{chatId, kind, value}`), including `value: null` decoding to
+    /// `None` (the unlink case) rather than failing to parse.
+    #[test]
+    fn set_chat_link_params_parse_the_documented_wire_shape() {
+        let p: SetChatLinkParams = parse_params(serde_json::json!({
+            "chatId": "c1",
+            "kind": "pr",
+            "value": "https://github.com/acme/widgets/pull/1",
+        }))
+        .unwrap();
+        assert_eq!(p.chat_id, "c1");
+        assert_eq!(p.kind, "pr");
+        assert_eq!(p.value.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+
+        let cleared: SetChatLinkParams = parse_params(serde_json::json!({
+            "chatId": "c1",
+            "kind": "ticket",
+            "value": null,
+        }))
+        .unwrap();
+        assert_eq!(cleared.kind, "ticket");
+        assert!(cleared.value.is_none());
+    }
+
+    /// `CHAT_LINK_STATUS`/`SET_CHAT_LINK` are both device-local (`gh`/CLI
+    /// state, or a workspace-doc write scoped to this device's chat rows) —
+    /// neither method is in `forwardable`'s allow-list, so both default to
+    /// IPC-only. A silent future addition to that list would relay-forward a
+    /// method whose doc comment explicitly promises otherwise.
+    #[test]
+    fn chat_link_methods_are_ipc_only() {
+        assert!(!forwardable(methods::CHAT_LINK_STATUS));
+        assert!(!forwardable(methods::SET_CHAT_LINK));
+    }
+
+    /// `SCAN_CHAT_SUBAGENTS`/`READ_SUBAGENT_TRANSCRIPT` both read this
+    /// machine's `~/.claude/projects` on-disk state — device-local, same
+    /// reasoning as the chat-link methods above.
+    #[test]
+    fn subagent_methods_are_ipc_only() {
+        assert!(!forwardable(methods::SCAN_CHAT_SUBAGENTS));
+        assert!(!forwardable(methods::READ_SUBAGENT_TRANSCRIPT));
+    }
+
+    /// `PLAN_CHAT_WORKSPACE`/`CREATE_CHAT_WORKTREE` are both device-local
+    /// (a TypeSafe judgment paired 1:1 with the worktree it feeds, and
+    /// device-local git/filesystem state) — neither is in `forwardable`'s
+    /// allow-list, same reasoning as `chat_link_methods_are_ipc_only` above.
+    #[test]
+    fn chat_workspace_plan_methods_are_ipc_only() {
+        assert!(!forwardable(methods::PLAN_CHAT_WORKSPACE));
+        assert!(!forwardable(methods::CREATE_CHAT_WORKTREE));
+    }
+
+    #[test]
+    fn plan_chat_workspace_params_parse_camel_case() {
+        let p: PlanChatWorkspaceParams = parse_params(serde_json::json!({
+            "message": "fix the login bug",
+            "cwd": "/repo",
+        }))
+        .unwrap();
+        assert_eq!(p.message, "fix the login bug");
+        assert_eq!(p.cwd, "/repo");
+    }
+
+    #[test]
+    fn create_chat_worktree_params_parse_camel_case() {
+        let p: CreateChatWorktreeParams = parse_params(serde_json::json!({
+            "chatId": "chat-1",
+            "repoPath": "/repo",
+            "name": "eng-42-do-a-thing",
+        }))
+        .unwrap();
+        assert_eq!(p.chat_id, "chat-1");
+        assert_eq!(p.repo_path, "/repo");
+        assert_eq!(p.name, "eng-42-do-a-thing");
+    }
 
     #[tokio::test]
     async fn explicit_install_rpc_verifies_archive_and_refreshes_descriptors() {

@@ -1801,7 +1801,10 @@ impl Harness for AcpHarness {
     /// the agent's advertised commands minus the spec's hidden ones, then its
     /// skills. Skills are read fresh on every call so a newly added one shows
     /// up, and they still list when discovery fails (a signed-out agent).
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// `spec.skill_dirs` is a fixed, global set of folders (see e.g.
+    /// `antigravity_skill_dirs`) — the ACP agents here don't have a chat cwd
+    /// to discover project-scoped skills from, unchanged here.
+    async fn commands(&self, _cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
         let discovered = self
             .commands
             .get_or_try_init(|| self.discover_commands())

@@ -1027,12 +1027,19 @@ impl Inner {
     }
 
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
+    /// Also the mining tap's choke point for user/assistant MESSAGE text
+    /// (ticket 0xx design item 4): every call site already hands this the
+    /// full, just-arrived text for a user prompt (dispatch) or a completed
+    /// assistant segment (Steered/Done/quiesce boundaries) — exactly "new
+    /// text", so the regex scans here stay cheap with no re-scanning.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
             return;
         }
         if let Some(ws) = self.workspace() {
             ws.note_message(chat_id, text);
+            crate::chat_links::mine_ticket_mention(&ws, chat_id, text);
+            crate::chat_links::mine_pr_mention(&ws, chat_id, text);
         }
     }
 
@@ -1554,6 +1561,13 @@ async fn drive_run(
     // folding the echo would mint an orphan chip mid-text in the NEXT
     // segment — the mid-word transcript splits.
     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Durable PR links (ticket 0xx): tool-call ids whose invocation looked
+    // like a PR-creation command (`gh pr create` per `chat_links::
+    // looks_like_pr_create`) — correlated against the matching `ToolResult`
+    // so a PR URL found there stamps `created_in_chat` rather than the
+    // weaker `mentioned`. Never pruned: a run's tool ids are unique and this
+    // set is scoped to one run's lifetime anyway.
+    let mut pr_create_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_images = std::collections::HashSet::new();
     for entry in doc_ref.read_entries().unwrap_or_default() {
         for part in entry.parts {
@@ -2143,6 +2157,39 @@ async fn drive_run(
                 continue;
             }
             _ => {}
+        }
+
+        // Durable PR links (ticket 0xx design item 4): tap tool calls/results
+        // for GitHub PR URLs, best-effort — mining never blocks or fails the
+        // run, and a write that loses precedence or hits a missing chat row
+        // silently no-ops via `WorkspaceHost::set_chat_link`'s own contract.
+        // Ticket-id mentions and PR mentions in MESSAGE text are mined at
+        // `note_message`'s own choke point instead (user prompts + completed
+        // assistant segments) — not here, to avoid double-scanning the same
+        // text at both the delta and segment level.
+        if let Some(workspace) = inner.workspace() {
+            match &event {
+                AgentEvent::ToolCall { id, call } => {
+                    let text = crate::chat_links::tool_call_invocation_text(call);
+                    if crate::chat_links::looks_like_pr_create(&text) {
+                        pr_create_tool_ids.insert(id.clone());
+                    }
+                }
+                AgentEvent::ToolResult {
+                    id,
+                    output: Some(output),
+                    ..
+                } => {
+                    if pr_create_tool_ids.contains(id) {
+                        if let Some(url) = crate::chat_links::extract_pr_url(output) {
+                            crate::chat_links::mine_pr_created(&workspace, &chat_id, &url);
+                        }
+                    } else {
+                        crate::chat_links::mine_pr_mention(&workspace, &chat_id, output);
+                    }
+                }
+                _ => {}
+            }
         }
 
         // Startup-crash retry: a run that dies before ever starting (errored

@@ -1351,7 +1351,11 @@ enum EditKind {
 
 const GENERIC_COMPOSER_CONTEXT: &str = "Composer";
 const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
-const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
+/// Key context for single-line search inputs: only this context (plus
+/// "Composer"/"MessageComposer") has editing bindings registered in
+/// `input_bindings`, so a `with_context` input in any other context gets
+/// typed characters (via the IME path) but no backspace/delete/motion.
+pub(crate) const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageEnterBindingAction {
@@ -1608,6 +1612,10 @@ pub enum ComposerInputEvent {
     ViewportChanged,
     MentionNavigate(isize),
     MentionAccept,
+    /// The secondary accept (Cmd/Ctrl+Enter) on an open completion with a
+    /// selection. The slash popup ATTACHES the row as a skill chip; other
+    /// completions treat it exactly like [`Self::MentionAccept`].
+    MentionAttach,
     MentionDismiss,
     /// Images pasted from the clipboard (screenshots / copied image data) —
     /// the wrapper stages them as attachments (use-attachments.ts onPaste).
@@ -1948,6 +1956,29 @@ impl ComposerInput {
     /// Replace a completed plain-text token (slash commands) as one
     /// non-coalescing undo step. Unlike [`Self::replace_mention`], the
     /// replacement is ordinary text — no link, no chip projection.
+    /// Delete `range` (plain text, one undo step) and park the caret there —
+    /// the slash popup's attach path turns a typed `/query` into a chip.
+    pub fn remove_plain_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        if self.read_only
+            || range.start > range.end
+            || range.end > self.content.len()
+            || !self.content.is_char_boundary(range.start)
+            || !self.content.is_char_boundary(range.end)
+        {
+            return;
+        }
+        self.record_edit(&range, "");
+        self.content = self.content[..range.start].to_owned() + &self.content[range.end..];
+        self.refresh_projection();
+        self.selected_range = range.start..range.start;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        self.needs_measure = true;
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
     pub fn replace_plain_token(
         &mut self,
         range: Range<usize>,
@@ -2638,7 +2669,7 @@ impl ComposerInput {
 
     fn modified_submit(&mut self, _: &ModifiedSubmit, _: &mut Window, cx: &mut Context<Self>) {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
-            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
+            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAttach),
             EnterOutcome::Submit => cx.emit(ComposerInputEvent::ModifiedSubmitted),
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
@@ -3916,46 +3947,163 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
-/// The `/` must open the input: slash commands are whole-prompt prefixes
-/// (`/compact`, `/goal ship it`), so only the first token triggers, and a
-/// query containing another `/` (a typed path) never does.
+/// The `/` must begin a whitespace-delimited token — the start of the input
+/// or anywhere after whitespace. Offset 0 is the whole-prompt command
+/// (`/compact`, `/goal ship it`) the CLI expands natively; mid-message
+/// tokens are plain-text skill mentions (`fix this /code-review`) the model
+/// reads and loads via its Skill tool. Either way the popup offers the same
+/// list and acceptance replaces the token with `/name `.
+///
+/// Guards, all per-token: a token containing another `/` (a typed path such
+/// as `/usr/bin` or `see /tmp/x`) never triggers, nor does one containing
+/// `@` (that shape belongs to the file-mention popup); the cursor must sit
+/// inside the token after its `/`.
 fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
-    if cursor > text.len() || !text.is_char_boundary(cursor) || !text.starts_with('/') {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
-    let end = text
+    let start = text[..cursor]
         .char_indices()
-        .find_map(|(at, ch)| ch.is_whitespace().then_some(at))
-        .unwrap_or(text.len());
-    // Cursor outside the command token (typing the argument): popup closed.
-    if cursor == 0 || cursor > end {
+        .rev()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(at + ch.len_utf8()))
+        .unwrap_or(0);
+    if !text[start..].starts_with('/') || cursor == start {
         return None;
     }
-    let query = &text[1..cursor];
-    if query.contains('/') {
+    let end = text[cursor..]
+        .char_indices()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(cursor + at))
+        .unwrap_or(text.len());
+    let body = &text[start + 1..end];
+    if body.contains('/') || body.contains('@') {
         return None;
     }
     Some(MentionToken {
-        range: 0..end,
-        query: query.to_string(),
+        range: start..end,
+        query: text[start + 1..cursor].to_string(),
     })
 }
 
+/// Height of the slash popup's key legend (22px caps + breathing room).
+const SLASH_FOOTER_HEIGHT: f32 = 30.0;
+
+/// The attach chord as the legend spells it (the `mod-enter` binding).
+fn slash_attach_key_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘↵"
+    } else {
+        "ctrl ↵"
+    }
+}
+
+/// The preamble attached-skill chips serialize into, prepended to the
+/// user's text. Plain, visible text — the model reads it and loads each
+/// named skill via its Skill tool; nothing is hidden from the transcript.
+fn skill_preamble(skills: &[String]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let list = skills
+        .iter()
+        .map(|name| format!("/{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("Load and follow these skills for this task: {list}."))
+}
+
+/// `text` with the attached-skills preamble prepended (unchanged when no
+/// skills are attached). An otherwise-empty message sends the preamble
+/// alone — a legitimate "load these" turn.
+fn with_skill_preamble(skills: &[String], text: &str) -> String {
+    match skill_preamble(skills) {
+        None => text.to_string(),
+        Some(preamble) if text.trim().is_empty() => preamble,
+        Some(preamble) => format!("{preamble}\n\n{text}"),
+    }
+}
+
+/// Add `name` to a draft's attached skills; no-op (false) if already there.
+fn attach_skill(skills: &mut Vec<String>, name: &str) -> bool {
+    if name.is_empty() || skills.iter().any(|s| s == name) {
+        return false;
+    }
+    skills.push(name.to_string());
+    true
+}
+
+/// Drop `name` from a draft's attached skills; false if it wasn't attached.
+fn detach_skill(skills: &mut Vec<String>, name: &str) -> bool {
+    let before = skills.len();
+    skills.retain(|s| s != name);
+    skills.len() != before
+}
+
+/// The span to delete when a typed `/query` token becomes a chip: the token
+/// plus one following space, so `fix /cod now` → `fix now` (not a double
+/// space) while `fix /cod` → `fix ` keeps the caret ready to type on.
+fn attach_removal_range(text: &str, token: Range<usize>) -> Range<usize> {
+    let end = if text[token.end..].starts_with(' ') {
+        token.end + 1
+    } else {
+        token.end
+    };
+    token.start..end
+}
+
 /// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// candidate list is fetched once per (harness, cwd) (`ListCommands`) and
+/// filtered locally per keystroke — no RPC, debounce, or skeleton churn while
+/// typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
     active: Option<usize>,
-    /// Harness the popup is showing commands for (cache key).
+    /// Harness the popup is showing commands for (half of the cache key).
     harness: Option<HarnessId>,
+    /// The active chat's cwd when the popup last (re)opened — empty when
+    /// none is known yet (a blank new-chat screen). The other half of the
+    /// cache key: project-scoped commands/skills differ per repo/worktree,
+    /// so a chat must never show another chat's cached list just because
+    /// they share a harness.
+    cwd: String,
     request: u64,
     loading: bool,
     error: Option<SharedString>,
     dismissed: Option<(Range<usize>, String)>,
+}
+
+/// `(harness, cwd)`: cwd is part of the cache key because a harness's
+/// advertised commands can be project-scoped (Claude Code's
+/// `.claude/commands` and skills) — two chats on the same harness but
+/// different repos/worktrees must each get their own list.
+type SlashCacheKey = (HarnessId, String);
+
+#[derive(Debug, Clone)]
+struct SlashCacheEntry {
+    commands: Vec<SlashCommand>,
+    fetched_at: Instant,
+}
+
+/// A skill/command added to a project mid-session should eventually show up
+/// without restarting zeron, but a picker reopen (or a quick tab-switch
+/// between a couple of chats) shouldn't re-fetch every time either — this is
+/// the same order of magnitude as the engine's own per-cwd discovery cache
+/// (see `zeron_harness::claude::discovery::CommandsCache`).
+const SLASH_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Whether a cached entry for `cached_key` can still answer a lookup for
+/// `key`: same (harness, cwd) AND not yet past the TTL. Pulled out as a pure
+/// function so the cache-key/invalidation decision is unit-testable without
+/// a GPUI context.
+fn slash_cache_entry_is_fresh(
+    cached_key: &SlashCacheKey,
+    fetched_at: Instant,
+    key: &SlashCacheKey,
+    now: Instant,
+) -> bool {
+    cached_key == key && now.saturating_duration_since(fetched_at) < SLASH_CACHE_TTL
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4023,6 +4171,12 @@ pub struct Composer {
     /// attachments. Each owns one screenshot that joins the existing upload
     /// path only at send time.
     pub(crate) appshots: HashMap<String, Vec<CapturedAppshot>>,
+    /// Skills attached from the slash popup (Cmd/Ctrl+Enter or the row's
+    /// ＋), keyed exactly like drafts. Per-draft: they serialize into the
+    /// outgoing message's preamble ([`with_skill_preamble`]) and clear on
+    /// send — the model keeps a loaded skill in context for the rest of the
+    /// chat, so nothing persists per chat.
+    skills: HashMap<String, Vec<String>>,
     appshot_entrances: HashMap<String, Instant>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
@@ -4038,9 +4192,10 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
-    /// Advertised commands per harness (one `ListCommands` per harness per
-    /// composer lifetime; the engine caches discovery on its side too).
-    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    /// Advertised commands per (harness, cwd) — one `ListCommands` per key
+    /// per [`SLASH_CACHE_TTL`] (the engine caches discovery on its side too,
+    /// also per-cwd for harnesses that support it).
+    slash_cache: HashMap<SlashCacheKey, SlashCacheEntry>,
     /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
     slash_scroll: gpui::ScrollHandle,
@@ -4242,7 +4397,10 @@ impl Composer {
             ComposerInputEvent::ViewportChanged => cx.notify(),
             // The slash popup and the mention popup share the input's
             // completion key routing; they are mutually exclusive by token
-            // shape (`/` at offset 0 vs `@` at a token boundary).
+            // shape (a token opening with `/` vs `@` at a token boundary —
+            // `slash_token` rejects any token containing `@`, and
+            // `on_input_edited` never opens the file popup while a slash
+            // token is live), so routing on `slash.token` is unambiguous.
             ComposerInputEvent::MentionNavigate(delta) => {
                 if this.slash.token.is_some() {
                     this.move_slash(*delta, cx)
@@ -4253,6 +4411,15 @@ impl Composer {
             ComposerInputEvent::MentionAccept => {
                 if this.slash.token.is_some() {
                     this.accept_slash(cx)
+                } else {
+                    this.accept_mention(cx)
+                }
+            }
+            // Cmd/Ctrl+Enter: the slash popup's secondary action attaches the
+            // row as a skill chip; the file popup has no second action.
+            ComposerInputEvent::MentionAttach => {
+                if this.slash.token.is_some() {
+                    this.attach_slash(cx)
                 } else {
                     this.accept_mention(cx)
                 }
@@ -4282,6 +4449,7 @@ impl Composer {
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             appshots: HashMap::new(),
+            skills: HashMap::new(),
             appshot_entrances: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
@@ -4437,6 +4605,110 @@ impl Composer {
             .get(&self.current_key)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Skills attached to the draft the composer is showing.
+    fn staged_skills(&self) -> &[String] {
+        self.skills
+            .get(&self.current_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn remove_skill(&mut self, name: &str, cx: &mut Context<Self>) {
+        let key = self.current_key.clone();
+        if let Some(list) = self.skills.get_mut(&key)
+            && detach_skill(list, name)
+        {
+            if list.is_empty() {
+                self.skills.remove(&key);
+            }
+            self.focus_pending = true;
+            cx.notify();
+        }
+    }
+
+    /// The attached-skills row: one removable chip per skill, above the input
+    /// (same strip geometry as the review-comments chip, so the pill's
+    /// arithmetic sizing stays exact — see [`comment_strip_height`]).
+    fn render_skill_chips(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let skills = self.staged_skills();
+        if skills.is_empty() {
+            return None;
+        }
+        let mut row = div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden()
+            .px(px(STRIP_PAD_X))
+            .pt(px(STRIP_PAD_TOP));
+        for (ix, name) in skills.iter().enumerate() {
+            let remove = name.clone();
+            let label: SharedString = format!("/{name}").into();
+            row = row.child(
+                div()
+                    .id(("composer-skill-chip", ix))
+                    .flex_none()
+                    .h(px(crate::badges::BADGE_HEIGHT))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .pl(px(8.0))
+                    .pr(px(4.0))
+                    .rounded(px(8.0))
+                    .bg(crate::theme::ink(0.06))
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .tooltip(|_, cx| {
+                        cx.new(|_| {
+                            crate::workspace_chip::WorkspaceChipTooltip(
+                                "Attached skill — sent as a \"load these skills\" line \
+                                 before your message. Skills stay loaded for the rest \
+                                 of the chat."
+                                    .into(),
+                            )
+                        })
+                        .into()
+                    })
+                    .tooltip_show_delay(Duration::from_millis(350))
+                    .child(
+                        crate::icons::icon(crate::icons::COMMAND)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted.opacity(0.7)),
+                    )
+                    .child(label)
+                    .child(
+                        div()
+                            .id(("composer-skill-remove", ix))
+                            .role(gpui::Role::Button)
+                            .aria_label("Remove skill")
+                            .size(px(16.0))
+                            .rounded(px(4.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.08)))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_skill(&remove, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE)
+                                    .size(px(10.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    ),
+            );
+        }
+        Some(row)
     }
 
     pub fn stage_appshot(&mut self, appshot: CapturedAppshot, cx: &mut Context<Self>) {
@@ -4617,6 +4889,7 @@ impl Composer {
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
         self.appshots.remove(chat_id);
+        self.skills.remove(chat_id);
         self.state.update(cx, |state, _| {
             state.purge_review_comments(chat_id);
         });
@@ -5044,7 +5317,13 @@ impl Composer {
             (input.text().to_string(), input.cursor_offset())
         };
         self.update_slash(&text, cursor, cx);
-        let token = mention_token(&text, cursor);
+        // A live slash token owns the completion keys; never open the file
+        // popup on top of it (defensive — the shapes are already disjoint).
+        let token = if self.slash.token.is_some() {
+            None
+        } else {
+            mention_token(&text, cursor)
+        };
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.mention
                 .dismissed
@@ -5378,13 +5657,20 @@ impl Composer {
         }
         self.slash.dismissed = None;
         let harness = self.pickers.read(cx).resolved(cx).harness;
-        let harness_changed = self.slash.harness != harness;
-        if token == self.slash.token && !harness_changed {
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone())
+            .unwrap_or_default();
+        let key_changed = self.slash.harness != harness || self.slash.cwd != cwd;
+        if token == self.slash.token && !key_changed {
             self.refilter_slash(cx);
             return;
         }
         self.slash.token = token.clone();
         self.slash.harness = harness;
+        self.slash.cwd = cwd.clone();
         self.slash.error = None;
         if token.is_none() {
             self.slash.active = None;
@@ -5397,13 +5683,21 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
+        let key: SlashCacheKey = (harness, cwd.clone());
+        let now = Instant::now();
+        let fresh = self
+            .slash_cache
+            .get(&key)
+            .is_some_and(|entry| slash_cache_entry_is_fresh(&key, entry.fetched_at, &key, now));
+        if fresh {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
+        // First open for this (harness, cwd) — or a stale/evicted entry: one
+        // ListCommands, targeted like file search (the chat/space host
+        // device owns the agent binary). A chat switch that lands back on an
+        // already-cached (harness, cwd) within the TTL never re-fetches.
         self.slash.request = self.slash.request.wrapping_add(1);
         self.slash.loading = true;
         self.refilter_slash(cx);
@@ -5420,7 +5714,7 @@ impl Composer {
         };
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
+            let mut params = serde_json::json!({ "harness": harness, "cwd": key.1 });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert("targetDeviceId".into(), target.clone().into());
             }
@@ -5433,7 +5727,13 @@ impl Composer {
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
+                            composer.slash_cache.insert(
+                                key,
+                                SlashCacheEntry {
+                                    commands,
+                                    fetched_at: Instant::now(),
+                                },
+                            );
                         }
                         Err(err) => tracing::warn!(%err, "slash command decode failed"),
                     },
@@ -5449,6 +5749,14 @@ impl Composer {
         cx.notify();
     }
 
+    /// The cache key for the popup's currently-tracked (harness, cwd), if a
+    /// harness is resolved.
+    fn slash_key(&self) -> Option<SlashCacheKey> {
+        self.slash
+            .harness
+            .map(|harness| (harness, self.slash.cwd.clone()))
+    }
+
     /// Re-rank the cached list for the current query (pure local filter).
     fn refilter_slash(&mut self, cx: &mut Context<Self>) {
         let query = self
@@ -5458,10 +5766,9 @@ impl Composer {
             .map(|t| t.query.clone())
             .unwrap_or_default();
         let commands = self
-            .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
-            .map(Vec::as_slice)
+            .slash_key()
+            .and_then(|key| self.slash_cache.get(&key))
+            .map(|entry| entry.commands.as_slice())
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
@@ -5495,27 +5802,61 @@ impl Composer {
         cx.notify();
     }
 
+    /// The command under the popup's keyboard cursor.
+    fn active_slash_command(&self) -> Option<SlashCommand> {
+        self.slash
+            .active
+            .and_then(|active| self.slash.filtered.get(active))
+            .and_then(|&ix| {
+                self.slash_key()
+                    .and_then(|key| self.slash_cache.get(&key))
+                    .and_then(|entry| entry.commands.get(ix))
+            })
+            .cloned()
+    }
+
+    /// Enter/Tab/click: replace the typed token with `/name `. At offset 0
+    /// that is the whole-prompt command the CLI expands natively (unchanged
+    /// behavior); anywhere else the same text is an inline skill mention the
+    /// model reads — no private URI scheme, it is just text.
     fn accept_slash(&mut self, cx: &mut Context<Self>) {
         let Some(token) = self.slash.token.clone() else {
             return;
         };
-        let Some(command) = self
-            .slash
-            .active
-            .and_then(|active| self.slash.filtered.get(active))
-            .and_then(|&ix| {
-                self.slash
-                    .harness
-                    .and_then(|h| self.slash_cache.get(&h))
-                    .and_then(|c| c.get(ix))
-            })
-            .cloned()
-        else {
+        let Some(command) = self.active_slash_command() else {
             return;
         };
         self.input.update(cx, |input, cx| {
             input.replace_plain_token(token.range, &format!("/{}", command.name), cx)
         });
+        self.reset_slash(None, cx);
+        cx.notify();
+    }
+
+    /// Cmd/Ctrl+Enter or the row's ＋: attach the command as a skill chip
+    /// and delete the typed `/query` token. While a queued row is being
+    /// edited there is no send to carry a preamble, so it inserts instead.
+    fn attach_slash(&mut self, cx: &mut Context<Self>) {
+        if self.editing_queued.is_some() {
+            self.accept_slash(cx);
+            return;
+        }
+        let Some(token) = self.slash.token.clone() else {
+            return;
+        };
+        let Some(command) = self.active_slash_command() else {
+            return;
+        };
+        let key = self.current_key.clone();
+        attach_skill(self.skills.entry(key).or_default(), &command.name);
+        let removal = {
+            let text = self.input.read(cx).text();
+            (token.range.end <= text.len()).then(|| attach_removal_range(text, token.range))
+        };
+        if let Some(removal) = removal {
+            self.input
+                .update(cx, |input, cx| input.remove_plain_range(removal, cx));
+        }
         self.reset_slash(None, cx);
         cx.notify();
     }
@@ -5528,6 +5869,7 @@ impl Composer {
             request,
             dismissed,
             harness: self.slash.harness,
+            cwd: self.slash.cwd.clone(),
             ..SlashState::default()
         };
         self.sync_mention_controls(cx);
@@ -5542,10 +5884,9 @@ impl Composer {
         // Only while a slash token is active.
         self.slash.token.as_ref()?;
         let commands = self
-            .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
-            .map(Vec::as_slice)
+            .slash_key()
+            .and_then(|key| self.slash_cache.get(&key))
+            .map(|entry| entry.commands.as_slice())
             .unwrap_or_default();
         // Full pill width at the mention card's height budget — both composer
         // completions share the same surface shape.
@@ -5591,6 +5932,9 @@ impl Composer {
                     }),
             );
         } else {
+            // A queued-row edit has no send to carry a preamble (attach falls
+            // back to insert there), so the affordance is hidden.
+            let can_attach = self.editing_queued.is_none();
             let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.slash.filtered.len());
             for (row_ix, &cmd_ix) in self.slash.filtered.iter().enumerate() {
                 let Some(command) = commands.get(cmd_ix) else {
@@ -5607,8 +5951,10 @@ impl Composer {
                     }
                 }
                 let description: SharedString = description.into();
+                let row_group: SharedString = format!("slash-row-{row_ix}").into();
                 rows.push(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
+                        .group(row_group.clone())
                         .id(("slash-result", row_ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.slash.active = Some(row_ix);
@@ -5616,6 +5962,7 @@ impl Composer {
                         }))
                         .child(
                             div()
+                                .w_full()
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -5642,7 +5989,12 @@ impl Composer {
                                         .text_size(crate::typography::ui_rems(12.0))
                                         .text_color(theme.text_muted)
                                         .child(description),
-                                ),
+                                )
+                                .when(can_attach, |row| {
+                                    row.child(Self::render_slash_attach_button(
+                                        theme, row_ix, selected, row_group, cx,
+                                    ))
+                                }),
                         )
                         .into_any_element(),
                 );
@@ -5657,7 +6009,11 @@ impl Composer {
                     .child(
                         div()
                             .id("slash-list")
-                            .max_h(px(312.0))
+                            .max_h(px(if can_attach {
+                                312.0 - SLASH_FOOTER_HEIGHT
+                            } else {
+                                312.0
+                            }))
                             .flex()
                             .flex_col()
                             .gap(px(crate::popover::MENU_GAP))
@@ -5667,6 +6023,9 @@ impl Composer {
                     )
                     .children(crate::popover::rail(self, "slash-scrollbar", theme, cx)),
             );
+            if can_attach {
+                card = card.child(Self::render_slash_footer(theme));
+            }
         }
         // Full pill width above the composer, matching the file-mention popup.
         Some(crate::popover::full_width_menu_above(
@@ -5674,6 +6033,74 @@ impl Composer {
             card.into_any_element(),
             None,
         ))
+    }
+
+    /// The row's secondary action: attach this command as a skill chip
+    /// instead of inserting it. Visible on the keyboard-selected row and on
+    /// hover; the click never reaches the row's own insert handler.
+    fn render_slash_attach_button(
+        theme: &Theme,
+        row_ix: usize,
+        selected: bool,
+        row_group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(("slash-attach", row_ix))
+            .role(gpui::Role::Button)
+            .aria_label("Attach skill to chat")
+            .flex_none()
+            .size(px(20.0))
+            .rounded(px(5.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .opacity(if selected { 1.0 } else { 0.0 })
+            .group_hover(row_group, |s| s.opacity(1.0))
+            .hover(|s| s.bg(crate::theme::ink(0.08)))
+            .tooltip(|_, cx| {
+                cx.new(|_| {
+                    crate::workspace_chip::WorkspaceChipTooltip(
+                        format!("Attach to chat ({})", slash_attach_key_label()).into(),
+                    )
+                })
+                .into()
+            })
+            .tooltip_show_delay(Duration::from_millis(350))
+            // Mouse-down bubbles to the card, which keeps the input focused
+            // (an unfocused input tears the popup down on the next render).
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.slash.active = Some(row_ix);
+                this.attach_slash(cx);
+                window.focus(&this.input.focus_handle(cx), cx);
+            }))
+            .child(
+                crate::icons::icon(crate::icons::PLUS)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted),
+            )
+            .into_any_element()
+    }
+
+    /// One-line legend under the slash rows: Enter inserts, the modified
+    /// Enter attaches.
+    fn render_slash_footer(theme: &Theme) -> gpui::Div {
+        div()
+            .h(px(SLASH_FOOTER_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(8.0))
+            .child(crate::popover::key_hint_text(theme, "↵", "Insert"))
+            .child(crate::popover::key_hint_text(
+                theme,
+                slash_attach_key_label(),
+                "Attach to chat",
+            ))
     }
 
     /// The popup whose rows a scrollbar drag is moving — the tokens are
@@ -5900,7 +6327,7 @@ impl Composer {
         }
         let has_text = composer_has_content(
             self.input.read(cx).text(),
-            self.staged().len() + self.staged_appshots().len(),
+            self.staged().len() + self.staged_appshots().len() + self.staged_skills().len(),
             self.staged_comments(cx).len(),
         );
         send_button_mode(self.run_live(cx), has_text)
@@ -5922,7 +6349,7 @@ impl Composer {
         let text = self.input.read(cx).text().trim().to_string();
         let no_content = !composer_has_content(
             &text,
-            self.staged().len() + self.staged_appshots().len(),
+            self.staged().len() + self.staged_appshots().len() + self.staged_skills().len(),
             self.staged_comments(cx).len(),
         );
         match self.button_mode(cx) {
@@ -5949,7 +6376,7 @@ impl Composer {
         }
         let has_content = composer_has_content(
             self.input.read(cx).text(),
-            self.staged().len() + self.staged_appshots().len(),
+            self.staged().len() + self.staged_appshots().len() + self.staged_skills().len(),
             self.staged_comments(cx).len(),
         );
         match modified_submit_target(has_content) {
@@ -5980,6 +6407,15 @@ impl Composer {
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
         let plan = self.pickers.read(cx).checkout_plan();
+        // New-chat worktree chip (`crate::workspace_chip`): taken (and reset
+        // to Auto) only for an eligible new chat — existing chats, the
+        // overview's panel (always an existing chat), non-git / remote
+        // projects and explicit checkout-picker worktrees never see it.
+        let workspace_choice = if is_new && self.pickers.read(cx).workspace_chip_eligible(cx) {
+            Some(self.pickers.update(cx, |p, _| p.take_workspace_choice()))
+        } else {
+            None
+        };
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
@@ -6044,6 +6480,9 @@ impl Composer {
             .remove(&self.current_key)
             .unwrap_or_default();
         let staged_appshots = self.appshots.remove(&self.current_key).unwrap_or_default();
+        // Attached-skill chips are per-draft: taken now, handed back on
+        // failure like the attachments.
+        let staged_skills = self.skills.remove(&self.current_key).unwrap_or_default();
         let mut staged = ordinary_staged.clone();
         staged.extend(
             staged_appshots
@@ -6062,6 +6501,9 @@ impl Composer {
             taken
         });
         let typed = text.clone();
+        // Visible preamble ahead of the user's words (never hidden prompt
+        // injection): the transcript, queue row and Run prompt all carry it.
+        let text = with_skill_preamble(&staged_skills, &text);
         let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
@@ -6208,6 +6650,31 @@ impl Composer {
             }
             cx.notify();
         });
+        if let Some(choice) = workspace_choice {
+            use crate::workspace_chip::{WorkspaceChoice, WorkspaceOutcome};
+            let initial = match choice {
+                WorkspaceChoice::Auto => WorkspaceOutcome::Deciding,
+                WorkspaceChoice::Worktree => WorkspaceOutcome::Creating,
+                WorkspaceChoice::MainCheckout => WorkspaceOutcome::Main {
+                    plan: None,
+                    note: None,
+                    warning: false,
+                },
+            };
+            self.pickers
+                .update(cx, |p, cx| p.set_workspace_outcome(&chat_id, initial, cx));
+        }
+        // Jev (the worktree chip's Auto classifier) sees the skill preamble
+        // too: an attached `/open-pr` or `/implement-ticket` is a strong
+        // "this will change code" signal. The worktree NAME still derives
+        // from the user's own words — a slug of "Load and follow these…"
+        // would name every skill-attached worktree the same.
+        let workspace_message = with_skill_preamble(&staged_skills, &typed);
+        let worktree_name_source = if typed.trim().is_empty() {
+            workspace_message.clone()
+        } else {
+            typed.clone()
+        };
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
@@ -6488,6 +6955,74 @@ impl Composer {
                     }
                 }
 
+                // Worktree chip pre-dispatch step (new chats only; after
+                // createChat so the engine has a row to stamp the worktree
+                // cwd onto). Never fails the send: every error path falls
+                // back to the base checkout.
+                if let (Some(choice), Some(repo_path)) = (workspace_choice, &space_path) {
+                    use crate::workspace_chip as wc;
+                    let set_outcome = |outcome: wc::WorkspaceOutcome, failure: Option<String>, cx: &mut gpui::AsyncApp| {
+                        let chat_id = chat_id.clone();
+                        this.update(cx, |composer, cx| {
+                            composer
+                                .pickers
+                                .update(cx, |p, cx| p.set_workspace_outcome(&chat_id, outcome, cx));
+                            if let Some(failure) = failure {
+                                composer.failure = Some(failure.into());
+                                composer.failure_key = Some(chat_id.clone());
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    };
+                    let mut create = choice.first_step() == wc::PreSendStep::Create;
+                    let mut plan_reply: Option<wc::PlanReply> = None;
+                    if choice.first_step() == wc::PreSendStep::Plan {
+                        let planned = attachments::call_with_timeout(
+                            &engine,
+                            cx.background_executor(),
+                            wc::PLAN_CHAT_WORKSPACE,
+                            serde_json::json!({ "message": workspace_message, "cwd": repo_path }),
+                            wc::PLAN_TIMEOUT,
+                        )
+                        .await
+                        .and_then(|value| wc::decode_plan(&value));
+                        if wc::should_create_after_plan(&planned) {
+                            create = true;
+                            plan_reply = planned.ok();
+                            set_outcome(wc::WorkspaceOutcome::Creating, None, cx);
+                        } else {
+                            if let Err(err) = &planned {
+                                tracing::warn!(error = %err, "PlanChatWorkspace failed; using the main checkout");
+                            }
+                            set_outcome(wc::main_after_plan(planned), None, cx);
+                        }
+                    }
+                    if create {
+                        let created = attachments::call_with_timeout(
+                            &engine,
+                            cx.background_executor(),
+                            wc::CREATE_CHAT_WORKTREE,
+                            serde_json::json!({
+                                "chatId": chat_id,
+                                "repoPath": repo_path,
+                                "name": wc::worktree_name(&worktree_name_source),
+                            }),
+                            wc::CREATE_TIMEOUT,
+                        )
+                        .await;
+                        let resolution = wc::resolve_create(created, plan_reply);
+                        if let Some(worktree) = resolution.cwd {
+                            // The engine already stamped the chat's dispatch
+                            // cwd; the Run request agrees with it.
+                            cwd = worktree;
+                        } else if let Some(failure) = &resolution.failure {
+                            tracing::warn!(error = %failure, "CreateChatWorktree failed; dispatching in the base checkout");
+                        }
+                        set_outcome(resolution.outcome, resolution.failure, cx);
+                    }
+                }
+
                 if queue {
                     // A queue row is editable UI state, so its text must stay
                     // free of the internal attachment-path trailer. The host
@@ -6697,6 +7232,15 @@ impl Composer {
                         // re-keyed to the canvas before this handler ran —
                         // no further swap will fire). Set the input directly.
                         composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    }
+                    if !staged_skills.is_empty() {
+                        // Chips attached while the send was in flight stay;
+                        // the failed send's chips rejoin them (deduped).
+                        let slot = composer.skills.entry(restore_key.clone()).or_default();
+                        let fresh = std::mem::take(slot);
+                        for name in staged_skills.iter().chain(&fresh) {
+                            attach_skill(slot, name);
+                        }
                     }
                     if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
@@ -7449,7 +7993,7 @@ impl Render for Composer {
             && !self.pickers.read(cx).is_open()
             && !composer_has_content(
                 self.input.read(cx).text(),
-                self.staged().len() + self.staged_appshots().len(),
+                self.staged().len() + self.staged_appshots().len() + self.staged_skills().len(),
                 self.staged_comments(cx).len(),
             );
         let container = container.when_some(
@@ -7511,7 +8055,10 @@ impl Render for Composer {
             self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) - 2.0 * Theme::SPACE_LG - 2.0;
         let appshot_count = self.staged_appshots().len();
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
-        let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
+        // The attached-skills row shares the comment chip's strip geometry;
+        // both fold into one height term so every sizing site below agrees.
+        let comment_strip_h = comment_strip_height(self.staged_comments(cx).len())
+            + comment_strip_height(self.staged_skills().len());
         let base_height = if self.dock_frame.is_some() {
             dock_height(dock_amount)
         } else if expanded {
@@ -7682,6 +8229,7 @@ impl Render for Composer {
         let strip = self.render_attachment_strip(&theme, cx);
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
+        let skill_chips = self.render_skill_chips(&theme, cx);
 
         // A translucent cool silver/slate edge sits more naturally on frost
         // than the general-purpose white/black separator color.
@@ -7790,6 +8338,7 @@ impl Render for Composer {
                 .flex()
                 .flex_col()
                 .children(comments_chip)
+                .children(skill_chips)
                 .children(appshot_strip)
                 .children(strip)
                 .child(
@@ -7855,6 +8404,7 @@ impl Render for Composer {
                 .flex_col()
                 .justify_end()
                 .children(comments_chip)
+                .children(skill_chips)
                 .children(appshot_strip)
                 .children(strip)
                 .child(
@@ -8095,6 +8645,42 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         (dir, window)
+    }
+
+    /// Regression: the overview search was built with a bespoke key context
+    /// ("OverviewSearch") that `input_bindings` never registers, so typing
+    /// worked (IME path) but backspace/delete/⌥⌫/⌘⌫ were dead keys. A search
+    /// input in `PALETTE_SEARCH_CONTEXT` must get the full editing set.
+    #[gpui::test]
+    fn palette_search_context_input_deletes_with_backspace_and_chords(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            init(cx, Default::default());
+        });
+        let window = cx.add_window(|_, cx| {
+            ComposerInput::with_context("Search chats…", PALETTE_SEARCH_CONTEXT, cx)
+        });
+        window
+            .update(cx, |input, window, cx| {
+                input.set_text("hello big world", cx);
+                window.focus(&input.focus_handle, cx);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let text = |cx: &mut gpui::TestAppContext| {
+            window.read_with(cx, |input, _| input.text().to_string()).unwrap()
+        };
+        cx.simulate_keystrokes(window.into(), "backspace");
+        assert_eq!(text(cx), "hello big worl");
+        let word_left = if cfg!(target_os = "macos") { "alt-backspace" } else { "ctrl-backspace" };
+        cx.simulate_keystrokes(window.into(), word_left);
+        assert_eq!(text(cx), "hello big ");
+        cx.simulate_keystrokes(window.into(), "cmd-backspace");
+        assert_eq!(text(cx), "");
     }
 
     #[gpui::test]
@@ -8628,7 +9214,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_token_only_opens_the_prompt() {
+    fn slash_token_at_prompt_start_is_unchanged() {
         assert_eq!(
             slash_token("/comp", 5),
             Some(MentionToken {
@@ -8644,8 +9230,6 @@ mod tests {
                 query: "co".into(),
             })
         );
-        // Not at offset 0 → prose, not a command.
-        assert!(slash_token("run /compact", 12).is_none());
         // Cursor past the command word (typing the argument) → closed.
         assert!(slash_token("/goal ship it", 10).is_none());
         // A typed absolute path is not a command.
@@ -8653,6 +9237,163 @@ mod tests {
         // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
         assert!(slash_token("/", 0).is_none());
         assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
+    }
+
+    #[test]
+    fn slash_token_opens_mid_message_at_a_word_boundary() {
+        assert_eq!(
+            slash_token("run /compact", 12),
+            Some(MentionToken {
+                range: 4..12,
+                query: "compact".into(),
+            })
+        );
+        // Newlines are boundaries too; the range stops at the next space.
+        assert_eq!(
+            slash_token("fix it\n/code-rev now", 16),
+            Some(MentionToken {
+                range: 7..16,
+                query: "code-rev".into(),
+            })
+        );
+        // Bare "/" after a space opens the full list.
+        assert_eq!(
+            slash_token("please /", 8),
+            Some(MentionToken {
+                range: 7..8,
+                query: String::new(),
+            })
+        );
+        // Not at a boundary: "and/or", a URL, a mid-word slash.
+        assert!(slash_token("and/or", 4).is_none());
+        assert!(slash_token("see http://x", 12).is_none());
+        assert!(slash_token("foo/bar", 7).is_none());
+    }
+
+    #[test]
+    fn slash_token_path_guard_and_cursor_rules_are_per_token() {
+        // A path anywhere in the message never triggers — the guard looks at
+        // the whole token, including what's after the cursor.
+        assert!(slash_token("see /tmp/x", 10).is_none());
+        assert!(slash_token("see /tmp/x", 8).is_none());
+        assert!(slash_token("/usr/bin", 4).is_none());
+        // ...but only THAT token: an earlier path doesn't poison a later
+        // skill mention (the old whole-input check would have).
+        assert_eq!(
+            slash_token("/usr/bin then /rev", 18).map(|t| t.range),
+            Some(14..18)
+        );
+        // Cursor on the "/" itself (before it) → closed; inside → open.
+        assert!(slash_token("run /compact", 4).is_none());
+        assert_eq!(
+            slash_token("run /compact", 6).map(|t| t.query),
+            Some("c".into())
+        );
+        // Cursor in the following word → closed.
+        assert!(slash_token("run /compact now", 15).is_none());
+        // `@` in the token belongs to the file-mention popup.
+        assert!(slash_token("/(@src", 6).is_none());
+        assert!(mention_token("/(@src", 6).is_some());
+        // Out of range / non-boundary cursors are rejected, not panics.
+        assert!(slash_token("/é", 2).is_none());
+        assert!(slash_token("/a", 9).is_none());
+    }
+
+    #[test]
+    fn skill_preamble_serializes_attached_chips() {
+        assert_eq!(skill_preamble(&[]), None);
+        assert_eq!(with_skill_preamble(&[], "hello"), "hello");
+        let one = vec!["code-review".to_string()];
+        assert_eq!(
+            with_skill_preamble(&one, "look at this"),
+            "Load and follow these skills for this task: /code-review.\n\nlook at this"
+        );
+        let three = vec!["a".to_string(), "b".to_string(), "open-pr".to_string()];
+        assert_eq!(
+            with_skill_preamble(&three, "ship it"),
+            "Load and follow these skills for this task: /a, /b, /open-pr.\n\nship it"
+        );
+        // Chips alone are a legitimate "load these" turn: preamble only.
+        assert_eq!(
+            with_skill_preamble(&three, "   "),
+            "Load and follow these skills for this task: /a, /b, /open-pr."
+        );
+        assert_eq!(
+            with_skill_preamble(&one, ""),
+            "Load and follow these skills for this task: /code-review."
+        );
+        // Attached chips count as content, so a chips-only draft can send.
+        assert!(composer_has_content("", one.len(), 0));
+    }
+
+    #[test]
+    fn skill_chips_add_dedupe_and_remove() {
+        let mut skills = Vec::new();
+        assert!(attach_skill(&mut skills, "a"));
+        assert!(attach_skill(&mut skills, "b"));
+        assert!(!attach_skill(&mut skills, "a"), "duplicates are ignored");
+        assert!(!attach_skill(&mut skills, ""), "empty names are ignored");
+        assert_eq!(skills, vec!["a".to_string(), "b".to_string()]);
+        assert!(detach_skill(&mut skills, "a"));
+        assert!(!detach_skill(&mut skills, "a"));
+        assert_eq!(skills, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn attaching_removes_the_typed_token_without_a_double_space() {
+        let text = "fix /cod now";
+        let token = slash_token(text, 8).unwrap().range;
+        let removal = attach_removal_range(text, token);
+        let mut out = text.to_string();
+        out.replace_range(removal, "");
+        assert_eq!(out, "fix now");
+
+        let text = "fix /cod";
+        let removal = attach_removal_range(text, slash_token(text, 8).unwrap().range);
+        let mut out = text.to_string();
+        out.replace_range(removal, "");
+        assert_eq!(out, "fix ");
+
+        let text = "/cod";
+        let removal = attach_removal_range(text, slash_token(text, 4).unwrap().range);
+        assert_eq!(removal, 0..4);
+    }
+
+    /// Pins the cache design behind the project-skills fix: the slash-command
+    /// cache is keyed by (harness, cwd) — not harness alone — so two chats on
+    /// the same harness but different repos/worktrees never share a cached
+    /// list, and an entry past the TTL is treated as a miss even for its own
+    /// key (so a skill added to the project mid-session eventually appears).
+    #[test]
+    fn slash_cache_freshness_checks_key_and_ttl() {
+        let key = (HarnessId::ClaudeCode, "/repo/a".to_string());
+        let now = Instant::now();
+
+        // Same key, no time elapsed: fresh.
+        assert!(slash_cache_entry_is_fresh(&key, now, &key, now));
+        // Same key, still within the TTL: fresh.
+        assert!(slash_cache_entry_is_fresh(
+            &key,
+            now,
+            &key,
+            now + Duration::from_secs(299)
+        ));
+        // Same key, past the TTL: stale, must refetch.
+        assert!(!slash_cache_entry_is_fresh(
+            &key,
+            now,
+            &key,
+            now + Duration::from_secs(301)
+        ));
+
+        // Different cwd, same harness, no time elapsed: a DIFFERENT repo's
+        // cached commands must never answer this chat's lookup.
+        let other_cwd = (HarnessId::ClaudeCode, "/repo/b".to_string());
+        assert!(!slash_cache_entry_is_fresh(&key, now, &other_cwd, now));
+
+        // Same cwd, different harness: also a miss.
+        let other_harness = (HarnessId::Codex, "/repo/a".to_string());
+        assert!(!slash_cache_entry_is_fresh(&key, now, &other_harness, now));
     }
 
     #[test]

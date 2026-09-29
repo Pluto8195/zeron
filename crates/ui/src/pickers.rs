@@ -11,7 +11,7 @@
 //! in free functions with unit tests; RPC results land in [`Loadable`] slots
 //! rendered as skeletons / inline errors with Retry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -20,6 +20,7 @@ use gpui::{
     Subscription, Task, Window, div, prelude::*, px,
 };
 
+use zeron_engine::external_import::{ExternalSessionCandidate, ImportedSession};
 use zeron_engine::registry::HarnessDescriptor;
 use zeron_proto::{
     ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
@@ -51,6 +52,7 @@ use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+use crate::workspace_chip::{WorkspaceChipTooltip, WorkspaceChoice, WorkspaceOutcome};
 
 /// Dev/testing knob: `ZERON_SLOW_CATALOG_MS=<ms>` delays every harness and
 /// model catalog result app-side — the chip/tab/list loading states are
@@ -469,6 +471,9 @@ pub enum PickerKind {
     /// New-session canvas only: the device project-less sessions run on (a
     /// project pick implies its own host and overrides this).
     Device,
+    /// New-session canvas only: browse Claude Code sessions found on disk
+    /// (started outside Zeron) and import one into a brand-new chat.
+    Import,
 }
 
 pub(crate) struct ReturnComposerFocus;
@@ -573,6 +578,38 @@ pub struct Pickers {
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
+    /// External-session candidates (`~/.claude/projects` sessions Zeron
+    /// didn't launch itself), newest first.
+    import_candidates: Loadable<Vec<ExternalSessionCandidate>>,
+    import_candidates_task: Option<Task<()>>,
+    /// Session id of the candidate currently being imported, if any (disables
+    /// its row and shows a spinner instead of the pick affordance).
+    importing: Option<String>,
+    import_task: Option<Task<()>>,
+    /// Last import failure, shown inline until the next open/retry.
+    import_error: Option<String>,
+    /// Session id currently being liveness-checked (the brief gap between a
+    /// click and either importing outright or showing a confirm prompt).
+    import_checking: Option<String>,
+    import_checking_task: Option<Task<()>>,
+    /// Session id whose row is showing "might still be active — import
+    /// anyway?" pending a second click. Cleared on picking a different row
+    /// or reopening the picker.
+    import_confirm_pending: Option<String>,
+    /// Session ids checked (via multi-select checkbox) for bulk import.
+    import_selected: HashSet<String>,
+    /// Bulk import in flight: (completed, total).
+    import_bulk_progress: Option<(usize, usize)>,
+    import_bulk_task: Option<Task<()>>,
+    /// Count of selected candidates that came back liveness-concerning,
+    /// awaiting one aggregate confirmation before the batch runs.
+    import_bulk_confirm_pending: Option<usize>,
+    /// New-chat worktree chip pick (`Auto` default, one-shot per new chat —
+    /// taken + reset by the composer's first send; never persisted).
+    workspace_choice: WorkspaceChoice,
+    /// Per-chat outcome of that pick (pending/decided), shown as a badge in
+    /// the session footer. In-memory: it narrates this app session's sends.
+    workspace_outcomes: HashMap<String, WorkspaceOutcome>,
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
@@ -619,6 +656,7 @@ impl Pickers {
             | ComposerInputEvent::ViewportChanged
             | ComposerInputEvent::MentionNavigate(_)
             | ComposerInputEvent::MentionAccept
+            | ComposerInputEvent::MentionAttach
             | ComposerInputEvent::MentionDismiss => {}
         });
         // Chat selection / config changes must re-render the chips (child views
@@ -647,6 +685,7 @@ impl Pickers {
                 this.load_task = None;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
+                this.workspace_choice = WorkspaceChoice::default();
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
@@ -733,6 +772,20 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             mutate_task: None,
+            import_candidates: Loadable::Idle,
+            import_candidates_task: None,
+            importing: None,
+            import_task: None,
+            import_error: None,
+            import_checking: None,
+            import_checking_task: None,
+            import_confirm_pending: None,
+            import_selected: HashSet::new(),
+            import_bulk_progress: None,
+            import_bulk_task: None,
+            import_bulk_confirm_pending: None,
+            workspace_choice: WorkspaceChoice::default(),
+            workspace_outcomes: HashMap::new(),
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
@@ -1049,6 +1102,7 @@ impl Pickers {
             PickerKind::HarnessModel => self.selected_model_index(cx),
             PickerKind::Space => self.selected_space_index(cx),
             PickerKind::Device => self.selected_device_index(cx),
+            PickerKind::Import => 0,
         };
         if kind == PickerKind::HarnessModel {
             // scroll_to_item below may land anywhere; the first note of the
@@ -1090,6 +1144,17 @@ impl Pickers {
                 });
                 window.focus(&handle, cx);
             }
+            PickerKind::Import => {
+                self.import_error = None; // stale failures don't linger past a reopen
+                self.import_confirm_pending = None;
+                self.import_selected.clear();
+                self.import_bulk_confirm_pending = None;
+                let handle = self.search.read(cx).focus_handle(cx);
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder("Search sessions…", cx);
+                });
+                window.focus(&handle, cx);
+            }
             _ => window.focus(&self.focus, cx),
         }
         match kind {
@@ -1107,6 +1172,9 @@ impl Pickers {
                 // timeout/fallback result until the application restarts.
                 self.prefetch_models(true, cx);
             }
+            // Force: sessions on disk change between opens (new terminal
+            // sessions, prior imports) — always rescan.
+            PickerKind::Import => self.ensure_import_candidates(true, cx),
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
         }
@@ -1383,6 +1451,38 @@ impl Pickers {
                 {
                     pickers.active = pickers.selected_ref_index(cx);
                 }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// ScanExternalSessions: Claude Code sessions on disk not yet imported.
+    /// No space-scoping (unlike `ensure_refs`) — the scan is machine-wide.
+    fn ensure_import_candidates(&mut self, force: bool, cx: &mut Context<Self>) {
+        if !force && !matches!(self.import_candidates, Loadable::Idle) {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.import_candidates = Loadable::Loading;
+        self.import_error = None;
+        self.import_candidates_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::SCAN_EXTERNAL_SESSIONS, serde_json::json!({}))
+                .await;
+            this.update(cx, |pickers, cx| {
+                pickers.import_candidates = match result {
+                    Ok(value) => {
+                        match serde_json::from_value::<Vec<ExternalSessionCandidate>>(value) {
+                            Ok(rows) => Loadable::Ready(rows),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        }
+                    }
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
                 cx.notify();
             })
             .ok();
@@ -1932,6 +2032,131 @@ impl Pickers {
         }
     }
 
+    // ---- the new-chat worktree chip (see `crate::workspace_chip`) ----
+
+    /// Whether the worktree chip applies to the current draft: the new-chat
+    /// canvas, a git project, the checkout picker left on plain "Current
+    /// checkout" (an explicit "New worktree" / existing-worktree pick already
+    /// decided), and a project on THIS device (the chip's RPCs run local git).
+    pub fn workspace_chip_eligible(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        if state.selected_chat.is_some() {
+            return false;
+        }
+        let git = state
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
+        let local_target = state
+            .effective_device_id()
+            .is_none_or(|id| state.local_device_id.as_deref() == Some(id.as_str()));
+        git && local_target && matches!(self.checkout_plan(), CheckoutPlan::CurrentCheckout { .. })
+    }
+
+    /// The draft pick for the send about to happen; resets to `Auto` so the
+    /// next new chat starts fresh (explicit picks are one-shot).
+    pub fn take_workspace_choice(&mut self) -> WorkspaceChoice {
+        std::mem::take(&mut self.workspace_choice)
+    }
+
+    pub fn set_workspace_outcome(
+        &mut self,
+        chat_id: &str,
+        outcome: WorkspaceOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_outcomes.insert(chat_id.to_string(), outcome);
+        cx.notify();
+    }
+
+    /// The clickable draft chip: cycles Auto → Worktree → Main checkout.
+    fn render_workspace_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.workspace_chip_eligible(cx) {
+            return None;
+        }
+        let id = "picker-workspace-choice";
+        let choice = self.workspace_choice;
+        let icon_path = match choice {
+            WorkspaceChoice::MainCheckout => crate::icons::FOLDER,
+            WorkspaceChoice::Auto | WorkspaceChoice::Worktree => crate::icons::FOLDER_WITH_FILES,
+        };
+        let tooltip = SharedString::from(choice.tooltip());
+        Some(
+            div()
+                .id(id)
+                .h(px(20.0))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .rounded(px(FOOTER_CHIP_RADIUS))
+                .text_size(crate::typography::ui_rems(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(motion::hover_blend(
+                    id,
+                    theme.text_muted.opacity(0.7),
+                    theme.text.opacity(0.8),
+                ))
+                .bg(motion::hover_blend(
+                    id,
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                ))
+                .on_hover(motion::hover_listener(id))
+                .cursor_pointer()
+                .tooltip(move |_, cx| cx.new(|_| WorkspaceChipTooltip(tooltip.clone())).into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.workspace_choice = this.workspace_choice.next();
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(icon_path)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(SharedString::from(choice.label()))
+                .into_any_element(),
+        )
+    }
+
+    /// Post-send badge for a chat this app session sent through the chip.
+    fn render_workspace_outcome(&self, chat_id: &str, theme: &Theme) -> Option<AnyElement> {
+        let outcome = self.workspace_outcomes.get(chat_id)?;
+        let color = if outcome.is_warning() {
+            theme.warning.opacity(0.85)
+        } else {
+            theme.text_muted.opacity(0.6)
+        };
+        let icon_path = match outcome {
+            WorkspaceOutcome::Main { warning: true, .. } => crate::icons::DANGER_TRIANGLE,
+            WorkspaceOutcome::Main { .. } => crate::icons::FOLDER,
+            _ => crate::icons::FOLDER_WITH_FILES,
+        };
+        let tooltip = SharedString::from(outcome.tooltip());
+        Some(
+            div()
+                .id("composer-workspace-outcome")
+                .h(px(20.0))
+                .max_w(px(200.0))
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(color)
+                .when(outcome.is_pending(), |el| el.opacity(0.75))
+                .tooltip(move |_, cx| cx.new(|_| WorkspaceChipTooltip(tooltip.clone())).into())
+                .child(crate::icons::icon(icon_path).size(px(12.0)).text_color(color))
+                .child(div().min_w_0().truncate().child(outcome.label()))
+                .into_any_element(),
+        )
+    }
+
     /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
     /// `resolveCurrentWorkspaceLabel`).
     fn checkout_label(&self) -> &'static str {
@@ -2039,6 +2264,234 @@ impl Pickers {
         self.close(cx);
     }
 
+    /// One `ImportExternalSession` RPC call — the shared primitive the
+    /// single-row pick and the bulk-import loop both use.
+    async fn call_import_external_session(
+        engine: &EngineHandle,
+        chat_id: String,
+        candidate: &ExternalSessionCandidate,
+    ) -> Result<ImportedSession, String> {
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "externalSessionId": candidate.session_id,
+            "path": candidate.path,
+        });
+        match engine
+            .client()
+            .call(methods::IMPORT_EXTERNAL_SESSION, params)
+            .await
+        {
+            Ok(value) => {
+                serde_json::from_value::<ImportedSession>(value).map_err(|e| e.to_string())
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// One `CheckSessionLiveness` RPC call. `None` means it couldn't be
+    /// determined (RPC/transport failure) — callers treat that the same as
+    /// "not concerning": this gate is best-effort and never hard-blocks, so
+    /// a false negative here is no worse than the check never having run.
+    async fn call_check_liveness(
+        engine: &EngineHandle,
+        candidate: &ExternalSessionCandidate,
+    ) -> Option<bool> {
+        let params = serde_json::json!({
+            "path": candidate.path,
+            "sessionId": candidate.session_id,
+            "cwd": candidate.cwd.clone().unwrap_or_default(),
+        });
+        let value = engine
+            .client()
+            .call(methods::CHECK_SESSION_LIVENESS, params)
+            .await
+            .ok()?;
+        let recently_modified = value
+            .get("recentlyModified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let live_process_match = value
+            .get("liveProcessMatch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Some(recently_modified || live_process_match)
+    }
+
+    /// Import one scanned candidate: mint a chat_id client-side (matching how
+    /// a normal send mints one, `composer.rs`'s `Composer::send`), call
+    /// `ImportExternalSession`, then select the resulting chat. Does NOT
+    /// close the picker on dispatch (only on success/failure) — the row shows
+    /// a spinner and stays visible so a slow import doesn't read as a no-op.
+    ///
+    /// Liveness-gated: this is the entry point for a row click. A first click
+    /// runs `CheckSessionLiveness` first — a clean result imports immediately
+    /// (no behavior change for the common case); a concerning one instead
+    /// shows an inline "might still be active" confirm state on the row, and
+    /// only a *second* click on that same row (matched below) proceeds with
+    /// the actual import, skipping the check the second time.
+    fn pick_import_candidate(&mut self, candidate: ExternalSessionCandidate, cx: &mut Context<Self>) {
+        if self.importing.is_some() || self.import_checking.is_some() || self.import_bulk_task.is_some() {
+            return; // one operation at a time
+        }
+        if self.import_confirm_pending.as_deref() == Some(candidate.session_id.as_str()) {
+            self.import_confirm_pending = None;
+            self.run_single_import(candidate, cx);
+            return;
+        }
+        // A click on a row other than the one currently pending confirmation
+        // (if any) drops that stale state — only the row just clicked matters.
+        self.import_confirm_pending = None;
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.import_checking = Some(candidate.session_id.clone());
+        cx.notify();
+        self.import_checking_task = Some(cx.spawn(async move |this, cx| {
+            let concerning = Self::call_check_liveness(&engine, &candidate)
+                .await
+                .unwrap_or(false);
+            this.update(cx, |pickers, cx| {
+                pickers.import_checking = None;
+                if concerning {
+                    pickers.import_confirm_pending = Some(candidate.session_id.clone());
+                    cx.notify();
+                } else {
+                    pickers.run_single_import(candidate, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Actually perform one import — the liveness gate (if any) has already
+    /// passed by the time this runs.
+    fn run_single_import(&mut self, candidate: ExternalSessionCandidate, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.importing = Some(candidate.session_id.clone());
+        self.import_error = None;
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        self.import_task = Some(cx.spawn(async move |this, cx| {
+            let result = Self::call_import_external_session(&engine, chat_id, &candidate).await;
+            this.update(cx, |pickers, cx| {
+                pickers.importing = None;
+                match result {
+                    Ok(imported) => {
+                        pickers
+                            .state
+                            .update(cx, |s, cx| s.select_chat(Some(imported.chat_id), cx));
+                        pickers.close(cx);
+                        // The imported chat is now on disk; a re-scan on the
+                        // next open must not offer it again.
+                        pickers.import_candidates = Loadable::Idle;
+                    }
+                    Err(err) => {
+                        pickers.import_error = Some(err);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Toggle a candidate's bulk-import checkbox.
+    fn toggle_import_selected(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if !self.import_selected.remove(&session_id) {
+            self.import_selected.insert(session_id);
+        }
+        cx.notify();
+    }
+
+    /// Import every checked candidate. `skip_liveness_check` is true only on
+    /// the confirm-and-proceed call after [`Self::import_bulk_confirm_pending`]
+    /// was shown — a fresh invocation always checks first. If any selected
+    /// candidate comes back concerning, the batch stops before importing
+    /// anything and shows one aggregate confirmation rather than interrupting
+    /// mid-batch per row.
+    fn run_bulk_import(&mut self, skip_liveness_check: bool, cx: &mut Context<Self>) {
+        if self.importing.is_some() || self.import_checking.is_some() || self.import_bulk_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let selected_ids = self.import_selected.clone();
+        let candidates: Vec<ExternalSessionCandidate> = self
+            .import_candidates
+            .ready()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|c| selected_ids.contains(&c.session_id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            return;
+        }
+        self.import_error = None;
+        self.import_bulk_confirm_pending = None;
+        let total = candidates.len();
+        self.import_bulk_progress = Some((0, total));
+        cx.notify();
+        self.import_bulk_task = Some(cx.spawn(async move |this, cx| {
+            if !skip_liveness_check {
+                let mut concerning = 0usize;
+                for candidate in &candidates {
+                    if Self::call_check_liveness(&engine, candidate)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        concerning += 1;
+                    }
+                }
+                if concerning > 0 {
+                    this.update(cx, |pickers, cx| {
+                        pickers.import_bulk_progress = None;
+                        pickers.import_bulk_task = None;
+                        pickers.import_bulk_confirm_pending = Some(concerning);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            }
+            let mut errors: Vec<String> = Vec::new();
+            for (done, candidate) in candidates.iter().enumerate() {
+                let chat_id = uuid::Uuid::new_v4().to_string();
+                let result = Self::call_import_external_session(&engine, chat_id, candidate).await;
+                if let Err(err) = result {
+                    let label = candidate.cwd.clone().unwrap_or_else(|| candidate.session_id.clone());
+                    errors.push(format!("{label}: {err}"));
+                }
+                this.update(cx, |pickers, cx| {
+                    pickers.import_bulk_progress = Some((done + 1, total));
+                    cx.notify();
+                })
+                .ok();
+            }
+            this.update(cx, |pickers, cx| {
+                pickers.import_bulk_progress = None;
+                pickers.import_bulk_task = None;
+                pickers.import_selected.clear();
+                // Whatever landed is now claimed; a re-scan must not offer it
+                // again (mirrors the single-import success path).
+                pickers.import_candidates = Loadable::Idle;
+                if !errors.is_empty() {
+                    pickers.import_error = Some(format!(
+                        "{} of {total} failed: {}",
+                        errors.len(),
+                        errors.join("; ")
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// Persist the device/project picks — the "last selected" defaults the
     /// next boot's canvas restores.
     fn remember_target(&mut self, cx: &App) {
@@ -2080,6 +2533,30 @@ impl Pickers {
         let rows = self.device_rows(cx);
         let names: Vec<String> = rows.iter().map(|d| d.name.clone()).collect();
         popover::filter_indices(&query, &names)
+            .into_iter()
+            .map(|ix| rows[ix].clone())
+            .collect()
+    }
+
+    /// [`Self::import_candidates`]'s ready rows filtered by the search box
+    /// (matched against cwd/title/preview text).
+    fn filtered_import_rows(&self, cx: &App) -> Vec<ExternalSessionCandidate> {
+        let query = self.search.read(cx).text().to_string();
+        let rows = self.import_candidates.ready().cloned().unwrap_or_default();
+        if query.trim().is_empty() {
+            return rows;
+        }
+        let hay: Vec<String> = rows
+            .iter()
+            .map(|c| {
+                [c.cwd.as_deref(), c.title.as_deref(), c.preview.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        popover::filter_indices(&query, &hay)
             .into_iter()
             .map(|ix| rows[ix].clone())
             .collect()
@@ -2175,6 +2652,291 @@ impl Pickers {
             .flex_col()
             .child(self.search_box(&theme))
             .child(body)
+            .into_any_element()
+    }
+
+    /// The import popover: search + one row per Claude Code session found on
+    /// disk (cwd, relative mtime, title-or-preview). No liveness warning here
+    /// (a separate, deliberately later piece) — picking a row imports
+    /// immediately.
+    fn render_import_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).for_popup();
+        let now = chrono::Utc::now();
+        let all_empty = self.import_candidates.ready().is_none_or(|r| r.is_empty());
+        let rows = self.filtered_import_rows(cx);
+        let active = self.active;
+        let importing = self.importing.clone();
+        let checking = self.import_checking.clone();
+        let confirm_pending = self.import_confirm_pending.clone();
+        let selected = self.import_selected.clone();
+        let bulk_running = self.import_bulk_task.is_some();
+        let entity = cx.entity().downgrade();
+        let scrollbar = popover::rail(self, "import-scrollbar", &theme, cx);
+
+        let body: AnyElement = if matches!(
+            self.import_candidates,
+            Loadable::Loading | Loadable::Idle
+        ) {
+            popover::skeleton_rows("import-skeleton", &theme, 4, cx.entity_id(), cx)
+        } else if let Some(error) = self.import_candidates.error() {
+            let message = error.to_string();
+            self.retry_row("import-retry", &message, PickerKind::Import, &theme, cx)
+        } else if rows.is_empty() {
+            let empty: &str = if all_empty {
+                "No external sessions found."
+            } else {
+                "No sessions match."
+            };
+            div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(empty))
+                .into_any_element()
+        } else {
+            popover::menu_scroll_host("import-list-host")
+                .on_hover(cx.listener(Self::on_menu_list_hover))
+                .child(
+                    popover::menu_scroll_list("import-list", &self.menu_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(280.0))
+                        .children(rows.into_iter().enumerate().map(|(ix, candidate)| {
+                            let is_importing = importing.as_deref() == Some(&candidate.session_id);
+                            let is_checking = checking.as_deref() == Some(&candidate.session_id);
+                            let is_confirm_pending =
+                                confirm_pending.as_deref() == Some(&candidate.session_id);
+                            let is_busy = is_importing || is_checking;
+                            let is_checked = selected.contains(&candidate.session_id);
+                            let cwd: SharedString = candidate
+                                .cwd
+                                .clone()
+                                .unwrap_or_else(|| "Unknown folder".to_string())
+                                .into();
+                            let subtitle: SharedString = if is_confirm_pending {
+                                "This session looks like it might still be active — click again to import anyway.".into()
+                            } else {
+                                candidate
+                                    .title
+                                    .clone()
+                                    .or_else(|| candidate.preview.clone())
+                                    .unwrap_or_default()
+                                    .into()
+                            };
+                            let when: SharedString = chrono::DateTime::from_timestamp_millis(
+                                candidate.modified_at_ms,
+                            )
+                            .map(|dt| crate::state::format_time_ago(dt, now))
+                            .unwrap_or_default()
+                            .into();
+                            let pick = candidate.clone();
+                            let checkbox_id = candidate.session_id.clone();
+                            let toggle_entity = entity.clone();
+                            popover::menu_row_nav(&theme, false, ix == active, format!("import-row-{ix}"))
+                                .id(("import-row", ix))
+                                .when(!is_busy, |el| {
+                                    el.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.pick_import_candidate(pick.clone(), cx);
+                                    }))
+                                })
+                                .when(is_busy, |el| el.cursor_default())
+                                .when(is_confirm_pending, |el| {
+                                    el.bg(theme.warning.opacity(0.08))
+                                })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .pr(px(4.0))
+                                        .child(
+                                            gpui_base::Checkbox::new(("import-select", ix))
+                                                .checked(is_checked)
+                                                .disabled(bulk_running)
+                                                .size(px(14.0))
+                                                .border_1()
+                                                .rounded(px(3.0))
+                                                .border_color(if is_checked {
+                                                    theme.accent
+                                                } else {
+                                                    theme.border
+                                                })
+                                                .bg(if is_checked {
+                                                    theme.accent
+                                                } else {
+                                                    gpui::transparent_black()
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .when(is_checked, |checkbox| {
+                                                    checkbox.child(
+                                                        crate::icons::icon(crate::icons::CHECK)
+                                                            .size(px(10.0))
+                                                            .text_color(theme.bg),
+                                                    )
+                                                })
+                                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .on_change(move |_, _, _, cx| {
+                                                    let id = checkbox_id.clone();
+                                                    let _ = toggle_entity.update(cx, |this, cx| {
+                                                        this.toggle_import_selected(id, cx);
+                                                    });
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(div().truncate().child(cwd))
+                                        .when(!subtitle.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .when(!is_confirm_pending, |el| el.truncate())
+                                                    .text_size(crate::typography::ui_rems(11.0))
+                                                    .text_color(if is_confirm_pending {
+                                                        theme.warning
+                                                    } else {
+                                                        theme.text_muted.opacity(0.7)
+                                                    })
+                                                    .child(subtitle),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(10.0))
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(if is_importing {
+                                            SharedString::from("Importing…")
+                                        } else if is_checking {
+                                            SharedString::from("Checking…")
+                                        } else if is_confirm_pending {
+                                            SharedString::from("Click to confirm")
+                                        } else {
+                                            when
+                                        }),
+                                )
+                        })),
+                )
+                .children(scrollbar)
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(self.search_box(&theme))
+            .when_some(self.import_error.clone(), |el, error| {
+                el.child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .pb(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.warning)
+                        .child(SharedString::from(format!("Import failed: {error}"))),
+                )
+            })
+            .child(body)
+            .child(self.render_import_bulk_footer(&theme, cx))
+            .into_any_element()
+    }
+
+    /// Bulk-import footer: the "Import N selected" action, the running
+    /// batch's progress, or the aggregate liveness confirmation — whichever
+    /// applies. Empty (no footer row at all) when nothing is selected and no
+    /// batch is running.
+    fn render_import_bulk_footer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(concerning) = self.import_bulk_confirm_pending {
+            return div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .px(px(Theme::SPACE_SM))
+                .py(px(6.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.warning)
+                        .child(SharedString::from(format!(
+                            "{concerning} of these look like they might still be active — import anyway?"
+                        ))),
+                )
+                .child(
+                    div()
+                        .id("import-bulk-confirm")
+                        .flex_none()
+                        .self_start()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(theme.warning.opacity(0.15))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.warning)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.run_bulk_import(true, cx);
+                        }))
+                        .child(SharedString::from("Import anyway")),
+                )
+                .into_any_element();
+        }
+        if let Some((done, total)) = self.import_bulk_progress {
+            return div()
+                .flex()
+                .items_center()
+                .px(px(Theme::SPACE_SM))
+                .py(px(6.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!("Importing {done} of {total}…")))
+                .into_any_element();
+        }
+        let count = self.import_selected.len();
+        if count == 0 {
+            return div().into_any_element();
+        }
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!("{count} selected"))),
+            )
+            .child(
+                div()
+                    .id("import-bulk-run")
+                    .flex_none()
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(theme.accent.opacity(0.15))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.run_bulk_import(false, cx);
+                    }))
+                    .child(SharedString::from(format!("Import {count} selected"))),
+            )
             .into_any_element()
     }
 
@@ -2402,6 +3164,7 @@ impl Pickers {
                     }
                     Some(PickerKind::Space) => self.filtered_space_rows(cx).len() + 1,
                     Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
+                    Some(PickerKind::Import) => self.filtered_import_rows(cx).len(),
                     None => 0,
                 };
                 let current = (self.active != NO_ACTIVE_ROW).then_some(self.active);
@@ -2463,6 +3226,7 @@ impl Pickers {
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Space => "picker-space",
             PickerKind::Device => "picker-device",
+            PickerKind::Import => "picker-import",
         };
         let open = self.open_kind() == Some(kind);
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
@@ -2650,6 +3414,10 @@ impl Pickers {
                 let content = self.render_device_popover(cx);
                 Some((PickerKind::Device, self.popover_frame(224.0, content, cx)))
             }
+            Some(PickerKind::Import) => {
+                let content = self.render_import_popover(cx);
+                Some((PickerKind::Import, self.popover_frame(380.0, content, cx)))
+            }
             _ => None,
         };
         let (device_label, project_label, offline) = {
@@ -2689,6 +3457,14 @@ impl Pickers {
             &theme,
             cx,
         );
+        let import_chip = self.footer_chip(
+            PickerKind::Import,
+            "picker-import",
+            crate::icons::FOLDER_WITH_FILES,
+            SharedString::from("Import session"),
+            &theme,
+            cx,
+        );
         div()
             .flex_none()
             .flex()
@@ -2702,11 +3478,18 @@ impl Pickers {
                 "device-popover",
                 closing,
             ))
-            .child(attach_overlay_end(
+            .child(attach_overlay(
                 project_chip,
                 &mut overlay,
                 PickerKind::Space,
                 "project-popover",
+                closing,
+            ))
+            .child(attach_overlay_end(
+                import_chip,
+                &mut overlay,
+                PickerKind::Import,
+                "import-popover",
                 closing,
             ))
             .into_any_element()
@@ -2760,6 +3543,7 @@ impl Pickers {
             &theme,
             cx,
         );
+        let workspace_chip = self.render_workspace_chip(&theme, cx);
         Some(
             workspace_footer_row()
                 .child(attach_overlay_below(
@@ -2776,6 +3560,7 @@ impl Pickers {
                     "branch-popover",
                     closing,
                 ))
+                .children(workspace_chip)
                 .into_any_element(),
         )
     }
@@ -2851,6 +3636,9 @@ impl Pickers {
                         .unwrap_or_else(|| SharedString::from("No ref")),
                     &theme,
                 ));
+            // The worktree chip's outcome for a chat this session sent
+            // (pending "Deciding…" → "worktree: <branch>" / "main checkout").
+            let right = right.children(self.render_workspace_outcome(&chat.id, &theme));
             // Checkout + branch stay together. PR and usage form the trailing
             // status group, independently of the branch label's length.
             return Some(
@@ -2942,6 +3730,7 @@ impl Pickers {
                 "branch-popover",
                 closing,
             ));
+        let right = right.children(self.render_workspace_chip(&theme, cx));
         Some(row().child(left).child(right).into_any_element())
     }
 
@@ -3063,6 +3852,7 @@ impl Pickers {
                             this.catalog_rev += 1;
                             this.ensure_harnesses(false, cx);
                         }
+                        PickerKind::Import => this.ensure_import_candidates(true, cx),
                         // Projects/devices load nothing; no retry surface exists.
                         PickerKind::Space | PickerKind::Device => {}
                     }))
@@ -4730,7 +5520,8 @@ impl Render for Pickers {
             Some(PickerKind::Branch)
             | Some(PickerKind::Checkout)
             | Some(PickerKind::Space)
-            | Some(PickerKind::Device) => None,
+            | Some(PickerKind::Device)
+            | Some(PickerKind::Import) => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
                 Some((

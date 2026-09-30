@@ -252,23 +252,149 @@ case "$turnline" in
   ;;
 
 *scenario:approve*)
-  # Wire policy is always "never" (unattended parity with the Claude
-  # adapter); the requests below are the STRAY-approval path, which must
-  # still round-trip as input questions.
-  has "$thread_line" '"approvalPolicy":"never"' ||
-    { fail_turn "$tid" "thread approvalPolicy should be never"; exit 0; }
-  has "$turnline" '"approvalPolicy":"never"' ||
-    { fail_turn "$tid" "turn approvalPolicy should be never"; exit 0; }
+  # Non-yolo runs (auto_approve=false) speak "on-request" + the request's own
+  # sandbox (workspace-write here) on BOTH thread/start and turn/start;
+  # approvals are then real server requests that must round-trip as input
+  # questions. The second request is shaped like codex-cli 0.154.0's: the
+  # file-change request carries only an itemId (paths live on the item).
+  for want in '"approvalPolicy":"on-request"' '"sandbox":"workspace-write"'; do
+    has "$thread_line" "$want" ||
+      { fail_turn "$tid" "thread param missing: $want"; exit 0; }
+  done
+  for want in '"approvalPolicy":"on-request"' \
+    '"sandboxPolicy":{"networkAccess":true,"type":"workspaceWrite"}'; do
+    has "$turnline" "$want" ||
+      { fail_turn "$tid" "turn param missing: $want"; exit 0; }
+  done
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
-  emit '{"id":101,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /tmp/x"}}'
+  emit '{"id":101,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","threadId":"th-1","turnId":"t-1","command":"rm -rf /tmp/x","reason":"outside the workspace","availableDecisions":["accept","cancel"]}}'
   read -r a1 || exit 1
   { has "$a1" '"id":101' && has "$a1" '"decision":"accept"'; } ||
     { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"command approval not accepted"}}}}'; exit 0; }
-  emit '{"id":102,"method":"item/fileChange/requestApproval","params":{"itemId":"f1","changes":[{"path":"/tmp/a.rs","kind":"update"}]}}'
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"f1","type":"fileChange","status":"inProgress","changes":[{"path":"/tmp/a.rs","kind":{"type":"update"},"diff":"x"}]}}}'
+  emit '{"id":102,"method":"item/fileChange/requestApproval","params":{"itemId":"f1","threadId":"th-1","turnId":"t-1","reason":null,"grantRoot":null}}'
   read -r a2 || exit 1
   { has "$a2" '"id":102' && has "$a2" '"decision":"accept"'; } ||
     { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"file approval not accepted"}}}}'; exit 0; }
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
+*scenario:ask-yolo*)
+  # auto_approve=true: "never" + danger-full-access on the wire; a stray
+  # approval is accepted outright WITHOUT consulting the user (the test's
+  # input bridge would answer "No").
+  for want in '"approvalPolicy":"never"' '"sandbox":"danger-full-access"'; do
+    has "$thread_line" "$want" ||
+      { fail_turn "$tid" "thread param missing: $want"; exit 0; }
+  done
+  for want in '"approvalPolicy":"never"' '"sandboxPolicy":{"type":"dangerFullAccess"}'; do
+    has "$turnline" "$want" ||
+      { fail_turn "$tid" "turn param missing: $want"; exit 0; }
+  done
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":151,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"ls"}}'
+  read -r a1 || exit 1
+  { has "$a1" '"id":151' && has "$a1" '"decision":"accept"'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"yolo approval not accepted"}}}}'; exit 0; }
+  # Permission-profile grants are not a yolo surface: rejected as unsupported.
+  emit '{"id":152,"method":"item/permissions/requestApproval","params":{"itemId":"p1","permissions":{"network":{"enabled":true}}}}'
+  read -r a2 || exit 1
+  { has "$a2" '"id":152' && has "$a2" '"error"'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"expected yolo permissions error"}}}}'; exit 0; }
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
+*scenario:ask-readonly*)
+  # A non-yolo run honors the request's sandbox level (no forced override).
+  has "$thread_line" '"sandbox":"read-only"' ||
+    { fail_turn "$tid" "thread sandbox should be read-only"; exit 0; }
+  has "$turnline" '"sandboxPolicy":{"type":"readOnly"}' ||
+    { fail_turn "$tid" "turn sandbox should be readOnly"; exit 0; }
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
+*scenario:ask-dropped*)
+  # The user-input channel is dropped mid-approval (engine teardown): the
+  # harness must tell codex to CANCEL, never silently allow.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":301,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /"}}'
+  read -r a1 || exit 1
+  { has "$a1" '"id":301' && has "$a1" '"decision":"cancel"'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"expected cancel"}}}}'; exit 0; }
+  emit '{"method":"turn/aborted","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
+*scenario:ask-eof*)
+  # The app server dies while an approval is pending: the run must end with an
+  # errored Done instead of hanging on the unanswered question.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":351,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /"}}'
+  exit 0
+  ;;
+
+*scenario:ask-steer*)
+  # Steering still lands while an approval sits unanswered.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":401,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  if has "$steerline" '"method":"turn/steer"' && has "$steerline" 'redirect please'; then
+    emit "{\"id\":$sid,\"result\":{}}"
+    emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  else
+    emit "{\"id\":$sid,\"error\":{\"code\":-32600,\"message\":\"bad steer\"}}"
+    emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"steer verification failed"}}}}'
+  fi
+  ;;
+
+*scenario:ask-interrupt*)
+  # turn/interrupt still works with an approval unanswered.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":451,"method":"item/commandExecution/requestApproval","params":{"itemId":"c1","command":"rm -rf /"}}'
+  read -r intline || exit 1
+  iid=$(rid "$intline")
+  if has "$intline" '"method":"turn/interrupt"' && has "$intline" '"turnId":"t-1"'; then
+    emit "{\"id\":$iid,\"result\":{}}"
+    emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"interrupted"}}}'
+  else
+    emit "{\"id\":$iid,\"result\":{}}"
+    emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"expected turn/interrupt"}}}}'
+  fi
+  ;;
+
+*scenario:ask-permissions*)
+  # item/permissions/requestApproval: Yes echoes the requested profile back
+  # (scope "turn"); No grants nothing.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":501,"method":"item/permissions/requestApproval","params":{"itemId":"p1","threadId":"th-1","turnId":"t-1","cwd":"/w","reason":"needs network","permissions":{"network":{"enabled":true},"fileSystem":null}}}'
+  read -r a1 || exit 1
+  if has "$a1" '"id":501' && has "$a1" '"scope":"turn"' && has "$a1" '"network":{"enabled":true}'; then
+    emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"granted"}}'
+  elif has "$a1" '"id":501' && has "$a1" '"scope":"turn"' && has "$a1" '"permissions":{}'; then
+    emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"refused"}}'
+  else
+    emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"bad permissions reply"}}}}'; exit 0
+  fi
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
+*scenario:ask-subagent*)
+  # An approval raised by a CHILD thread (same app-server, other threadId).
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"id":601,"method":"item/commandExecution/requestApproval","params":{"itemId":"c9","threadId":"child-alpha","turnId":"alpha-1","command":"make deploy"}}'
+  read -r a1 || exit 1
+  { has "$a1" '"id":601' && has "$a1" '"decision":"decline"'; } ||
+    { emit '{"method":"turn/failed","params":{"turn":{"id":"t-1","error":{"message":"expected decline"}}}}'; exit 0; }
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 

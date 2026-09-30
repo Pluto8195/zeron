@@ -3,9 +3,27 @@
 //! uses. Resurrected from the pre-ACP driver and modernized.
 //!
 //! VERSION PIN: the app-server API is EXPERIMENTAL (`capabilities.
-//! experimentalApi`); this driver is validated against codex-cli 0.153.4 —
-//! imageGeneration additionally follows the 0.154.0 schema (savedPath only).
+//! experimentalApi`); this driver was validated against codex-cli 0.153.4 and
+//! re-checked against 0.154.0 (schema via `app-server generate-json-schema
+//! --experimental`, plus a live headless probe of the approval surface).
 //! Revalidate the method/notification surface when bumping past it.
+//!
+//! 0.154.0 surface differences hit (all additive/tolerated):
+//! - `item/fileChange/requestApproval` carries only `itemId` (+ nullable
+//!   `reason`/`grantRoot`) — NO `changes`; the paths are on the preceding
+//!   `item/started` fileChange item (tracked per item id for the prompt).
+//! - `item/commandExecution/requestApproval` adds `availableDecisions`
+//!   (live: `["accept", {acceptWithExecpolicyAmendment}, "cancel"]` — it does
+//!   NOT list `decline`, yet `decline` is accepted and ends the item as
+//!   `declined` while the turn continues), `proposedExecpolicyAmendment`,
+//!   `reason`, `commandActions`, `environmentId`, `startedAtMs`.
+//! - `serverRequest/resolved` and `thread/status/changed`
+//!   (`activeFlags: ["waitingOnApproval"]`) notifications accompany approvals
+//!   (ignored). `turn/interrupt` while an approval is pending ends the turn
+//!   `interrupted` without any reply to the request.
+//! - imageGeneration follows the 0.154.0 schema (savedPath only).
+//! - The user's `model = "gpt-5.5"` default 404s on this machine; nothing to
+//!   do with the harness (zeron always sends an explicit model).
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
 //!   the `initialized` notification; unknown notification methods tolerated.
@@ -15,12 +33,25 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
-//!   the sandbox is forced to `danger-full-access` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs). Stray
-//!   `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Approvals + sandbox follow `RunRequest::auto_approve`:
+//!   - `true` (yolo): approval policy `"never"` + sandbox forced to
+//!     `danger-full-access` — parity with the Claude adapter's
+//!     bypass-permissions mode; the wire never surfaces approvals.
+//!   - `false`: approval policy `"on-request"` + the request's own sandbox
+//!     (zeron sends `workspace-write`, network on). Sandbox escalations arrive
+//!     as server requests — `item/commandExecution/requestApproval`,
+//!     `item/fileChange/requestApproval`, `item/permissions/requestApproval` —
+//!     and round-trip through [`RunControls::request_input`] as a synthesized
+//!     Yes/No question (the engine's input bridge owns the
+//!     `InputRequested`/`InputResolved` lifecycle). Yes → `accept` (permissions:
+//!     the requested profile, scope `turn`), No → `decline` (deny, turn
+//!     continues), answer channel dropped → `cancel` (deny + abort the turn).
+//!     There is no wall-clock timeout, like every other input-bridge question;
+//!     the main loop never blocks on a pending approval, so steering and
+//!     interrupt still work, and pending prompts are dropped with the session.
+//!     `mcpServer/elicitation/request` and the legacy v1 approval methods stay
+//!     unsupported (JSON-RPC error = denied).
+//!   - Title runs are always read-only + `"never"`.
 //! - Subagents are full child app-server threads. Parent spawn items establish
 //!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
@@ -59,7 +90,7 @@ use zeron_proto::{
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::process::{Child, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls};
+use crate::{CancellationToken, Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
@@ -651,17 +682,19 @@ impl CodexHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
-        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
-        // Parity with the Claude adapter, which auto-approves every
-        // can_use_tool and so effectively grants full access. This also
-        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
-        // worktree on a slash-named branch derives a malformed mount that
-        // kills every command.
+        // `auto_approve` (yolo): danger-full-access + approvalPolicy "never"
+        // (set below) — codex's --dangerously-bypass-approvals-and-sandbox
+        // equivalent. This also sidesteps codex ≤0.144.x's workspace-write
+        // bug where a linked worktree on a slash-named branch derives a
+        // malformed mount that kills every command. Without `auto_approve`
+        // the request's own sandbox level is honored and approvals are
+        // "on-request" (see [`approval_policy_for`]).
         request.sandbox = if title_only {
             zeron_proto::SandboxLevel::ReadOnly
-        } else {
+        } else if request.auto_approve {
             zeron_proto::SandboxLevel::DangerFullAccess
+        } else {
+            request.sandbox
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -795,6 +828,19 @@ impl TurnRouter {
     }
 }
 
+/// The wire approval policy. `"never"` for yolo runs and the read-only title
+/// run; `"on-request"` otherwise — codex's standard "Auto" preset: commands
+/// run in the sandbox and only sandbox escalations ask. (`"untrusted"` would
+/// prompt for every non-read-only command, which is the noise yolo mode was
+/// introduced to avoid.) Both words verified against codex-cli 0.154.0.
+fn approval_policy_for(auto_approve: bool, title_only: bool) -> &'static str {
+    if auto_approve || title_only {
+        "never"
+    } else {
+        "on-request"
+    }
+}
+
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -838,14 +884,15 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (zeron sessions run unattended; combined
-    // with the danger-full-access override above this is codex's yolo mode):
-    // never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // `auto_approve` (and the title run, which is read-only with no tools to
+    // approve) is yolo: policy "never", so the wire never surfaces approvals
+    // ("on-request" on an unattended run turned every command into a yes/no
+    // question — user report: "asking me for approval at every step"). A
+    // run without `auto_approve` uses "on-request" + the request's sandbox:
+    // the model works inside the sandbox and only ESCALATIONS (writes outside
+    // the workspace, network, unsandboxed commands) reach
+    // `handle_server_request` → `request_input`.
+    let approval_policy = approval_policy_for(request.auto_approve, title_only);
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -1064,11 +1111,33 @@ async fn run_session(session: Session) {
     let mut done_current = false;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // Approval prompts outlive the loop iteration that spawned them; they stop
+    // waiting when the session ends (dropping the guard cancels the token).
+    let approvals_done = CancellationToken::new();
+    let _approvals_guard = approvals_done.clone().drop_guard();
+    // fileChange item id → affected paths, for approval prompts (see
+    // [`ApprovalCtx::file_paths`]). Recorded for every thread, before routing.
+    let mut file_change_paths: HashMap<String, Vec<String>> = HashMap::new();
 
     'main: loop {
         tokio::select! {
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
+                if matches!(method.as_str(), "item/started" | "item/completed") {
+                    let item = params.get("item").unwrap_or(&Value::Null);
+                    if matches!(item_type(item), "fileChange" | "file_change") {
+                        let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+                        if method == "item/started" {
+                            if file_change_paths.len() >= 256 {
+                                file_change_paths.clear();
+                            }
+                            file_change_paths.insert(id, file_change_item_paths(item));
+                        }
+                        // A request can land just after its item completes
+                        // (declined items complete instantly), so entries
+                        // are evicted by the size cap, not on completion.
+                    }
+                }
                 // Foreign-thread traffic FIRST: a child thread's turn/thread
                 // bookkeeping must never reach the parent turn router below
                 // (a child's turn/completed would settle the PARENT turn).
@@ -1325,6 +1394,11 @@ async fn run_session(session: Session) {
                         &params,
                         request.auto_approve,
                         &request_input,
+                        &ApprovalCtx {
+                            root_thread: &thread_id,
+                            file_paths: &file_change_paths,
+                            done: &approvals_done,
+                        },
                     );
                 }
 
@@ -1533,11 +1607,75 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
+/// Session context an approval needs beyond the request itself.
+struct ApprovalCtx<'a> {
+    /// The parent thread; a request from any other thread is a subagent's.
+    root_thread: &'a str,
+    /// `fileChange` item id → paths, from the item's `item/started` (0.154.0's
+    /// `item/fileChange/requestApproval` carries only the item id).
+    file_paths: &'a HashMap<String, Vec<String>>,
+    /// Cancelled when the session ends; pending approval tasks stop waiting.
+    done: &'a CancellationToken,
+}
+
+/// The user's verdict on one approval question. `Gone` = the answer channel
+/// was dropped (engine tore the run down): nobody is left to ask, so codex is
+/// told to cancel the turn rather than retry something the user never saw.
+enum Verdict {
+    Accept,
+    Decline,
+    Gone,
+}
+
+/// Ask the user one yes/no question through the engine's input bridge. `None`
+/// when the session ended while waiting (nothing left to reply to).
+async fn ask_yes_no(
+    request_input: Arc<RequestInputFn>,
+    question: UserInputQuestion,
+    done: CancellationToken,
+) -> Option<Verdict> {
+    // The engine's input bridge owns the `InputRequested`/`InputResolved`
+    // lifecycle (it mints the request id the resolver is parked under);
+    // emitting our own copy here doubled the doc's input part with an id
+    // `respond_input` could never match. There is deliberately no wall-clock
+    // timeout — same as the Claude path's AskUserQuestion and every other
+    // harness's input bridge; the turn stays interruptible and steerable
+    // while this waits (the main loop never blocks on it).
+    let rx = (request_input)(vec![question.clone()]);
+    let answers = tokio::select! {
+        answers = rx => answers,
+        _ = done.cancelled() => return None,
+    };
+    Some(match answers {
+        Err(_) => Verdict::Gone,
+        Ok(answers) => {
+            let accept = answers.iter().any(|a| {
+                a.question_id == question.id
+                    && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
+            });
+            if accept {
+                Verdict::Accept
+            } else {
+                Verdict::Decline
+            }
+        }
+    })
+}
+
 /// Serve one server→client request. Approval requests round-trip through
 /// `request_input` as a synthesized yes/no question (in a subtask so the
 /// message loop keeps flowing); with `auto_approve` they're accepted outright
 /// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
 /// rejected as unsupported so the server never wedges awaiting a reply.
+///
+/// Wire shapes (codex-cli 0.154.0, `generate-json-schema --experimental`):
+/// `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`
+/// answer `{ decision: "accept" | "decline" | "cancel" | … }`
+/// (`decline` = deny and continue the turn, `cancel` = deny and interrupt it);
+/// `item/permissions/requestApproval` answers `{ permissions, scope }`.
+/// Approvals from subagent child threads arrive on this same channel (the
+/// app-server multiplexes every thread) and surface in the parent chat,
+/// labelled as a subagent's.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
@@ -1545,6 +1683,7 @@ fn handle_server_request(
     params: &Value,
     auto_approve: bool,
     request_input: &Arc<RequestInputFn>,
+    ctx: &ApprovalCtx<'_>,
 ) {
     // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
     // question, never auto-approvable — route it to the input bridge and
@@ -1575,9 +1714,13 @@ fn handle_server_request(
     }
     let is_approval = matches!(
         method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
     );
-    if !is_approval {
+    // Permission-profile grants only exist off the yolo path (policy "never"
+    // never asks); keep the yolo branch's behavior exactly as it was.
+    if !is_approval || (auto_approve && method == "item/permissions/requestApproval") {
         tracing::debug!(
             target: "zeron_harness::codex",
             "unhandled server request: {method}"
@@ -1590,27 +1733,43 @@ fn handle_server_request(
         return;
     }
 
-    let question = approval_question(method, params);
+    let paths = params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .and_then(|item| ctx.file_paths.get(item))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let from_subagent = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .is_some_and(|thread| !thread.is_empty() && thread != ctx.root_thread);
+    let question = approval_question(method, params, paths, from_subagent);
     let client = client.clone();
     let request_input = Arc::clone(request_input);
+    let done = ctx.done.clone();
+    let is_permissions = method == "item/permissions/requestApproval";
+    let requested = params.get("permissions").cloned().unwrap_or(Value::Null);
     tokio::spawn(async move {
-        // The engine's input bridge owns the `InputRequested`/`InputResolved`
-        // lifecycle (it mints the request id the resolver is parked under);
-        // emitting our own copy here doubled the doc's input part with an id
-        // `respond_input` could never match.
-        //
-        // A dropped sender (caller went away) degrades to a decline so the
-        // agent is unblocked — never silently allowed.
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
-        let accept = answers.iter().any(|a| {
-            a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
-        });
-        client.respond(
-            &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
-        );
+        let Some(verdict) = ask_yes_no(request_input, question, done).await else {
+            return;
+        };
+        // Never silently allowed: a dropped resolver cancels, "No" declines.
+        if is_permissions {
+            // The granted profile mirrors the requested one; a refusal grants
+            // nothing (scope "turn": never a durable session-wide grant).
+            let granted = match verdict {
+                Verdict::Accept => requested,
+                Verdict::Decline | Verdict::Gone => json!({}),
+            };
+            client.respond(&id, json!({ "permissions": granted, "scope": "turn" }));
+            return;
+        }
+        let decision = match verdict {
+            Verdict::Accept => "accept",
+            Verdict::Decline => "decline",
+            Verdict::Gone => "cancel",
+        };
+        client.respond(&id, json!({ "decision": decision }));
     });
 }
 
@@ -1672,9 +1831,33 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
         .collect()
 }
 
+/// The `changes[].path`s of a `fileChange` item (empty when absent).
+fn file_change_item_paths(item: &Value) -> Vec<String> {
+    item.get("changes")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Synthesize the yes/no question an approval request surfaces to the user.
-fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
-    let (header, question) = if method.contains("commandExecution") {
+/// `paths` are the affected files when the wire carries none of its own
+/// (0.154.0 file-change approvals); `from_subagent` labels a child thread's.
+fn approval_question(
+    method: &str,
+    params: &Value,
+    paths: &[String],
+    from_subagent: bool,
+) -> UserInputQuestion {
+    let reason = params
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    let (header, mut question) = if method.contains("commandExecution") {
         let command = match params.get("command") {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Array(parts)) => parts
@@ -1692,8 +1875,23 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
                 format!("Codex wants to run `{command}`. Allow it?")
             },
         )
+    } else if method.contains("permissions") {
+        let mut requested = params
+            .get("permissions")
+            .map(Value::to_string)
+            .unwrap_or_default();
+        if requested.chars().count() > 300 {
+            requested = requested.chars().take(300).collect::<String>() + "…";
+        }
+        (
+            "Approve permissions".to_owned(),
+            format!(
+                "Codex requests additional permissions for this turn: {requested}. Allow them?"
+            ),
+        )
     } else {
-        let paths: Vec<&str> = params
+        // Older builds inline the changes; 0.154.0 leaves them on the item.
+        let inline: Vec<&str> = params
             .get("changes")
             .and_then(Value::as_array)
             .map(|a| a.as_slice())
@@ -1701,18 +1899,30 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
             .iter()
             .filter_map(|c| c.get("path").and_then(Value::as_str))
             .collect();
+        let listed = if inline.is_empty() {
+            paths.join(", ")
+        } else {
+            inline.join(", ")
+        };
         (
             "Approve file change".to_owned(),
-            if paths.is_empty() {
+            if listed.is_empty() {
                 "Codex wants to modify files. Allow it?".to_owned()
             } else {
-                format!("Codex wants to modify {}. Allow it?", paths.join(", "))
+                format!("Codex wants to modify {listed}. Allow it?")
             },
         )
     };
+    if let Some(reason) = reason {
+        question.push_str(&format!(" Reason: {reason}"));
+    }
     UserInputQuestion {
         id: new_message_id(),
-        header,
+        header: if from_subagent {
+            format!("{header} (subagent)")
+        } else {
+            header
+        },
         question,
         options: vec!["Yes".into(), "No".into()],
         multi_select: false,
@@ -1749,6 +1959,8 @@ mod tests {
         let q = approval_question(
             "item/commandExecution/requestApproval",
             &json!({"itemId": "c1", "command": "rm -rf /tmp/x"}),
+            &[],
+            false,
         );
         assert_eq!(q.header, "Approve command");
         assert!(q.question.contains("rm -rf /tmp/x"));
@@ -1758,16 +1970,38 @@ mod tests {
         let q = approval_question(
             "item/fileChange/requestApproval",
             &json!({"changes": [{"path": "/a.rs"}, {"path": "/b.rs"}]}),
+            &[],
+            false,
         );
         assert_eq!(q.header, "Approve file change");
         assert!(q.question.contains("/a.rs, /b.rs"));
+
+        // 0.154.0 carries no changes on the request: paths come from the item.
+        let q = approval_question(
+            "item/fileChange/requestApproval",
+            &json!({"itemId": "f1", "reason": "needs write access"}),
+            &["/w/hello.txt".to_string()],
+            true,
+        );
+        assert_eq!(q.header, "Approve file change (subagent)");
+        assert!(q.question.contains("/w/hello.txt"));
+        assert!(q.question.ends_with("Reason: needs write access"));
 
         // Command as argv array joins with spaces.
         let q = approval_question(
             "item/commandExecution/requestApproval",
             &json!({"command": ["git", "push", "--force"]}),
+            &[],
+            false,
         );
         assert!(q.question.contains("git push --force"));
+    }
+
+    #[test]
+    fn approval_policy_is_never_only_for_yolo_and_title_runs() {
+        assert_eq!(approval_policy_for(true, false), "never");
+        assert_eq!(approval_policy_for(false, true), "never");
+        assert_eq!(approval_policy_for(false, false), "on-request");
     }
 
     #[test]

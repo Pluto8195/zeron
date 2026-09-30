@@ -467,6 +467,298 @@ async fn approval_no_answer_becomes_decline() {
     );
 }
 
+/// Non-yolo request: the run's own sandbox + "on-request" approvals.
+fn gated_request(prompt: &str) -> RunRequest {
+    let mut req = request(prompt);
+    req.auto_approve = false;
+    req
+}
+
+/// Controls whose input bridge records each question and then NEVER answers
+/// (the sender is parked, not dropped): a user who walked away.
+fn silent_controls() -> (
+    RunControls,
+    mpsc::Sender<SteerMessage>,
+    CancellationToken,
+    mpsc::UnboundedReceiver<UserInputQuestion>,
+) {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let (asked_tx, asked_rx) = mpsc::unbounded_channel();
+    let parked: Arc<Mutex<Vec<oneshot::Sender<Vec<UserInputAnswer>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            parked.lock().unwrap().push(tx);
+            for q in questions {
+                let _ = asked_tx.send(q);
+            }
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    (controls, steer_tx, token, asked_rx)
+}
+
+#[tokio::test]
+async fn auto_approve_keeps_yolo_wire_and_never_asks_the_user() {
+    // The fake verifies "never" + danger-full-access on thread/start AND
+    // turn/start, accepts the stray approval without an answer from the user
+    // (the bridge below answers "No" — it must not be consulted), and expects
+    // the permission-profile request to be rejected as unsupported.
+    let asked = Arc::new(Mutex::new(0usize));
+    let seen = asked.clone();
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let _steer = steer_tx;
+    let controls = RunControls {
+        request_input: Box::new(move |_| {
+            *seen.lock().unwrap() += 1;
+            let (_tx, rx) = oneshot::channel();
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let mut req = request("scenario:ask-yolo");
+    // A requested sandbox is overridden, not honored, under auto_approve.
+    req.sandbox = SandboxLevel::ReadOnly;
+    let events = run_to_end(&harness(), req, controls).await;
+    assert_eq!(*asked.lock().unwrap(), 0, "{events:?}");
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_yolo_run_honors_the_requested_sandbox() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = gated_request("scenario:ask-readonly");
+    req.sandbox = SandboxLevel::ReadOnly;
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn file_change_approval_lists_paths_from_the_item_and_carries_reason() {
+    // codex-cli 0.154.0's fileChange approval has only an itemId; the paths
+    // come from the item's `item/started`. The scenario:approve fake emits
+    // exactly that shape (plus a command request with a `reason`).
+    let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let _steer = steer_tx;
+    let seen = asked.clone();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            seen.lock().unwrap().extend(questions.iter().cloned());
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(
+                questions
+                    .iter()
+                    .map(|q| UserInputAnswer {
+                        question_id: q.id.clone(),
+                        labels: vec!["Yes".into()],
+                    })
+                    .collect(),
+            );
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let events = run_to_end(&harness(), gated_request("scenario:approve"), controls).await;
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 2, "{events:?}");
+    assert!(asked[0].question.contains("Reason: outside the workspace"));
+    assert_eq!(asked[1].header, "Approve file change");
+    assert!(asked[1].question.contains("/tmp/a.rs"), "{:?}", asked[1]);
+}
+
+#[tokio::test]
+async fn subagent_thread_approval_is_labelled_and_declined_on_no() {
+    let (controls, _steer, _token) = controls("No");
+    let events = run_to_end(&harness(), gated_request("scenario:ask-subagent"), controls).await;
+    // The fake completes only after seeing `decline` for the child's request.
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let _steer = steer_tx;
+    let seen = asked.clone();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            seen.lock().unwrap().extend(questions.iter().cloned());
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    run_to_end(&harness(), gated_request("scenario:ask-subagent"), controls).await;
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].header, "Approve command (subagent)");
+    assert!(asked[0].question.contains("make deploy"));
+}
+
+#[tokio::test]
+async fn permission_profile_request_grants_on_yes_and_nothing_on_no() {
+    for (label, expect) in [("Yes", "granted"), ("No", "refused")] {
+        let (controls, _steer, _token) = controls(label);
+        let events = run_to_end(
+            &harness(),
+            gated_request("scenario:ask-permissions"),
+            controls,
+        )
+        .await;
+        assert!(
+            events.contains(&AgentEvent::TextDelta {
+                text: expect.into()
+            }),
+            "{label}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dropped_input_channel_cancels_instead_of_allowing() {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let _steer = steer_tx;
+    let controls = RunControls {
+        // The resolver is dropped immediately — the engine tore the run down.
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+    };
+    let events = run_to_end(&harness(), gated_request("scenario:ask-dropped"), controls).await;
+    // The fake only aborts the turn after seeing `cancel` (anything else
+    // fails it), so an Interrupted-mapped Done proves the deny-and-abort.
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn app_server_exit_with_pending_approval_ends_errored_not_hung() {
+    let (controls, _steer, _token, mut asked) = silent_controls();
+    let events = run_to_end(&harness(), gated_request("scenario:ask-eof"), controls).await;
+    assert!(asked.try_recv().is_ok(), "approval reached the user");
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn steering_lands_while_an_approval_is_pending() {
+    let (controls, steer, _token, mut asked) = silent_controls();
+    let stream = harness()
+        .run(gated_request("scenario:ask-steer"), controls)
+        .await
+        .expect("run starts");
+    // Steer only once the approval is actually waiting on the user.
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let question = asked.recv().await.expect("approval surfaced");
+        assert_eq!(question.header, "Approve command");
+        steer
+            .send(SteerMessage {
+                prompt: "redirect please".into(),
+                message_id: None,
+            })
+            .await
+            .expect("steer queued");
+        stream
+            .map(|r| r.expect("stream event"))
+            .collect::<Vec<_>>()
+            .await
+    })
+    .await
+    .expect("steer completed in time");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. })),
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn interrupt_lands_while_an_approval_is_pending() {
+    let (controls, _steer, token, mut asked) = silent_controls();
+    let stream = harness()
+        .run(gated_request("scenario:ask-interrupt"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        asked.recv().await.expect("approval surfaced");
+        token.cancel();
+        stream
+            .map(|r| r.expect("stream event"))
+            .collect::<Vec<_>>()
+            .await
+    })
+    .await
+    .expect("interrupt completed in time");
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: None,
+            session_id: Some("th-1".into()),
+        })
+    );
+}
+
 #[tokio::test]
 async fn interrupt_sends_turn_interrupt_and_maps_aborted() {
     let (controls, _steer, token) = controls("Yes");

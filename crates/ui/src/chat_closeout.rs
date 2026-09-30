@@ -14,12 +14,12 @@
 
 use serde_json::Value;
 
-/// `{chatId, cwd}` → `{isWorktree, worktreePath, branch, chatLive, dirty,
-/// dirtyFiles, unmergedCommits, defaultBranch}`.
-pub use zeron_rpc::methods::PLAN_CHAT_CLOSEOUT;
 /// `{chatId, cwd, force}` → `{removed, branchDeleted, archived}`; errors carry
 /// human-readable refusal reasons.
 pub use zeron_rpc::methods::CLOSE_CHAT_WORKTREE;
+/// `{chatId, cwd}` → `{isWorktree, worktreePath, branch, chatLive, dirty,
+/// dirtyFiles, unmergedCommits, defaultBranch}`.
+pub use zeron_rpc::methods::PLAN_CHAT_CLOSEOUT;
 
 /// The plan runs a handful of `git` commands plus a process scan.
 pub const PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -161,15 +161,18 @@ fn merge_unverifiable(plan: &CloseoutPlan) -> bool {
     plan.branch.is_some() && plan.default_branch.is_none()
 }
 
-/// Precedence mirrors the engine's own refusal order: live, not-a-worktree,
-/// default branch (all hard), then the soft blockers.
+/// Permanent blockers first (not a worktree, default branch — stopping the
+/// chat wouldn't help, so don't tell the user to), then the temporary one
+/// (live), then the soft blockers `force` overrides. The engine checks
+/// liveness first, but every one of these is a refusal there too, so the
+/// order only decides which explanation the dialog leads with.
 pub fn verdict(plan: &CloseoutPlan) -> CloseoutVerdict {
-    if plan.chat_live {
-        CloseoutVerdict::Live
-    } else if !plan.is_worktree {
+    if !plan.is_worktree {
         CloseoutVerdict::NotWorktree
     } else if plan.branch.is_some() && plan.branch == plan.default_branch {
         CloseoutVerdict::OnDefaultBranch
+    } else if plan.chat_live {
+        CloseoutVerdict::Live
     } else if plan.dirty || plan.unmerged_commits > 0 || merge_unverifiable(plan) {
         CloseoutVerdict::NeedsForce
     } else {
@@ -195,19 +198,20 @@ pub fn dirty_count_label(plan: &CloseoutPlan) -> String {
     }
 }
 
-/// The first [`DIRTY_FILES_SHOWN`] entries (trimmed porcelain lines) plus a
+/// The first [`DIRTY_FILES_SHOWN`] entries (worktree-relative paths — the
+/// engine strips the porcelain status columns) plus a
 /// `"+N more"` tail when there are more (`"+N more"` becomes `"+N+ more"`
 /// when the engine's cap truncated the list).
 pub fn dirty_file_lines(plan: &CloseoutPlan) -> Vec<String> {
     let files = &plan.dirty_files;
-    let mut lines: Vec<String> = files
-        .iter()
-        .take(DIRTY_FILES_SHOWN)
-        .map(|f| f.trim().to_string())
-        .collect();
+    let mut lines: Vec<String> = files.iter().take(DIRTY_FILES_SHOWN).cloned().collect();
     if files.len() > DIRTY_FILES_SHOWN {
         let more = files.len() - DIRTY_FILES_SHOWN;
-        let capped = if files.len() >= DIRTY_FILES_CAP { "+" } else { "" };
+        let capped = if files.len() >= DIRTY_FILES_CAP {
+            "+"
+        } else {
+            ""
+        };
         lines.push(format!("+{more}{capped} more"));
     }
     lines
@@ -236,35 +240,88 @@ pub fn unverifiable_label(plan: &CloseoutPlan) -> Option<String> {
     })
 }
 
-/// `"<path> · <branch>"` (or `"… · detached HEAD"`).
-pub fn summary_line(plan: &CloseoutPlan) -> String {
-    let branch = plan.branch.as_deref().unwrap_or("detached HEAD");
-    format!("{} \u{00B7} {branch}", plan.worktree_path)
+/// The dialog's `label: value` summary of what gets torn down. Empty for a
+/// non-worktree (nothing to summarize).
+pub fn summary_rows(plan: &CloseoutPlan) -> Vec<(&'static str, String)> {
+    if !plan.is_worktree || plan.worktree_path.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![
+        ("Worktree", plan.worktree_path.clone()),
+        (
+            "Branch",
+            plan.branch
+                .clone()
+                .unwrap_or_else(|| "detached HEAD".to_string()),
+        ),
+    ];
+    if let Some(default) = plan.default_branch.as_deref() {
+        rows.push(("Base", default.to_string()));
+    }
+    rows
 }
 
-/// Body copy per verdict.
+/// Body copy per verdict. The forced variant names only what's actually at
+/// stake (uncommitted work and/or an unmerged branch).
 pub fn body_copy(plan: &CloseoutPlan) -> String {
     match verdict(plan) {
-        CloseoutVerdict::Live => "This chat's session is still live \u{2014} it may be running a \
-             turn, or just warm and idle between turns. Stop or interrupt the chat first, \
-             then close out its worktree."
+        CloseoutVerdict::Live => "This chat\u{2019}s session is still live \u{2014} it may be \
+             running a turn, or just warm and idle between turns (or a claude process is \
+             running in its folder). Stop the chat first, then close out its worktree."
             .to_string(),
-        CloseoutVerdict::NotWorktree => {
-            "This chat's folder isn't a closeable agent worktree, so there's nothing to close out."
-                .to_string()
-        }
+        CloseoutVerdict::NotWorktree => "This chat\u{2019}s folder isn\u{2019}t a closeable agent \
+             worktree, so there\u{2019}s nothing to close out."
+            .to_string(),
         CloseoutVerdict::OnDefaultBranch => format!(
-            "This worktree is on the repository's default branch ({}), which can't be closed out.",
+            "This worktree is on the repository\u{2019}s default branch ({}), which can\u{2019}t be \
+             closed out.",
             plan.branch.as_deref().unwrap_or("default")
         ),
-        CloseoutVerdict::Clean => "Removes the worktree, deletes its branch, and archives this \
-             chat. Everything is committed and merged."
-            .to_string(),
-        CloseoutVerdict::NeedsForce => "Force closing out permanently discards the uncommitted \
-             work below, deletes the branch even though it isn't merged, removes the worktree, \
-             and archives this chat. This can\u{2019}t be undone."
-            .to_string(),
+        CloseoutVerdict::Clean => match plan.branch.as_deref() {
+            Some(branch) => format!(
+                "Removes the worktree, deletes its branch {branch}, and archives this chat. \
+                 Everything is committed and merged."
+            ),
+            None => "Removes the worktree (detached HEAD \u{2014} no branch to delete) and \
+                 archives this chat. There are no uncommitted changes."
+                .to_string(),
+        },
+        CloseoutVerdict::NeedsForce => {
+            let mut losses: Vec<String> = Vec::new();
+            if plan.dirty {
+                losses.push("permanently discards the uncommitted changes below".into());
+            }
+            if let Some(branch) = plan.branch.as_deref() {
+                losses.push(if plan.unmerged_commits > 0 {
+                    format!("deletes {branch} even though it isn\u{2019}t merged")
+                } else if merge_unverifiable(plan) {
+                    format!("deletes {branch} even though it can\u{2019}t be verified as merged")
+                } else {
+                    format!("deletes {branch}")
+                });
+            }
+            losses.push("removes the worktree".into());
+            format!(
+                "Force closing out {}, and archives this chat. This can\u{2019}t be undone.",
+                losses.join(", ")
+            )
+        }
     }
+}
+
+/// The sidebar notice after a successful close-out. The engine deletes the
+/// branch best-effort (the worktree is already gone by then), so say when it
+/// was kept; likewise when archiving the chat didn't take.
+pub fn success_notice(branch: Option<&str>, outcome: &CloseoutOutcome) -> String {
+    let mut note = match branch {
+        Some(b) if outcome.branch_deleted => format!("Closed out worktree and deleted {b}"),
+        Some(b) => format!("Closed out worktree; branch {b} was kept"),
+        None => "Closed out worktree".to_string(),
+    };
+    if !outcome.archived {
+        note.push_str(" (chat not archived)");
+    }
+    note
 }
 
 /// A dialog-level reply is only applied while the dialog still shows the
@@ -299,7 +356,7 @@ mod tests {
             "branch": "zeron/eng-1",
             "chatLive": false,
             "dirty": true,
-            "dirtyFiles": [" M src/a.rs", "?? b.txt"],
+            "dirtyFiles": ["src/a.rs", "b.txt"],
             "unmergedCommits": 2,
             "defaultBranch": "main",
         }))
@@ -312,7 +369,7 @@ mod tests {
                 branch: Some("zeron/eng-1".into()),
                 chat_live: false,
                 dirty: true,
-                dirty_files: vec![" M src/a.rs".into(), "?? b.txt".into()],
+                dirty_files: vec!["src/a.rs".into(), "b.txt".into()],
                 unmerged_commits: 2,
                 default_branch: Some("main".into()),
             }
@@ -372,6 +429,7 @@ mod tests {
         live.dirty = true;
         assert_eq!(verdict(&live), CloseoutVerdict::Live);
         assert!(!verdict(&live).can_proceed());
+        assert_eq!(verdict(&live).button_label(), None);
 
         let mut default = plan();
         default.branch = Some("main".into());
@@ -379,9 +437,20 @@ mod tests {
         assert_eq!(verdict(&default), CloseoutVerdict::OnDefaultBranch);
         assert_eq!(verdict(&default).button_label(), None);
 
+        // Permanent blockers lead over liveness: stopping the chat wouldn't
+        // make these closeable, so the dialog mustn't suggest it.
+        default.chat_live = true;
+        assert_eq!(verdict(&default), CloseoutVerdict::OnDefaultBranch);
+        let not_wt = CloseoutPlan {
+            chat_live: true,
+            ..CloseoutPlan::default()
+        };
+        assert_eq!(verdict(&not_wt), CloseoutVerdict::NotWorktree);
+        assert!(!verdict(&not_wt).can_proceed());
+
         let mut dirty = plan();
         dirty.dirty = true;
-        dirty.dirty_files = vec!["?? x".into()];
+        dirty.dirty_files = vec!["x".into()];
         assert_eq!(verdict(&dirty), CloseoutVerdict::NeedsForce);
         assert!(verdict(&dirty).force());
         assert_eq!(verdict(&dirty).button_label(), Some("Force close out"));
@@ -407,19 +476,22 @@ mod tests {
     #[test]
     fn dirty_lines_cap_at_five_with_more_tail() {
         let mut p = plan();
-        p.dirty_files = (0..3).map(|i| format!(" M f{i}.rs")).collect();
+        p.dirty_files = (0..3).map(|i| format!("src/f{i}.rs")).collect();
         assert_eq!(dirty_count_label(&p), "3 uncommitted files");
-        assert_eq!(dirty_file_lines(&p), vec!["M f0.rs", "M f1.rs", "M f2.rs"]);
+        assert_eq!(
+            dirty_file_lines(&p),
+            vec!["src/f0.rs", "src/f1.rs", "src/f2.rs"]
+        );
 
-        p.dirty_files = vec!["?? one".into()];
+        p.dirty_files = vec!["one".into()];
         assert_eq!(dirty_count_label(&p), "1 uncommitted file");
 
-        p.dirty_files = (0..8).map(|i| format!("?? f{i}")).collect();
+        p.dirty_files = (0..8).map(|i| format!("f{i}")).collect();
         let lines = dirty_file_lines(&p);
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[5], "+3 more");
 
-        p.dirty_files = (0..DIRTY_FILES_CAP).map(|i| format!("?? f{i}")).collect();
+        p.dirty_files = (0..DIRTY_FILES_CAP).map(|i| format!("f{i}")).collect();
         assert_eq!(dirty_count_label(&p), "20+ uncommitted files");
         assert_eq!(dirty_file_lines(&p).last().unwrap(), "+15+ more");
 
@@ -440,7 +512,10 @@ mod tests {
         );
         p.unmerged_commits = 1;
         p.default_branch = None;
-        assert_eq!(unmerged_label(&p).as_deref(), Some("1 unmerged commit on zeron/eng-1"));
+        assert_eq!(
+            unmerged_label(&p).as_deref(),
+            Some("1 unmerged commit on zeron/eng-1")
+        );
         assert_eq!(unverifiable_label(&p), None);
         p.unmerged_commits = 0;
         assert_eq!(
@@ -453,17 +528,60 @@ mod tests {
     #[test]
     fn summary_and_copy() {
         let mut p = plan();
-        assert_eq!(summary_line(&p), "/r/.worktrees/workspace/eng-1 \u{00B7} zeron/eng-1");
+        assert_eq!(
+            summary_rows(&p),
+            vec![
+                ("Worktree", "/r/.worktrees/workspace/eng-1".to_string()),
+                ("Branch", "zeron/eng-1".to_string()),
+                ("Base", "main".to_string()),
+            ]
+        );
         p.branch = None;
-        assert!(summary_line(&p).ends_with("detached HEAD"));
+        p.default_branch = None;
+        assert_eq!(summary_rows(&p)[1], ("Branch", "detached HEAD".to_string()));
+        assert_eq!(summary_rows(&p).len(), 2);
+        assert!(summary_rows(&CloseoutPlan::default()).is_empty());
         let mut live = plan();
         live.chat_live = true;
-        assert!(body_copy(&live).contains("warm and idle"));
-        let mut forced = plan();
-        forced.dirty = true;
-        let copy = body_copy(&forced);
-        assert!(copy.contains("discards the uncommitted"));
-        assert!(copy.contains("deletes the branch"));
+        let copy = body_copy(&live);
+        assert!(copy.contains("warm and idle"));
+        assert!(copy.contains("Stop the chat first"));
+
+        assert!(body_copy(&plan()).contains("deletes its branch zeron/eng-1"));
+        let mut detached = plan();
+        detached.branch = None;
+        assert!(body_copy(&detached).contains("no branch to delete"));
+
+        // Dirty only: work is lost, branch is deleted (merged, so no caveat).
+        let mut dirty = plan();
+        dirty.dirty = true;
+        dirty.dirty_files = vec!["src/a.rs".into()];
+        let copy = body_copy(&dirty);
+        assert!(copy.contains("permanently discards the uncommitted changes"));
+        assert!(copy.contains("deletes zeron/eng-1,"));
+        assert!(!copy.contains("isn\u{2019}t merged"));
+        assert!(copy.ends_with("and archives this chat. This can\u{2019}t be undone."));
+
+        // Unmerged only: no "uncommitted" claim, branch-loss caveat.
+        let mut unmerged = plan();
+        unmerged.unmerged_commits = 2;
+        let copy = body_copy(&unmerged);
+        assert!(!copy.contains("uncommitted"));
+        assert!(copy.contains("deletes zeron/eng-1 even though it isn\u{2019}t merged"));
+
+        let mut both = dirty.clone();
+        both.unmerged_commits = 1;
+        let copy = body_copy(&both);
+        assert!(copy.contains("uncommitted") && copy.contains("isn\u{2019}t merged"));
+
+        let mut unverifiable = plan();
+        unverifiable.default_branch = None;
+        assert!(body_copy(&unverifiable).contains("can\u{2019}t be verified as merged"));
+
+        // Dirty on a detached HEAD: nothing about a branch.
+        let mut dirty_detached = dirty.clone();
+        dirty_detached.branch = None;
+        assert!(!body_copy(&dirty_detached).contains("deletes"));
     }
 
     #[test]
@@ -479,6 +597,36 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         std::fs::create_dir(other.path().join(".workspace-root")).unwrap();
         assert!(!has_workspace_root(other.path().to_str()));
+    }
+
+    #[test]
+    fn success_notice_reports_kept_branch_and_archive_miss() {
+        let full = CloseoutOutcome {
+            removed: true,
+            branch_deleted: true,
+            archived: true,
+        };
+        assert_eq!(
+            success_notice(Some("zeron/eng-1"), &full),
+            "Closed out worktree and deleted zeron/eng-1"
+        );
+        let kept = CloseoutOutcome {
+            branch_deleted: false,
+            ..full
+        };
+        assert_eq!(
+            success_notice(Some("zeron/eng-1"), &kept),
+            "Closed out worktree; branch zeron/eng-1 was kept"
+        );
+        let unarchived = CloseoutOutcome {
+            branch_deleted: false,
+            archived: false,
+            ..full
+        };
+        assert_eq!(
+            success_notice(None, &unarchived),
+            "Closed out worktree (chat not archived)"
+        );
     }
 
     #[test]

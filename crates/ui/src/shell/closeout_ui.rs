@@ -4,8 +4,10 @@
 //! overview's expanded-tile detail. Fetches `PLAN_CHAT_CLOSEOUT`, then shows
 //! one of: loading, live-chat notice, not-a-worktree notice, default-branch
 //! notice, clean confirm (`force: false`) or forced confirm with warnings
-//! (`force: true`). Engine errors from `CLOSE_CHAT_WORKTREE` render verbatim
-//! inside the still-open dialog. On success the engine archives the chat;
+//! (`force: true`). Live and plan-failed states offer "Check again".
+//! Engine errors from `CLOSE_CHAT_WORKTREE` render verbatim inside the
+//! still-open dialog, which then re-plans quietly so its buttons track the
+//! engine's current view. On success the engine archives the chat;
 //! the `WATCH_CHATS` stream carries that into `AppState`, which the overview
 //! observes, so the tile leaves the canvas with no extra refresh call.
 
@@ -42,7 +44,13 @@ impl Shell {
     /// Open the close-out dialog for `chat_id` and fetch its plan.
     pub(crate) fn open_chat_closeout(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.close_chat_menu(cx);
-        let chat = self.state.read(cx).chats.iter().find(|c| c.id == chat_id).cloned();
+        let chat = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|c| c.id == chat_id)
+            .cloned();
         let title = transcript::single_line(
             &chat
                 .as_ref()
@@ -52,18 +60,18 @@ impl Shell {
         let cwd = chat.and_then(|c| c.cwd).unwrap_or_default();
         self.closeout_seq += 1;
         let request_id = self.closeout_seq;
-        let engine = self.state.read(cx).engine().cloned();
+        let connected = self.state.read(cx).engine().is_some();
         let phase = if cwd.trim().is_empty() {
             CloseoutPhase::PlanFailed("This chat has no folder to close out.".into())
-        } else if engine.is_none() {
+        } else if !connected {
             CloseoutPhase::PlanFailed("Engine not connected".into())
         } else {
             CloseoutPhase::Loading
         };
         let loading = matches!(phase, CloseoutPhase::Loading);
         self.closeout_dialog = Some(CloseoutDialog {
-            chat_id: chat_id.clone(),
-            cwd: cwd.clone(),
+            chat_id,
+            cwd,
             title,
             request_id,
             phase,
@@ -71,9 +79,25 @@ impl Shell {
             error: None,
         });
         cx.notify();
-        let (true, Some(engine)) = (loading, engine) else {
+        if loading {
+            self.fetch_closeout_plan(cx);
+        }
+    }
+
+    /// (Re)fetch the open dialog's plan. The current phase stays on screen
+    /// until the reply lands, so callers that want a spinner set
+    /// [`CloseoutPhase::Loading`] first. A failed re-plan after a refusal
+    /// leaves the previous phase alone (the refusal message is already up).
+    fn fetch_closeout_plan(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.closeout_dialog.as_ref() else {
             return;
         };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let request_id = dialog.request_id;
+        let chat_id = dialog.chat_id.clone();
+        let cwd = dialog.cwd.clone();
         cx.spawn(async move |this, cx| {
             let result = crate::attachments::call_with_timeout(
                 &engine,
@@ -88,20 +112,44 @@ impl Shell {
                 if !co::reply_is_current(shell.closeout_request_id(), request_id) {
                     return;
                 }
-                if let Some(dialog) = shell.closeout_dialog.as_mut() {
-                    dialog.phase = match result {
-                        Ok(plan) => CloseoutPhase::Ready(plan),
-                        Err(err) => {
-                            tracing::warn!(chat = %dialog.chat_id, error = %err, "PlanChatCloseout failed");
-                            CloseoutPhase::PlanFailed(err)
+                let Some(dialog) = shell.closeout_dialog.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(plan) => dialog.phase = CloseoutPhase::Ready(plan),
+                    Err(err) => {
+                        tracing::warn!(chat = %dialog.chat_id, error = %err, "PlanChatCloseout failed");
+                        let quiet_replan =
+                            matches!(dialog.phase, CloseoutPhase::Ready(_)) && dialog.error.is_some();
+                        if !quiet_replan {
+                            dialog.phase = CloseoutPhase::PlanFailed(err);
                         }
-                    };
+                    }
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// "Check again": re-plan from scratch (after stopping a live chat, or
+    /// when the plan call itself failed).
+    fn recheck_chat_closeout(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.closeout_dialog.as_mut() else {
+            return;
+        };
+        if dialog.submitting {
+            return;
+        }
+        if self.state.read(cx).engine().is_none() {
+            dialog.phase = CloseoutPhase::PlanFailed("Engine not connected".into());
+        } else {
+            dialog.phase = CloseoutPhase::Loading;
+            dialog.error = None;
+            self.fetch_closeout_plan(cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn close_chat_closeout(&mut self, cx: &mut Context<Self>) {
@@ -150,13 +198,8 @@ impl Shell {
                 match result {
                     Ok(outcome) => {
                         // Reported even if the dialog was dismissed mid-call.
-                        let what = branch.map_or_else(|| "worktree".to_string(), |b| format!("worktree ({b})"));
-                        let note = if outcome.archived {
-                            format!("Closed out {what}; chat archived")
-                        } else {
-                            format!("Closed out {what}")
-                        };
-                        shell.sidebar_notice = Some(note.into());
+                        shell.sidebar_notice =
+                            Some(co::success_notice(branch.as_deref(), &outcome).into());
                         if current {
                             shell.closeout_dialog = None;
                         }
@@ -168,6 +211,12 @@ impl Shell {
                                 dialog.submitting = false;
                                 dialog.error = Some(err);
                             }
+                            // The engine re-inspects on close, so a refusal
+                            // means the plan we showed is stale (a file got
+                            // dirtied, the chat went live…). Re-plan quietly
+                            // so the buttons match what the engine now
+                            // reports; the refusal message stays up.
+                            shell.fetch_closeout_plan(cx);
                         } else {
                             shell.sidebar_notice = Some(format!("Close out failed: {err}").into());
                         }
@@ -195,40 +244,72 @@ impl Shell {
                 .text_color(color)
                 .child(SharedString::from(text))
         };
-        let mono = |text: String, color: gpui::Hsla| {
-            small(text, color).font_family(code_family.clone()).overflow_hidden().text_ellipsis()
-        };
+        let mono =
+            |text: String, color: gpui::Hsla| small(text, color).font_family(code_family.clone());
 
         let verdict = match &dialog.phase {
             CloseoutPhase::Ready(plan) => Some(co::verdict(plan)),
             _ => None,
         };
         let title = match verdict {
-            Some(CloseoutVerdict::Live | CloseoutVerdict::NotWorktree | CloseoutVerdict::OnDefaultBranch) => {
-                "Can\u{2019}t close out worktree"
-            }
+            Some(
+                CloseoutVerdict::Live
+                | CloseoutVerdict::NotWorktree
+                | CloseoutVerdict::OnDefaultBranch,
+            ) => "Can\u{2019}t close out worktree",
             Some(CloseoutVerdict::NeedsForce) => "Force close out worktree?",
             _ => "Close out worktree?",
         };
 
         let mut body: Vec<AnyElement> = vec![
-            small(format!("\u{201C}{}\u{201D}", dialog.title), theme.text_muted).into_any_element(),
+            small(
+                format!("\u{201C}{}\u{201D}", dialog.title),
+                theme.text_muted,
+            )
+            .into_any_element(),
         ];
         match &dialog.phase {
             CloseoutPhase::Loading => {
-                body.push(popover::dialog_body(&theme, "Checking the worktree\u{2026}").into_any_element());
+                body.push(
+                    popover::dialog_body(&theme, "Checking the worktree\u{2026}")
+                        .into_any_element(),
+                );
             }
             CloseoutPhase::PlanFailed(err) => {
                 body.push(
-                    popover::dialog_body(&theme, "Couldn\u{2019}t inspect this chat\u{2019}s worktree.")
-                        .into_any_element(),
+                    popover::dialog_body(
+                        &theme,
+                        "Couldn\u{2019}t inspect this chat\u{2019}s worktree.",
+                    )
+                    .into_any_element(),
                 );
                 body.push(small(err.clone(), theme.danger).into_any_element());
             }
             CloseoutPhase::Ready(plan) => {
                 let verdict = co::verdict(plan);
-                if plan.is_worktree && !plan.worktree_path.is_empty() {
-                    body.push(mono(co::summary_line(plan), theme.text).into_any_element());
+                let summary = co::summary_rows(plan);
+                if !summary.is_empty() {
+                    let rows = summary.into_iter().map(|(label, value)| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(64.0))
+                                    .child(small(label.to_string(), theme.text_muted)),
+                            )
+                            .child(div().flex_1().min_w_0().child(mono(value, theme.text)))
+                    });
+                    body.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(rows)
+                            .into_any_element(),
+                    );
                 }
                 body.push(popover::dialog_body(&theme, co::body_copy(plan)).into_any_element());
                 if verdict == CloseoutVerdict::NeedsForce {
@@ -244,7 +325,8 @@ impl Shell {
                     if plan.dirty {
                         warnings = warnings.child(small(co::dirty_count_label(plan), theme.danger));
                         for line in co::dirty_file_lines(plan) {
-                            warnings = warnings.child(div().pl(px(10.0)).child(mono(line, theme.text_muted)));
+                            warnings = warnings
+                                .child(div().pl(px(10.0)).child(mono(line, theme.text_muted)));
                         }
                     }
                     if let Some(line) = co::unmerged_label(plan) {
@@ -270,16 +352,40 @@ impl Shell {
                 verdict.button_label().unwrap_or("Close out")
             };
             popover::btn_danger(&theme, label)
-                .id(if force { "closeout-force-confirm" } else { "closeout-confirm" })
+                .id(if force {
+                    "closeout-force-confirm"
+                } else {
+                    "closeout-confirm"
+                })
                 .when(submitting, |button| button.opacity(0.6))
                 .on_click(cx.listener(move |this, _, _, cx| this.submit_chat_closeout(force, cx)))
         });
-        let cancel_label = if verdict.is_some_and(|v| !v.can_proceed()) { "Close" } else { "Cancel" };
+        let cancel_label = if verdict.is_some_and(|v| !v.can_proceed()) {
+            "Close"
+        } else {
+            "Cancel"
+        };
+        // Worth re-asking only when the answer can change without reopening:
+        // a live chat that's since been stopped, or a failed plan call.
+        let recheck = (matches!(dialog.phase, CloseoutPhase::PlanFailed(_))
+            || verdict == Some(CloseoutVerdict::Live))
+        .then(|| {
+            popover::btn_ghost(&theme, "Check again", "closeout-recheck")
+                .id("closeout-recheck")
+                .on_click(cx.listener(|this, _, _, cx| this.recheck_chat_closeout(cx)))
+        });
 
         let card = popover::dialog_card(&theme)
             .w(px(440.0))
             .child(popover::dialog_title(&theme, title))
-            .child(div().mt(px(8.0)).flex().flex_col().gap(px(8.0)).children(body))
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .children(body),
+            )
             .child(
                 div()
                     .mt(px(16.0))
@@ -292,6 +398,7 @@ impl Shell {
                             .id("closeout-cancel")
                             .on_click(cx.listener(|this, _, _, cx| this.close_chat_closeout(cx))),
                     )
+                    .children(recheck)
                     .children(proceed),
             )
             .into_any_element();

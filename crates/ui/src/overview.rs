@@ -370,6 +370,10 @@ struct OverviewRow {
     /// chat — copied in like `subagent_count`, for the same reason (it
     /// feeds `tile_size`). See [`link_has_badge_row`].
     has_badge_row: bool,
+    /// `chat.cwd` holds a `.workspace-root` marker — the expanded detail
+    /// offers "Close out worktree…" ([`crate::chat_closeout`]). Computed in
+    /// the cached `rows()` pass so the fs check never runs per frame.
+    closeable: bool,
 }
 
 impl OverviewRow {
@@ -2336,6 +2340,7 @@ impl Overview {
                 status == ChatIndicator::Completed,
             );
             let repo = repo_key(chat.cwd.as_deref());
+            let closeable = crate::chat_closeout::has_workspace_root(chat.cwd.as_deref());
             known_repos.insert(repo.clone());
             all.push(OverviewRow {
                 status,
@@ -2350,6 +2355,7 @@ impl Overview {
                 context_pct,
                 subagent_count,
                 has_badge_row,
+                closeable,
             });
         }
         self.known_repos = known_repos;
@@ -2489,6 +2495,14 @@ impl Overview {
     /// something is selected (see [`panel_chat_id`]).
     fn panel_chat_id(&self, cx: &Context<Self>) -> Option<String> {
         panel_chat_id(self.chat_panel_open, self.state.read(cx).selected_chat.as_deref())
+    }
+
+    /// "Close out worktree…": the confirmation dialog is Shell-owned (it's a
+    /// window modal, shared with the sidebar chat menu's entry point).
+    fn open_closeout(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let _ = self.shell.update(cx, |shell, cx| {
+            shell.open_chat_closeout(chat_id, cx);
+        });
     }
 
     fn set_archived(&mut self, chat_id: String, archived: bool, cx: &mut Context<Self>) {
@@ -3845,6 +3859,27 @@ impl Overview {
             }))
             .child(SharedString::from(if archived { "Unarchive" } else { "Archive" }));
 
+        let closeout_id = chat_id.clone();
+        let closeout = row.closeable.then(|| {
+            div()
+                .id(SharedString::from(format!("overview-detail-closeout-{chat_id}")))
+                .flex_none()
+                .px(px(8.0 * zoom))
+                .py(px(2.0 * zoom))
+                .rounded(px(4.0 * zoom))
+                .cursor_pointer()
+                .text_size(crate::typography::ui_rems(10.0 * zoom))
+                .text_color(theme.text_muted)
+                .border_1()
+                .border_color(theme.border)
+                .hover(|el| el.bg(theme.element_hover).text_color(theme.danger))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_closeout(closeout_id.clone(), cx);
+                }))
+                .child(SharedString::from("Close out worktree…"))
+        });
+
         let editor_open = self.link_editor_chat.as_deref() == Some(chat_id.as_str());
         let link_toggle_id = chat_id.clone();
         let link_toggle = div()
@@ -3937,7 +3972,8 @@ impl Overview {
                     .gap(px(6.0 * zoom))
                     .child(self.open_chat_button(chat_id, theme, cx, zoom))
                     .child(archive_toggle)
-                    .child(link_toggle),
+                    .child(link_toggle)
+                    .children(closeout),
             )
             .children(editor)
             .children(error_line)
@@ -7253,6 +7289,7 @@ mod logic_tests {
             context_pct: pct,
             subagent_count,
             has_badge_row,
+            closeable: false,
         }
     }
 

@@ -20,6 +20,7 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
+pub mod chat_closeout;
 mod comment_ui;
 pub mod comments;
 pub mod composer;

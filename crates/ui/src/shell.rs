@@ -60,6 +60,7 @@ use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
 
 mod actions_ui;
+mod closeout_ui;
 mod command_palette;
 mod files_panel;
 mod project_icon;
@@ -140,6 +141,10 @@ struct ChatMenuState {
     chat_id: String,
     position: Point<Pixels>,
     page: ChatMenuPage,
+    /// The chat's cwd holds a `.workspace-root` marker — offer "Close out
+    /// worktree…" ([`crate::chat_closeout::has_workspace_root`]). Checked
+    /// once at open, not per frame.
+    closeable: bool,
 }
 
 /// Interruptible height tween for the sidebar's device/archive disclosures.
@@ -1563,6 +1568,10 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// The chat close-out dialog (`closeout_ui`), `Some` while open.
+    closeout_dialog: Option<closeout_ui::CloseoutDialog>,
+    /// Monotonic id per close-out dialog open (stale-reply guard).
+    closeout_seq: u64,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -1967,6 +1976,8 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            closeout_dialog: None,
+            closeout_seq: 0,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             sidebar_section_migration: None,
@@ -6515,10 +6526,19 @@ impl Shell {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        let closeable = crate::chat_closeout::has_workspace_root(
+                            this.state
+                                .read(cx)
+                                .chats
+                                .iter()
+                                .find(|c| c.id == menu_id)
+                                .and_then(|c| c.cwd.as_deref()),
+                        );
                         this.chat_menu.open(ChatMenuState {
                             chat_id: menu_id.clone(),
                             position: event.position,
                             page: ChatMenuPage::Root,
+                            closeable,
                         });
                         cx.notify();
                     }),
@@ -8006,6 +8026,10 @@ impl Shell {
         // Modals and context menus sit above the rest of the shell. Preserve
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
+        if self.closeout_dialog.is_some() {
+            self.close_chat_closeout(cx);
+            return true;
+        }
         if self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
             || self.delete_space_confirm.is_some()
@@ -8142,6 +8166,8 @@ impl Shell {
             let delete_id = chat_id.clone();
             let sync_id = chat_id.clone();
             let link_id = chat_id.clone();
+            let closeout_id = chat_id.clone();
+            let closeable = menu_state.closeable;
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -8209,6 +8235,21 @@ impl Shell {
                             )
                             .child(SharedString::from("Link PR / ticket…")),
                     )
+                    .when(closeable, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-closeout-{chat_id}"))
+                                .id("chat-menu-closeout")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_chat_closeout(closeout_id.clone(), cx)
+                                }))
+                                .child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Close out worktree…")),
+                        )
+                    })
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
                             .id("chat-menu-copy")
@@ -8439,6 +8480,10 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(overlay) = self.render_closeout_overlay(viewport, cx) {
+            overlays.push(overlay);
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {

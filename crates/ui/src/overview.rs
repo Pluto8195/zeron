@@ -651,9 +651,9 @@ fn pr_matches_search(query_lower: &str, item: &MyPrItem) -> bool {
 
 /// Restore the sidebar's open state from the persisted UI-flag set. Unknown
 /// entries (a future flag, or junk) are ignored rather than failing the load.
-/// No view mode was ever persisted — `ViewMode` (formerly with a `MyPrs`
-/// variant) is in-memory only and every overview starts in List — so there
-/// is no stale "my PRs view" value to migrate.
+/// `ViewMode` (formerly with a `MyPrs` variant) is persisted separately as
+/// [`VIEW_CANVAS_FLAG`]; a stale `viewMode:myPrs` entry is just an unknown
+/// flag and is ignored.
 fn pr_sidebar_open_from_flags(flags: &BTreeSet<String>) -> bool {
     flags.contains(PR_SIDEBAR_FLAG)
 }
@@ -678,6 +678,79 @@ fn pr_collapsed_sections_from_flags(flags: &BTreeSet<String>) -> BTreeSet<String
         .filter(|key| !key.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// UI-flag entry: the canvas (rather than the list) is the main column's
+/// mode. Absent = List, the default.
+const VIEW_CANVAS_FLAG: &str = "viewMode:canvas";
+/// UI-flag entry: the "Hide stale" toggle is on.
+const HIDE_STALE_FLAG: &str = "hideStale";
+/// UI-flag entry: the "Show archived" toggle is on.
+const SHOW_ARCHIVED_FLAG: &str = "showArchived";
+/// Prefix of the UI-flag entry holding the active grouping dimensions in
+/// activation (= nesting) order, comma-joined:
+/// `groupBy:origin,repo`. Exactly one such entry exists at a time (a string
+/// set has no order of its own, so the order lives inside the one string).
+const GROUP_BY_PREFIX: &str = "groupBy:";
+
+/// The overview's persisted view state other than the repo filter (which has
+/// its own `HIDDEN_REPOS_FILE`) and the PR-sidebar flags.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ViewPrefs {
+    canvas: bool,
+    hide_stale: bool,
+    show_archived: bool,
+    groups: Vec<GroupDimension>,
+}
+
+/// Restore [`ViewPrefs`] from the persisted UI-flag set. Unknown flags and
+/// unknown/duplicate grouping dimensions are dropped rather than failing the
+/// load.
+fn view_prefs_from_flags(flags: &BTreeSet<String>) -> ViewPrefs {
+    let mut groups: Vec<GroupDimension> = Vec::new();
+    if let Some(list) = flags.iter().find_map(|flag| flag.strip_prefix(GROUP_BY_PREFIX)) {
+        for dim in list.split(',').filter_map(|key| GroupDimension::from_persist_key(key.trim())) {
+            if !groups.contains(&dim) {
+                groups.push(dim);
+            }
+        }
+    }
+    ViewPrefs {
+        canvas: flags.contains(VIEW_CANVAS_FLAG),
+        hide_stale: flags.contains(HIDE_STALE_FLAG),
+        show_archived: flags.contains(SHOW_ARCHIVED_FLAG),
+        groups,
+    }
+}
+
+/// Write [`ViewPrefs`] into the UI-flag set, replacing any previous view-pref
+/// entries and leaving every other flag (sidebar, collapsed sections, future
+/// flags) untouched.
+fn apply_view_prefs_to_flags(flags: &mut BTreeSet<String>, prefs: &ViewPrefs) {
+    flags.retain(|flag| !flag.starts_with(GROUP_BY_PREFIX));
+    for (flag, on) in [
+        (VIEW_CANVAS_FLAG, prefs.canvas),
+        (HIDE_STALE_FLAG, prefs.hide_stale),
+        (SHOW_ARCHIVED_FLAG, prefs.show_archived),
+    ] {
+        if on {
+            flags.insert(flag.to_string());
+        } else {
+            flags.remove(flag);
+        }
+    }
+    if !prefs.groups.is_empty() {
+        let list: Vec<&str> = prefs.groups.iter().map(|dim| dim.persist_key()).collect();
+        flags.insert(format!("{GROUP_BY_PREFIX}{}", list.join(",")));
+    }
+}
+
+/// Whether a just-restored repo filter hides every repo that currently has
+/// chats — an invisible "everything is gone" state (typically a stale filter
+/// naming repos that were since renamed/cleaned up). `known` empty means the
+/// chat list hasn't arrived yet, which says nothing.
+fn restored_repo_filter_hides_everything(hidden: &BTreeSet<String>, known: &BTreeSet<String>) -> bool {
+    !known.is_empty() && known.iter().all(|repo| hidden.contains(repo))
 }
 
 /// Whether a PR-sidebar section renders its rows. An active search query
@@ -1884,6 +1957,13 @@ pub struct Overview {
     /// Whether `acknowledged_done`/`hidden_repos` have been read from disk
     /// (lazily, once `AppState.data_dir` exists).
     prefs_loaded: bool,
+    /// A view pref (mode / toggles / grouping) was changed by the user before
+    /// `prefs_loaded` — the older file must not then overwrite it.
+    view_prefs_touched: bool,
+    /// The restored repo filter still has to be sanity-checked against the
+    /// first non-empty chat list (see [`restored_repo_filter_hides_everything`]).
+    /// One-shot so a deliberate "None" in the dropdown isn't undone later.
+    repo_filter_needs_validation: bool,
     /// The Repos dropdown — the app's standard `Popup` lifecycle (exit
     /// animation + the trigger-press note that keeps a trigger click from
     /// close-then-reopening).
@@ -2147,6 +2227,8 @@ impl Overview {
             hidden_repos: BTreeSet::new(),
             known_repos: BTreeSet::new(),
             prefs_loaded: false,
+            view_prefs_touched: false,
+            repo_filter_needs_validation: false,
             repo_filter: popover::Popup::default(),
             legend_open: false,
             unfiltered_count: 0,
@@ -2239,9 +2321,45 @@ impl Overview {
         self.hidden_repos
             .extend(overview_positions::load_string_set(&data_dir, overview_positions::HIDDEN_REPOS_FILE));
         if !self.hidden_repos.is_empty() {
+            self.repo_filter_needs_validation = true;
             self.rows_dirty = true;
             self.grouped_layout_cache = None;
         }
+        // A toggle made before `data_dir` existed wins over the older file.
+        if !self.view_prefs_touched {
+            let prefs = view_prefs_from_flags(&flags);
+            self.view_mode = if prefs.canvas { ViewMode::Canvas } else { ViewMode::List };
+            self.hide_stale = prefs.hide_stale;
+            self.show_archived = prefs.show_archived;
+            self.active_groups = prefs.groups;
+            self.rows_dirty = true;
+            self.grouped_layout_cache = None;
+        }
+    }
+
+    /// The current view state as [`ViewPrefs`].
+    fn view_prefs(&self) -> ViewPrefs {
+        ViewPrefs {
+            canvas: self.view_mode == ViewMode::Canvas,
+            hide_stale: self.hide_stale,
+            show_archived: self.show_archived,
+            groups: self.active_groups.clone(),
+        }
+    }
+
+    /// Persist the view state (mode, Hide stale / Show archived, grouping
+    /// dimensions + order) into `UI_FLAGS_FILE`, read-modify-write like
+    /// [`Overview::persist_ui_flag`]. Call after every change to any of them.
+    fn view_prefs_changed(&mut self, cx: &Context<Self>) {
+        if !self.prefs_loaded {
+            self.view_prefs_touched = true;
+        }
+        let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
+            return;
+        };
+        let mut flags = overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
+        apply_view_prefs_to_flags(&mut flags, &self.view_prefs());
+        self.save_string_set(overview_positions::UI_FLAGS_FILE, &flags, cx);
     }
 
     fn save_string_set(&self, file_name: &str, set: &BTreeSet<String>, cx: &Context<Self>) {
@@ -2358,7 +2476,7 @@ impl Overview {
         self.ensure_link_status(chat_id, cx);
     }
 
-    fn toggle_group(&mut self, dim: GroupDimension) {
+    fn toggle_group(&mut self, dim: GroupDimension, cx: &Context<Self>) {
         if let Some(ix) = self.active_groups.iter().position(|&d| d == dim) {
             self.active_groups.remove(ix);
         } else {
@@ -2367,6 +2485,7 @@ impl Overview {
         // Cache key includes `active_groups`, so this alone would naturally
         // miss on the next read anyway — dropped explicitly for clarity.
         self.grouped_layout_cache = None;
+        self.view_prefs_changed(cx);
     }
 
     /// The current rows AND, as a side effect, kicks off any missing/stale
@@ -2447,6 +2566,14 @@ impl Overview {
             });
         }
         self.known_repos = known_repos;
+        if self.repo_filter_needs_validation && !self.known_repos.is_empty() {
+            self.repo_filter_needs_validation = false;
+            if restored_repo_filter_hides_everything(&self.hidden_repos, &self.known_repos) {
+                tracing::info!("restored repo filter hid every chat; resetting it");
+                self.hidden_repos.clear();
+                self.save_string_set(overview_positions::HIDDEN_REPOS_FILE, &self.hidden_repos, cx);
+            }
+        }
         if acknowledged_changed {
             self.save_string_set(overview_positions::ACKNOWLEDGED_DONE_FILE, &self.acknowledged_done, cx);
         }
@@ -4597,6 +4724,7 @@ impl Render for Overview {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         this.view_mode = ViewMode::List;
+                                        this.view_prefs_changed(cx);
                                         cx.notify();
                                     }),
                                 ),
@@ -4606,6 +4734,7 @@ impl Render for Overview {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         this.view_mode = ViewMode::Canvas;
+                                        this.view_prefs_changed(cx);
                                         cx.notify();
                                     }),
                                 ),
@@ -4675,6 +4804,7 @@ impl Render for Overview {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.hide_stale = !this.hide_stale;
+                    this.view_prefs_changed(cx);
                     this.rows_dirty = true;
                     this.grouped_layout_cache = None;
                     cx.notify();
@@ -4684,6 +4814,7 @@ impl Render for Overview {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.show_archived = !this.show_archived;
+                    this.view_prefs_changed(cx);
                     this.rows_dirty = true;
                     this.grouped_layout_cache = None;
                     cx.notify();
@@ -4738,7 +4869,7 @@ impl Render for Overview {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.toggle_group(dim);
+                            this.toggle_group(dim, cx);
                             cx.notify();
                         }),
                     )
@@ -7329,6 +7460,236 @@ mod logic_tests {
         let loaded = overview_positions::load_string_set(&dir, overview_positions::UI_FLAGS_FILE);
         assert!(!pr_sidebar_open_from_flags(&loaded));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_prefs_round_trip_through_the_flag_set_and_keep_other_flags() {
+        let prefs = ViewPrefs {
+            canvas: true,
+            hide_stale: true,
+            show_archived: true,
+            groups: vec![GroupDimension::Origin, GroupDimension::Repo, GroupDimension::Category],
+        };
+        let mut flags: BTreeSet<String> = [
+            PR_SIDEBAR_FLAG.to_string(),
+            pr_section_flag(PR_SECTION_NEEDS_REVIEW),
+            "someFutureFlag".to_string(),
+        ]
+        .into();
+        apply_view_prefs_to_flags(&mut flags, &prefs);
+        assert_eq!(view_prefs_from_flags(&flags), prefs, "activation order survives");
+        assert!(flags.contains("groupBy:origin,repo,category"));
+        // Unrelated flags survive and don't read as view prefs.
+        assert!(pr_sidebar_open_from_flags(&flags));
+        assert!(flags.contains("someFutureFlag"));
+        assert!(pr_collapsed_sections_from_flags(&flags).contains(PR_SECTION_NEEDS_REVIEW));
+
+        // Turning everything off removes every view-pref entry.
+        apply_view_prefs_to_flags(&mut flags, &ViewPrefs::default());
+        assert_eq!(view_prefs_from_flags(&flags), ViewPrefs::default());
+        assert!(!flags.iter().any(|f| f.starts_with(GROUP_BY_PREFIX)));
+        assert!(pr_sidebar_open_from_flags(&flags));
+        // Changing the grouping replaces (never accumulates) the groupBy entry.
+        let mut flags = BTreeSet::new();
+        apply_view_prefs_to_flags(&mut flags, &ViewPrefs { groups: vec![GroupDimension::Repo], ..Default::default() });
+        apply_view_prefs_to_flags(&mut flags, &ViewPrefs { groups: vec![GroupDimension::Ticket], ..Default::default() });
+        assert_eq!(flags, BTreeSet::from(["groupBy:ticket".to_string()]));
+    }
+
+    #[test]
+    fn view_prefs_defaults_and_junk_degrade_gracefully() {
+        assert_eq!(view_prefs_from_flags(&BTreeSet::new()), ViewPrefs::default());
+        let junk: BTreeSet<String> =
+            ["groupBy:bogus,repo,repo,,Origin, ticket".to_string(), "viewMode:myPrs".to_string()].into();
+        let prefs = view_prefs_from_flags(&junk);
+        // Unknown dropped, duplicate dropped, whitespace trimmed, case-sensitive keys.
+        assert_eq!(prefs.groups, vec![GroupDimension::Repo, GroupDimension::Ticket]);
+        assert!(!prefs.canvas);
+        // Every dimension's key round-trips.
+        for dim in [GroupDimension::Category, GroupDimension::Origin, GroupDimension::Repo, GroupDimension::Ticket] {
+            assert_eq!(GroupDimension::from_persist_key(dim.persist_key()), Some(dim));
+        }
+    }
+
+    #[test]
+    fn view_prefs_round_trip_through_the_string_set_file() {
+        let dir = std::env::temp_dir().join(format!("zeron-overview-viewprefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prefs = ViewPrefs {
+            canvas: true,
+            hide_stale: false,
+            show_archived: true,
+            groups: vec![GroupDimension::Ticket, GroupDimension::Category],
+        };
+        let mut flags = overview_positions::load_string_set(&dir, overview_positions::UI_FLAGS_FILE);
+        apply_view_prefs_to_flags(&mut flags, &prefs);
+        overview_positions::save_string_set(&dir, overview_positions::UI_FLAGS_FILE, &flags).unwrap();
+        let loaded = overview_positions::load_string_set(&dir, overview_positions::UI_FLAGS_FILE);
+        assert_eq!(view_prefs_from_flags(&loaded), prefs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_repo_filter_detection() {
+        let set = |keys: &[&str]| -> BTreeSet<String> { keys.iter().map(|k| k.to_string()).collect() };
+        // No chats known yet: says nothing.
+        assert!(!restored_repo_filter_hides_everything(&set(&["a"]), &set(&[])));
+        // Names only repos that no longer have chats: hides nothing.
+        assert!(!restored_repo_filter_hides_everything(&set(&["gone"]), &set(&["a", "b"])));
+        // Partial hide is a legitimate filter.
+        assert!(!restored_repo_filter_hides_everything(&set(&["a"]), &set(&["a", "b"])));
+        // Hides every repo that has chats.
+        assert!(restored_repo_filter_hides_everything(&set(&["a", "b", "gone"]), &set(&["a", "b"])));
+        // Nothing hidden.
+        assert!(!restored_repo_filter_hides_everything(&set(&[]), &set(&["a"])));
+    }
+
+    /// Build an `Overview` window over `state` (seeded with chats in the
+    /// given repos) and render once so `ensure_prefs_loaded` runs.
+    fn overview_over<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        state: &Entity<AppState>,
+    ) -> (Entity<Overview>, &'a mut gpui::VisualTestContext) {
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let state = state.clone();
+        let (overview, vcx) = cx.add_window_view(move |_, cx| {
+            Overview::new(state, gpui::WeakEntity::new_invalid(), transcript, composer, cx)
+        });
+        vcx.run_until_parked();
+        (overview, vcx)
+    }
+
+    fn state_with_repos(
+        cx: &mut gpui::TestAppContext,
+        dir: &std::path::Path,
+        repos: &[&str],
+    ) -> Entity<AppState> {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        let repos: Vec<String> = repos.iter().map(|r| format!("/work/{r}")).collect();
+        let dir = dir.to_path_buf();
+        state.update(cx, |state, _| {
+            state.data_dir = Some(dir);
+            state.chats = repos
+                .iter()
+                .enumerate()
+                .map(|(i, cwd)| {
+                    let mut chat = row_ex(&format!("c{i}"), cwd, None, 0, false).chat;
+                    chat.last_message_at = Some(Utc::now());
+                    chat
+                })
+                .collect();
+        });
+        state
+    }
+
+    /// Reload simulation: one overview changes every persisted piece of view
+    /// state through the real handlers, a brand-new overview over the same
+    /// data dir (app restart, or the page being rebuilt) restores all of it.
+    #[gpui::test]
+    fn view_state_survives_a_fresh_overview(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_repos(cx, dir.path(), &["alpha", "beta"]);
+        let (first, vcx) = overview_over(cx, &state);
+        first.update(vcx, |o, cx| {
+            assert!(o.prefs_loaded, "data_dir was available at first render");
+            o.view_mode = ViewMode::Canvas;
+            o.view_prefs_changed(cx);
+            o.hide_stale = true;
+            o.view_prefs_changed(cx);
+            o.show_archived = true;
+            o.view_prefs_changed(cx);
+            o.toggle_group(GroupDimension::Origin, cx);
+            o.toggle_group(GroupDimension::Repo, cx);
+            o.toggle_group(GroupDimension::Category, cx);
+            o.toggle_group(GroupDimension::Repo, cx); // off again
+            toggle_repo_hidden(&mut o.hidden_repos, "beta");
+            o.repo_filter_changed(cx);
+        });
+
+        let (second, vcx) = overview_over(cx, &state);
+        second.update(vcx, |o, _| {
+            assert_eq!(o.view_mode, ViewMode::Canvas);
+            assert!(o.hide_stale);
+            assert!(o.show_archived);
+            assert_eq!(o.active_groups, vec![GroupDimension::Origin, GroupDimension::Category]);
+            assert_eq!(o.hidden_repos, BTreeSet::from(["beta".to_string()]));
+        });
+
+        // And turning things back off persists too.
+        second.update(vcx, |o, cx| {
+            o.view_mode = ViewMode::List;
+            o.view_prefs_changed(cx);
+            o.hide_stale = false;
+            o.view_prefs_changed(cx);
+            o.show_archived = false;
+            o.view_prefs_changed(cx);
+            o.toggle_group(GroupDimension::Origin, cx);
+            o.toggle_group(GroupDimension::Category, cx);
+        });
+        let (third, vcx) = overview_over(cx, &state);
+        third.update(vcx, |o, _| {
+            assert_eq!(o.view_prefs(), ViewPrefs::default());
+            assert_eq!(o.hidden_repos, BTreeSet::from(["beta".to_string()]));
+        });
+    }
+
+    /// A restored repo filter that hides every repo with chats is reset (and
+    /// the reset persisted); a filter naming only vanished repos is inert; a
+    /// partial filter is kept.
+    #[gpui::test]
+    fn restored_stale_repo_filter_degrades_gracefully(cx: &mut gpui::TestAppContext) {
+        let save = |dir: &std::path::Path, keys: &[&str]| {
+            let set: BTreeSet<String> = keys.iter().map(|k| k.to_string()).collect();
+            overview_positions::save_string_set(dir, overview_positions::HIDDEN_REPOS_FILE, &set).unwrap();
+        };
+
+        // Hides every repo that has chats (plus one that vanished) -> reset.
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &["alpha", "beta", "vanished"]);
+        let state = state_with_repos(cx, dir.path(), &["alpha", "beta"]);
+        let (overview, vcx) = overview_over(cx, &state);
+        overview.update(vcx, |o, cx| {
+            let rows = o.rows(cx);
+            assert_eq!(rows.len(), 2, "nothing is filtered out invisibly");
+            assert!(o.hidden_repos.is_empty());
+        });
+        assert!(overview_positions::load_string_set(dir.path(), overview_positions::HIDDEN_REPOS_FILE).is_empty());
+
+        // Only a vanished repo: no crash, nothing hidden, entry left alone.
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &["vanished"]);
+        let state = state_with_repos(cx, dir.path(), &["alpha"]);
+        let (overview, vcx) = overview_over(cx, &state);
+        overview.update(vcx, |o, cx| {
+            assert_eq!(o.rows(cx).len(), 1);
+            assert_eq!(o.hidden_repos, BTreeSet::from(["vanished".to_string()]));
+        });
+
+        // Partial filter stays.
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &["alpha"]);
+        let state = state_with_repos(cx, dir.path(), &["alpha", "beta"]);
+        let (overview, vcx) = overview_over(cx, &state);
+        overview.update(vcx, |o, cx| {
+            let rows = o.rows(cx);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].repo, "beta");
+            assert_eq!(o.hidden_repos, BTreeSet::from(["alpha".to_string()]));
+        });
+
+        // A deliberate "None" made AFTER the restore is not undone.
+        overview.update(vcx, |o, cx| {
+            let known = o.known_repos.clone();
+            o.hidden_repos.extend(known);
+            o.repo_filter_changed(cx);
+            assert_eq!(o.rows(cx).len(), 0);
+            assert_eq!(o.hidden_repos.len(), 2);
+        });
     }
 
     #[test]

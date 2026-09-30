@@ -71,6 +71,31 @@ pub enum GroupDimension {
     Ticket,
 }
 
+impl GroupDimension {
+    /// Stable persistence key (`overview-ui-flags.json`'s `groupBy:` entry).
+    /// Never renamed: a persisted value must keep restoring.
+    pub fn persist_key(self) -> &'static str {
+        match self {
+            GroupDimension::Category => "category",
+            GroupDimension::Origin => "origin",
+            GroupDimension::Repo => "repo",
+            GroupDimension::Ticket => "ticket",
+        }
+    }
+
+    /// Inverse of [`GroupDimension::persist_key`]; `None` for an unknown key
+    /// (a dimension from a newer/older build, or junk).
+    pub fn from_persist_key(key: &str) -> Option<Self> {
+        match key {
+            "category" => Some(GroupDimension::Category),
+            "origin" => Some(GroupDimension::Origin),
+            "repo" => Some(GroupDimension::Repo),
+            "ticket" => Some(GroupDimension::Ticket),
+            _ => None,
+        }
+    }
+}
+
 /// Sentinel key for "this row has no value on this dimension" — matches the
 /// reference's own literal `"__none__"` string (`repoGroupKey`/
 /// `ticketGroupKey`, `session_canvas.html:898,912`) rather than a Rust

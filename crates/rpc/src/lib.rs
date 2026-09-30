@@ -202,6 +202,12 @@ pub mod methods {
     /// (bulk list search + one throttled per-PR detail fetch per tick), never
     /// blocks on a live call. IPC-only, same reason as its sibling methods.
     pub const MY_OPEN_PRS: &str = "MyOpenPrs";
+    /// Every open PR where review is currently requested from the signed-in
+    /// `gh` account ("Needs my review" section of the PR sidebar). No params
+    /// → `MyPrItem[]` (same shape as `MY_OPEN_PRS`, plus `author` login;
+    /// `detail` always null). Pure cache read off its own search slot.
+    /// IPC-only (not forwardable), same reason as `MY_OPEN_PRS`.
+    pub const REVIEW_REQUESTED_PRS: &str = "ReviewRequestedPrs";
     /// One-time migration: import every remaining Claude Code session on disk
     /// (same underlying scan `ScanExternalSessions` uses), carrying over
     /// archive status from the `session_canvas` stopgap tool this ticket

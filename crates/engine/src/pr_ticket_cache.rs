@@ -191,6 +191,12 @@ pub fn is_worktree_cwd(cwd: &str) -> bool {
 /// every minute outright").
 const MY_PRS_LIST_TTL: Duration = Duration::from_secs(60);
 
+/// After a failed `gh search prs` (non-zero exit, unparseable output, or `gh`
+/// missing), wait this long before trying that search again. Without it a
+/// failing search was retried on every 20s sweep tick forever, which is what
+/// trips GitHub's secondary rate limit.
+const SEARCH_FAILURE_BACKOFF: Duration = Duration::from_secs(90);
+
 /// One row from `gh search prs --author=@me` — list-only fields, no detail
 /// (checks/review/mergeable) yet. Matches `fetch_my_open_prs`'s dict shape
 /// (`session_canvas_server.py:1554`).
@@ -203,6 +209,11 @@ pub struct MyOpenPr {
     pub repo: Option<String>,
     pub is_draft: bool,
     pub updated_at: Option<String>,
+    /// PR author's login. Only populated by the review-requested search
+    /// (where "who asked me" matters); omitted from the wire entirely for
+    /// the authored list, which keeps that payload byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 /// A `MyOpenPr` plus whatever detail (checks/reviews/mergeable →
@@ -253,6 +264,13 @@ struct Inner {
     /// `None` until the first successful `fetch_my_open_prs` sweep.
     my_prs_list: Mutex<Option<(Vec<MyOpenPr>, Instant)>>,
     my_pr_detail: Mutex<HashMap<(String, u64), Entry<PrStatus>>>,
+    /// When the authored search last failed (`None` = last attempt succeeded
+    /// or none yet); gates retries by `SEARCH_FAILURE_BACKOFF`.
+    my_prs_failed_at: Mutex<Option<Instant>>,
+    /// `gh search prs --review-requested=@me` results. Own slot and TTL,
+    /// swept on a different tick from the authored search.
+    review_prs_list: Mutex<Option<(Vec<MyOpenPr>, Instant)>>,
+    review_prs_failed_at: Mutex<Option<Instant>>,
 }
 
 /// Cheap to clone (an `Arc` around the shared cache) — hand a clone to the
@@ -274,6 +292,9 @@ impl PrTicketCache {
                 pending_diff_stat: Mutex::new(HashSet::new()),
                 my_prs_list: Mutex::new(None),
                 my_pr_detail: Mutex::new(HashMap::new()),
+                my_prs_failed_at: Mutex::new(None),
+                review_prs_list: Mutex::new(None),
+                review_prs_failed_at: Mutex::new(None),
             }),
         }
     }
@@ -377,6 +398,24 @@ impl PrTicketCache {
             .collect()
     }
 
+    /// Pure cache read: open PRs where review is currently requested from the
+    /// signed-in user. `detail` is always `None` — the detail sweep only
+    /// covers the authored list. No reviewed-by exclusion on purpose: GitHub
+    /// drops you from `review-requested` once you submit a review, and a
+    /// re-request must stay visible.
+    pub fn review_requested_prs(&self) -> Vec<MyPrItem> {
+        lock(&self.inner.review_prs_list)
+            .as_ref()
+            .map(|(items, _)| items.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|summary| MyPrItem {
+                summary,
+                detail: None,
+            })
+            .collect()
+    }
+
     /// Spawn the throttled background sweep. Caller keeps the returned
     /// handle alive for as long as the sweep should run (dropping it aborts
     /// the loop) — `EngineCore` holds it for its own lifetime, same as any
@@ -465,7 +504,12 @@ impl PrTicketCache {
             );
         }
 
-        self.sweep_my_prs_list().await;
+        // Never run both `gh search prs` calls on the same tick: if the
+        // authored search fired, the review-requested one waits for the next
+        // tick (the two TTLs then drift apart and stay interleaved).
+        if !self.sweep_my_prs_list().await {
+            self.sweep_review_requested_list().await;
+        }
         self.sweep_one_my_pr_detail().await;
     }
 
@@ -473,16 +517,25 @@ impl PrTicketCache {
     /// from the per-branch PR/ticket sweep above — matches
     /// `my_prs_refresh_loop`'s comment that the list call is cheap enough to
     /// redo on its own schedule without competing with the hot path.
-    async fn sweep_my_prs_list(&self) {
-        let stale = lock(&self.inner.my_prs_list)
-            .as_ref()
-            .is_none_or(|(_, fetched_at)| fetched_at.elapsed() >= MY_PRS_LIST_TTL);
-        if !stale {
-            return;
-        }
-        if let Some(items) = tokio::task::spawn_blocking(fetch_my_open_prs).await.unwrap_or(None) {
-            *lock(&self.inner.my_prs_list) = Some((items, Instant::now()));
-        }
+    ///
+    /// Returns `true` if a search was actually attempted this tick.
+    async fn sweep_my_prs_list(&self) -> bool {
+        sweep_search_slot(
+            &self.inner.my_prs_list,
+            &self.inner.my_prs_failed_at,
+            fetch_my_open_prs,
+        )
+        .await
+    }
+
+    /// Same as `sweep_my_prs_list` for the review-requested search.
+    async fn sweep_review_requested_list(&self) -> bool {
+        sweep_search_slot(
+            &self.inner.review_prs_list,
+            &self.inner.review_prs_failed_at,
+            fetch_review_requested_prs,
+        )
+        .await
     }
 
     /// Fill in ONE stale/missing PR detail per tick — "stalest first" per
@@ -778,14 +831,29 @@ fn parse_git_shortstat(text: &str) -> DiffStat {
 /// searches every repo the signed-in `gh` account can see — the general
 /// per-user equivalent that works for anyone, not just this org.
 fn fetch_my_open_prs() -> Option<Vec<MyOpenPr>> {
+    run_pr_search("--author=@me", "number,title,url,repository,isDraft,updatedAt")
+}
+
+/// Open PRs where the signed-in user is a requested reviewer. Deliberately NO
+/// `-reviewed-by:@me` exclusion: GitHub already drops you from
+/// `review-requested` once you submit a review, and a re-request (which must
+/// stay visible) would be hidden by that qualifier.
+fn fetch_review_requested_prs() -> Option<Vec<MyOpenPr>> {
+    run_pr_search(
+        "--review-requested=@me",
+        "number,title,url,repository,isDraft,updatedAt,author",
+    )
+}
+
+fn run_pr_search(qualifier: &str, json_fields: &str) -> Option<Vec<MyOpenPr>> {
     let output = Command::new("gh")
         .args([
             "search",
             "prs",
-            "--author=@me",
+            qualifier,
             "--state=open",
             "--json",
-            "number,title,url,repository,isDraft,updatedAt",
+            json_fields,
             "--limit",
             "50",
         ])
@@ -794,7 +862,11 @@ fn fetch_my_open_prs() -> Option<Vec<MyOpenPr>> {
     if !output.status.success() {
         return None;
     }
-    let data: Vec<Value> = serde_json::from_slice(&output.stdout).ok()?;
+    parse_pr_search(&output.stdout)
+}
+
+fn parse_pr_search(stdout: &[u8]) -> Option<Vec<MyOpenPr>> {
+    let data: Vec<Value> = serde_json::from_slice(stdout).ok()?;
     Some(
         data.iter()
             .map(|d| MyOpenPr {
@@ -808,9 +880,50 @@ fn fetch_my_open_prs() -> Option<Vec<MyOpenPr>> {
                     .map(str::to_string),
                 is_draft: d.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
                 updated_at: d.get("updatedAt").and_then(Value::as_str).map(str::to_string),
+                author: d
+                    .get("author")
+                    .and_then(|a| a.get("login"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             })
             .collect(),
     )
+}
+
+/// Is a search slot due for a (re)fetch? Stale-or-empty list AND not inside
+/// the post-failure backoff window.
+fn search_due(
+    list_fetched_at: Option<Instant>,
+    failed_at: Option<Instant>,
+) -> bool {
+    if failed_at.is_some_and(|t| t.elapsed() < SEARCH_FAILURE_BACKOFF) {
+        return false;
+    }
+    list_fetched_at.is_none_or(|t| t.elapsed() >= MY_PRS_LIST_TTL)
+}
+
+/// Shared TTL + failure-backoff refresh for one `gh search prs` slot.
+/// Returns `true` if a search was attempted.
+async fn sweep_search_slot(
+    list: &Mutex<Option<(Vec<MyOpenPr>, Instant)>>,
+    failed_at: &Mutex<Option<Instant>>,
+    fetch: fn() -> Option<Vec<MyOpenPr>>,
+) -> bool {
+    let due = search_due(
+        lock(list).as_ref().map(|(_, at)| *at),
+        *lock(failed_at),
+    );
+    if !due {
+        return false;
+    }
+    match tokio::task::spawn_blocking(fetch).await.unwrap_or(None) {
+        Some(items) => {
+            *lock(list) = Some((items, Instant::now()));
+            *lock(failed_at) = None;
+        }
+        None => *lock(failed_at) = Some(Instant::now()),
+    }
+    true
 }
 
 /// `fetch_github_pr_by_number`: detail fetch keyed by `(repo, number)`
@@ -1249,6 +1362,7 @@ mod tests {
             repo: Some(repo.to_string()),
             is_draft: false,
             updated_at: None,
+            author: None,
         }
     }
 
@@ -1314,6 +1428,103 @@ mod tests {
             .checked_sub(MY_PRS_LIST_TTL + Duration::from_secs(1))
             .expect("MY_PRS_LIST_TTL is small enough that now() - it - 1s doesn't underflow");
         assert!(stale_at.elapsed() >= MY_PRS_LIST_TTL);
+    }
+
+    #[test]
+    fn review_requested_prs_is_empty_before_sweep_and_has_no_detail() {
+        let cache = PrTicketCache::new();
+        assert!(cache.review_requested_prs().is_empty());
+        let mut pr = sample_my_pr(7, "acme/widgets");
+        pr.author = Some("octocat".into());
+        *lock(&cache.inner.review_prs_list) = Some((vec![pr], Instant::now()));
+        // Even with detail cached for the same key, review rows skip detail.
+        let items = cache.review_requested_prs();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].detail.is_none());
+        assert_eq!(items[0].summary.author.as_deref(), Some("octocat"));
+        // Independent slot: authored list untouched.
+        assert!(cache.my_open_prs().is_empty());
+    }
+
+    #[test]
+    fn parse_pr_search_reads_author_login_from_review_requested_fixture() {
+        let fixture = br#"[
+            {"number": 12, "title": "Fix it", "url": "https://github.com/acme/widgets/pull/12",
+             "repository": {"name": "widgets", "nameWithOwner": "acme/widgets"},
+             "isDraft": false, "updatedAt": "2026-09-01T00:00:00Z",
+             "author": {"login": "octocat", "is_bot": false, "type": "User", "url": "https://github.com/octocat"}},
+            {"number": 13, "repository": {"nameWithOwner": "acme/widgets"}, "isDraft": true}
+        ]"#;
+        let items = parse_pr_search(fixture).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].author.as_deref(), Some("octocat"));
+        assert_eq!(items[0].repo.as_deref(), Some("acme/widgets"));
+        assert!(items[1].is_draft);
+        assert_eq!(items[1].author, None);
+        // Authored-list fixture (no `author` key) still parses.
+        assert_eq!(parse_pr_search(b"[]").unwrap().len(), 0);
+        assert!(parse_pr_search(b"not json").is_none());
+    }
+
+    /// Pins the wire shape the overview UI reads: camelCase keys, `author`
+    /// present only when set, and flattened into `MyPrItem`.
+    #[test]
+    fn my_pr_item_json_field_names_match_the_overview_ui_contract() {
+        let mut pr = sample_my_pr(3, "acme/widgets");
+        pr.is_draft = true;
+        pr.updated_at = Some("2026-09-01T00:00:00Z".into());
+        let authored = serde_json::to_value(MyPrItem { summary: pr.clone(), detail: None }).unwrap();
+        assert_eq!(authored["number"], serde_json::json!(3));
+        assert_eq!(authored["repo"], serde_json::json!("acme/widgets"));
+        assert_eq!(authored["isDraft"], serde_json::json!(true));
+        assert_eq!(authored["updatedAt"], serde_json::json!("2026-09-01T00:00:00Z"));
+        assert_eq!(authored["detail"], serde_json::Value::Null);
+        assert!(authored.get("author").is_none(), "authored payload must not grow an author key");
+
+        pr.author = Some("octocat".into());
+        let review = serde_json::to_value(MyPrItem { summary: pr, detail: None }).unwrap();
+        assert_eq!(review["author"], serde_json::json!("octocat"));
+    }
+
+    #[test]
+    fn search_due_honors_ttl_and_failure_backoff() {
+        let now = Instant::now();
+        let ago = |secs| now.checked_sub(Duration::from_secs(secs)).unwrap();
+        // Never fetched, never failed: due.
+        assert!(search_due(None, None));
+        // Fresh list: not due. Stale list: due.
+        assert!(!search_due(Some(ago(5)), None));
+        assert!(search_due(Some(ago(61)), None));
+        // Failed 20s ago: backed off even though there is no list.
+        assert!(!search_due(None, Some(ago(20))));
+        // Backoff window (90s) elapsed: retry.
+        assert!(search_due(None, Some(ago(91))));
+        // Backoff also suppresses a stale list's refresh.
+        assert!(!search_due(Some(ago(300)), Some(ago(30))));
+    }
+
+    #[tokio::test]
+    async fn failed_search_records_failure_and_does_not_retry_within_backoff() {
+        fn fail() -> Option<Vec<MyOpenPr>> {
+            None
+        }
+        fn ok() -> Option<Vec<MyOpenPr>> {
+            Some(vec![])
+        }
+        let list = Mutex::new(None);
+        let failed = Mutex::new(None);
+        assert!(sweep_search_slot(&list, &failed, fail).await, "first tick attempts");
+        assert!(failed.lock().unwrap().is_some());
+        assert!(list.lock().unwrap().is_none());
+        // Next tick (20s later in prod) is inside the 90s backoff: no attempt,
+        // even with a fetcher that would succeed.
+        assert!(!sweep_search_slot(&list, &failed, ok).await);
+        assert!(list.lock().unwrap().is_none());
+        // Backoff elapsed: retries and clears the failure marker.
+        *failed.lock().unwrap() = Instant::now().checked_sub(SEARCH_FAILURE_BACKOFF + Duration::from_secs(1));
+        assert!(sweep_search_slot(&list, &failed, ok).await);
+        assert!(failed.lock().unwrap().is_none());
+        assert!(list.lock().unwrap().is_some());
     }
 
     /// Live smoke test: `gh search prs --author=@me --state=open` (no

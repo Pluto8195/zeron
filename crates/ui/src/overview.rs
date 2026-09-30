@@ -642,6 +642,8 @@ fn pr_matches_search(query_lower: &str, item: &MyPrItem) -> bool {
             item.summary.title.as_deref(),
             Some(number.as_str()),
             item.detail.as_ref().and_then(|d| d.branch.as_deref()),
+            // Review-requested rows carry the requesting PR's author.
+            item.summary.author.as_deref(),
         ],
     )
 }
@@ -1870,6 +1872,11 @@ pub struct Overview {
     my_prs: Vec<MyPrItem>,
     my_prs_pending: bool,
     my_prs_fetched_at: Option<Instant>,
+    /// PRs where my review is requested (sidebar "Needs my review"). Own
+    /// pending/fetched gate so a slow/failed call can't stall `my_prs`.
+    review_prs: Vec<MyPrItem>,
+    review_prs_pending: bool,
+    review_prs_fetched_at: Option<Instant>,
     /// Left "My PRs" sidebar (toolbar toggle). Rendered as the overview's
     /// leftmost fixed-width column — `[sidebar | list/canvas | chat panel]`
     /// — so the canvas simply measures narrower (its `canvas_bounds` come
@@ -2095,6 +2102,9 @@ impl Overview {
             my_prs: Vec::new(),
             my_prs_pending: false,
             my_prs_fetched_at: None,
+            review_prs: Vec::new(),
+            review_prs_pending: false,
+            review_prs_fetched_at: None,
             pr_sidebar_open: false,
             pr_sidebar_scroll: ScrollHandle::new(),
             pending_focus: None,
@@ -2880,6 +2890,7 @@ impl Overview {
     /// The engine side is cache-backed, so this is not a live `gh` call per
     /// request. Never runs while the overview isn't the visible route.
     fn ensure_my_prs(&mut self, cx: &mut Context<Self>) {
+        self.ensure_review_prs(cx);
         let fresh_enough = self
             .my_prs_fetched_at
             .is_some_and(|at| at.elapsed() < MY_PRS_REFRESH);
@@ -2902,6 +2913,40 @@ impl Overview {
                     && let Ok(items) = serde_json::from_value::<Vec<MyPrItem>>(value)
                 {
                     this.my_prs = items;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Same gate as [`Self::ensure_my_prs`] for the "Needs my review" list
+    /// (`REVIEW_REQUESTED_PRS`). Called from `ensure_my_prs`, so it rides the
+    /// same render/idle-tick call sites and the same 30s `MY_PRS_REFRESH`.
+    fn ensure_review_prs(&mut self, cx: &mut Context<Self>) {
+        let fresh_enough = self
+            .review_prs_fetched_at
+            .is_some_and(|at| at.elapsed() < MY_PRS_REFRESH);
+        if fresh_enough || self.review_prs_pending {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.review_prs_pending = true;
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::REVIEW_REQUESTED_PRS, serde_json::json!({}))
+                .await;
+            this.update(cx, |this, cx| {
+                this.review_prs_pending = false;
+                this.review_prs_fetched_at = Some(Instant::now());
+                if let Ok(value) = result
+                    && let Ok(items) = serde_json::from_value::<Vec<MyPrItem>>(value)
+                {
+                    this.review_prs = items;
                 }
                 cx.notify();
             })
@@ -4413,8 +4458,12 @@ impl Render for Overview {
         let pr_action_count = actionable_pr_count(self.my_prs.iter().filter_map(|item| {
             item.detail.as_ref().map(|d| d.action_reasons())
         }).collect::<Vec<_>>().iter().map(Vec::as_slice));
-        let my_prs_label = if pr_action_count > 0 {
-            format!("My PRs ({pr_action_count})")
+        // Review requests are "needs you" too, so they fold into the same
+        // single count (and the same critical styling) rather than adding a
+        // second number to the toolbar.
+        let pr_badge_count = pr_action_count + self.review_prs.len();
+        let my_prs_label = if pr_badge_count > 0 {
+            format!("My PRs ({pr_badge_count})")
         } else {
             "My PRs".to_string()
         };
@@ -4503,7 +4552,7 @@ impl Render for Overview {
                                     .when(!self.pr_sidebar_open, |el| el.text_color(theme.text_muted))
                                     // `#my-prs-btn.has-action`: critical color +
                                     // border + bold (regardless of open state).
-                                    .when(pr_action_count > 0, |el| {
+                                    .when(pr_badge_count > 0, |el| {
                                         el.text_color(critical)
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .border_1()
@@ -5003,7 +5052,7 @@ impl Overview {
             "Small tiles under a card = its subagents, all of them (dot: blue running, green done). Hover for the full name; click one to peek at its transcript in a read-only side panel (a subagent can't be continued). ✕ or Escape closes it.",
             "Archive hides a chat from the default view (same as the sidebar's archive). \"Show archived\" brings archived chats back, dimmed.",
             "\"Repos\" hides whole repos everywhere (canvas, list, grouping, search). Search matches title, branch, last message, folder, ticket id and PR title, and zooms the canvas to 1-8 matches.",
-            "\"My PRs\" opens a left sidebar of every open PR you authored (\u{26a1} actionable first, then by repo) beside the list or canvas. Its count lights red when something needs you — CI failing, changes requested, a merge conflict, or no reviewer ever requested (ready-to-merge alone doesn't count). While it's open, search also filters PRs by repo, title, number (123 or #123) and branch. Clicking a PR with a linked chat opens that chat in the side panel and brings its tile/row into view; otherwise it opens the PR on GitHub.",
+            "\"My PRs\" opens a left sidebar of every open PR you authored (\u{26a1} actionable first, then by repo) beside the list or canvas, with PRs awaiting your review in a \"Needs my review\" section on top. Its count lights red when something needs you — CI failing, changes requested, a merge conflict, no reviewer ever requested (ready-to-merge alone doesn't count), or a review requested from you. While it's open, search also filters PRs by repo, title, number (123 or #123) and branch. Clicking a PR with a linked chat opens that chat in the side panel and brings its tile/row into view; otherwise it opens the PR on GitHub.",
             "Canvas: scroll to pan, pinch or Ctrl+scroll to zoom, − / + to zoom around the center, click the % to reset, ⤢ to fit every card in view. Panned or zoomed away from every card? A \"Fit view\" pill appears — click it to snap back.",
         ];
         div()
@@ -6267,12 +6316,19 @@ impl Overview {
             .filter(|item| pr_matches_search(&query, item))
             .cloned()
             .collect();
-        let total = self.my_prs.len();
+        let review_items: Vec<MyPrItem> = self
+            .review_prs
+            .iter()
+            .filter(|item| pr_matches_search(&query, item))
+            .cloned()
+            .collect();
+        let total = self.my_prs.len() + self.review_prs.len();
+        let shown = all_items.len() + review_items.len();
 
         let count_label = if query.is_empty() || total == 0 {
             format!("{total}")
         } else {
-            format!("{} of {total}", all_items.len())
+            format!("{shown} of {total}")
         };
         let header = div()
             .flex_none()
@@ -6314,9 +6370,11 @@ impl Overview {
                     })),
             );
 
-        let body: gpui::AnyElement = if all_items.is_empty() {
+        let body: gpui::AnyElement = if shown == 0 {
             let message = if total == 0 {
-                if self.my_prs_pending && self.my_prs_fetched_at.is_none() {
+                if (self.my_prs_pending && self.my_prs_fetched_at.is_none())
+                    || (self.review_prs_pending && self.review_prs_fetched_at.is_none())
+                {
                     "Loading…".to_string()
                 } else {
                     "No open PRs found (or `gh` isn't installed/authenticated).".to_string()
@@ -6361,10 +6419,22 @@ impl Overview {
             // in the rollup AND its repo group), so a running index.
             let mut next_ix = 0usize;
             let mut sections: Vec<gpui::AnyElement> = Vec::new();
+            if !review_items.is_empty() {
+                sections.push(self.render_pr_section(
+                    format!("Needs my review ({})", review_items.len()),
+                    &review_items,
+                    true,
+                    &mut next_ix,
+                    rows,
+                    theme,
+                    cx,
+                ));
+            }
             if !actionable.is_empty() {
                 sections.push(self.render_pr_section(
                     format!("⚡ Needs your action ({})", actionable.len()),
                     &actionable,
+                    false,
                     &mut next_ix,
                     rows,
                     theme,
@@ -6373,7 +6443,7 @@ impl Overview {
             }
             for (repo, items) in &by_repo {
                 let label = format!("{} ({})", repo.rsplit('/').next().unwrap_or(repo), items.len());
-                sections.push(self.render_pr_section(label, items, &mut next_ix, rows, theme, cx));
+                sections.push(self.render_pr_section(label, items, false, &mut next_ix, rows, theme, cx));
             }
             div()
                 .id("overview-pr-sidebar-list")
@@ -6411,6 +6481,7 @@ impl Overview {
         &mut self,
         label: String,
         items: &[MyPrItem],
+        review: bool,
         next_ix: &mut usize,
         rows: &[OverviewRow],
         theme: &Theme,
@@ -6421,7 +6492,7 @@ impl Overview {
             .map(|item| {
                 let ix = *next_ix;
                 *next_ix += 1;
-                self.render_pr_item(ix, item, rows, theme, cx)
+                self.render_pr_item(ix, item, review, rows, theme, cx)
             })
             .collect();
         div()
@@ -6444,6 +6515,7 @@ impl Overview {
         &mut self,
         ix: usize,
         item: &MyPrItem,
+        review: bool,
         rows: &[OverviewRow],
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -6464,11 +6536,19 @@ impl Overview {
                 .unwrap_or_else(|| "open".to_string())
                 .into()
         };
-        let action_badge = item
-            .detail
-            .as_ref()
-            .and_then(|d| d.action_reasons().into_iter().next())
-            .map(pr_action_badge);
+        // Review rows are someone else's PR: the author-oriented action badge
+        // (CI failing, needs reviewer, ...) doesn't apply, show who asked.
+        let action_badge = if review {
+            None
+        } else {
+            item.detail
+                .as_ref()
+                .and_then(|d| d.action_reasons().into_iter().next())
+                .map(pr_action_badge)
+        };
+        let author_label = review
+            .then(|| item.summary.author.as_deref().map(|login| format!("by {login}")))
+            .flatten();
         let jump = self.chat_for_pr_url(rows, item.summary.url.as_deref());
         let url = item.summary.url.clone();
 
@@ -6511,7 +6591,10 @@ impl Overview {
                     .text_color(theme.text_muted.opacity(0.7))
                     .child(SharedString::from(number_label))
                     .child(SharedString::from("·"))
-                    .child(SharedString::from(state_label)),
+                    .child(SharedString::from(state_label))
+                    .when_some(author_label, |el, label| {
+                        el.child(SharedString::from("·")).child(SharedString::from(label))
+                    }),
             );
 
         if let Some((chat_id, chat_title)) = jump {
@@ -7011,6 +7094,20 @@ mod logic_tests {
             "isDraft": false, "updatedAt": null, "detail": detail
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn review_requested_item_deserializes_author_and_search_matches_it() {
+        let item: MyPrItem = serde_json::from_value(serde_json::json!({
+            "number": 9, "title": "Add cache", "url": null, "repo": "cofactr/zeron",
+            "isDraft": false, "updatedAt": null, "author": "octocat", "detail": null
+        }))
+        .unwrap();
+        assert_eq!(item.summary.author.as_deref(), Some("octocat"));
+        assert!(pr_matches_search("octocat", &item));
+        assert!(!pr_matches_search("someone-else", &item));
+        // Authored rows (no `author` key on the wire) still deserialize.
+        assert!(pr_item(1, "a/b", "t", None).summary.author.is_none());
     }
 
     #[test]

@@ -2259,6 +2259,10 @@ impl RpcService for EngineRpc {
                 let items = self.pr_ticket_cache()?.my_open_prs();
                 RpcReply::value(&items)
             }
+            methods::REVIEW_REQUESTED_PRS => {
+                let items = self.pr_ticket_cache()?.review_requested_prs();
+                RpcReply::value(&items)
+            }
             methods::PLAN_CHAT_WORKSPACE => {
                 let p: PlanChatWorkspaceParams = parse_params(params)?;
                 // Fresh, unpooled client: this fires at most once per new

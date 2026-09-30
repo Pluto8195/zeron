@@ -31,6 +31,28 @@ pub(super) fn cycle_target(
     Some(order[next].clone())
 }
 
+/// Debug identity string for a chat: `<title> — chat <chatId> — session
+/// <harnessSessionId>`. The session part is omitted when the chat has no
+/// (non-blank) harness session id. Pure.
+pub(super) fn chat_identity_string(
+    title: &str,
+    chat_id: &str,
+    harness_session_id: Option<&str>,
+) -> String {
+    let mut out = format!("{title} \u{2014} chat {chat_id}");
+    if let Some(session) = harness_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!(" \u{2014} session {session}"));
+    }
+    out
+}
+
+/// [`chat_identity_string`] for a chat row (title collapsed to one line, the
+/// same fallback the titlebar uses).
+pub(super) fn chat_identity_for(chat: &zeron_proto::Chat) -> String {
+    let title = transcript::single_line(chat.title.as_deref().unwrap_or("New session"));
+    chat_identity_string(&title, &chat.id, chat.harness_session_id.as_deref())
+}
+
 pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
     if expanded {
         icons::COLLAPSE_ARROWS
@@ -184,11 +206,12 @@ impl Shell {
         // drag region, and buttons. A session appends its target as a muted
         // "project @ device" tag right of the title (the composer footer no
         // longer carries it).
-        let (title, target, harness, on_canvas): (
+        let (title, target, harness, on_canvas, chat_id): (
             SharedString,
             Option<SharedString>,
             Option<zeron_proto::HarnessId>,
             bool,
+            Option<String>,
         ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
@@ -209,9 +232,10 @@ impl Shell {
                         Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
                         false,
+                        Some(chat.id.clone()),
                     )
                 }
-                None => (SharedString::from(""), None, None, true),
+                None => (SharedString::from(""), None, None, true, None),
             }
         };
 
@@ -441,6 +465,17 @@ impl Shell {
                                 })
                                 .child(title),
                         )
+                        .when_some(chat_id, |el, chat_id| {
+                            let copied =
+                                self.copied_chat_identity.as_deref() == Some(chat_id.as_str());
+                            el.child(chat_identity_button(
+                                copied,
+                                &theme,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.copy_chat_identity(&chat_id, false, cx)
+                                }),
+                            ))
+                        })
                         .when_some(target, |el, target| {
                             el.child(
                                 div()
@@ -463,6 +498,70 @@ impl Shell {
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
+    }
+}
+
+/// Small copy-identity button beside the titlebar's chat name. Mirrors
+/// [`header_icon_button`] (occluded out of the drag strip, click swallowed)
+/// at a title-sized 20px; flips to a check while `copied`.
+fn chat_identity_button(
+    copied: bool,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let fade_key = "chat-identity-copy".to_string();
+    div()
+        .id("chat-identity-copy")
+        .size(px(20.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.0))
+        .cursor_pointer()
+        .bg(motion::hover_blend(
+            &fade_key,
+            crate::theme::wash(0.0),
+            crate::theme::wash(0.11),
+        ))
+        .on_hover(motion::hover_listener(fade_key))
+        .occlude()
+        .role(gpui::Role::Button)
+        .aria_label(if copied {
+            "Chat info copied"
+        } else {
+            "Copy chat info"
+        })
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx)
+        })
+        .child(
+            icon(if copied { icons::CHECK } else { icons::COPY })
+                .size(px(13.0))
+                .text_color(theme.text_muted),
+        )
+}
+
+#[cfg(test)]
+mod chat_identity_tests {
+    use super::*;
+
+    #[test]
+    fn identity_string_includes_session_when_present() {
+        assert_eq!(
+            chat_identity_string("Fix login", "chat-1", Some("sess-9")),
+            "Fix login \u{2014} chat chat-1 \u{2014} session sess-9"
+        );
+    }
+
+    #[test]
+    fn identity_string_omits_missing_or_blank_session() {
+        let want = "Fix login \u{2014} chat chat-1";
+        assert_eq!(chat_identity_string("Fix login", "chat-1", None), want);
+        assert_eq!(chat_identity_string("Fix login", "chat-1", Some("")), want);
+        assert_eq!(chat_identity_string("Fix login", "chat-1", Some("  ")), want);
     }
 }
 

@@ -1625,6 +1625,10 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    /// Chat whose header copy-identity button is showing its transient
+    /// "copied" check; cleared by `copied_chat_identity_clear` after ~1.2s.
+    copied_chat_identity: Option<String>,
+    copied_chat_identity_clear: Option<Task<()>>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -2010,6 +2014,8 @@ impl Shell {
             attention_sound_gate: Default::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
+            copied_chat_identity: None,
+            copied_chat_identity_clear: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -3830,6 +3836,46 @@ impl Shell {
             self.sidebar_notice = Some("Harness session ID copied".into());
         }
         self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    /// Copy `<title> — chat <id> — session <harness session id>` for
+    /// debugging ([`tabs::chat_identity_string`]). From the sidebar menu the
+    /// feedback is the sidebar notice (like its sibling copy rows); from the
+    /// header button the icon flips to a check for ~1.2s (the code-block
+    /// "Copied" idiom).
+    fn copy_chat_identity(&mut self, chat_id: &str, from_menu: bool, cx: &mut Context<Self>) {
+        let text = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(tabs::chat_identity_for);
+        let Some(text) = text else {
+            if from_menu {
+                self.close_chat_menu(cx);
+            }
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if from_menu {
+            self.sidebar_notice = Some("Chat info copied".into());
+            self.close_chat_menu(cx);
+        } else {
+            self.copied_chat_identity = Some(chat_id.to_string());
+            self.copied_chat_identity_clear = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1200))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.copied_chat_identity = None;
+                    this.copied_chat_identity_clear = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
         cx.notify();
     }
 
@@ -8167,6 +8213,7 @@ impl Shell {
             let sync_id = chat_id.clone();
             let link_id = chat_id.clone();
             let closeout_id = chat_id.clone();
+            let identity_id = chat_id.clone();
             let closeable = menu_state.closeable;
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
@@ -8250,6 +8297,19 @@ impl Shell {
                                 .child(SharedString::from("Close out worktree…")),
                         )
                     })
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-identity-{chat_id}"))
+                            .id("chat-menu-identity")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_chat_identity(&identity_id, true, cx)
+                            }))
+                            .child(
+                                icon(icons::COPY)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Copy chat info")),
+                    )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
                             .id("chat-menu-copy")
@@ -12918,6 +12978,84 @@ mod exit_regressions {
     /// The overview's chat panel selects a chat without leaving the route or
     /// recording history; "Open full chat →" on that already-selected chat
     /// still records the chat entry, so Back returns to the overview.
+    #[gpui::test]
+    fn copy_chat_identity_writes_clipboard_and_flashes_header_feedback(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "c1", "deviceId": "local", "archived": false,
+                            "title": "Fix\nlogin", "harnessSessionId": "sess-9",
+                            "createdAt": Utc::now(),
+                        }))
+                        .unwrap(),
+                        serde_json::from_value(serde_json::json!({
+                            "id": "c2", "deviceId": "local", "archived": false,
+                            "createdAt": Utc::now(),
+                        }))
+                        .unwrap(),
+                    ];
+                    cx.notify();
+                });
+                // Header button: clipboard + transient check, no sidebar notice.
+                shell.copy_chat_identity("c1", false, cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                    Some("Fix login \u{2014} chat c1 \u{2014} session sess-9")
+                );
+                assert_eq!(shell.copied_chat_identity.as_deref(), Some("c1"));
+                assert!(shell.sidebar_notice.is_none());
+                // Menu item: no session id -> the session part is omitted.
+                shell.copy_chat_identity("c2", true, cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                    Some("New session \u{2014} chat c2")
+                );
+                assert_eq!(shell.sidebar_notice.as_deref(), Some("Chat info copied"));
+            })
+            .unwrap();
+        // The header check clears itself after the flash.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1300));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.copied_chat_identity.is_none());
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn overview_chat_preview_keeps_route_and_history(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

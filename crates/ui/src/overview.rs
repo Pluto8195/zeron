@@ -629,7 +629,7 @@ fn actionable_pr_count<'a>(reasons: impl IntoIterator<Item = &'a [PrAction]>) ->
         .count()
 }
 
-/// PR-sidebar search: the toolbar's same query (trimmed + lowercased, empty
+/// PR-sidebar search: the sidebar box's query (trimmed + lowercased, empty
 /// matches everything) over repo (`owner/name`), title, number — matched as
 /// `#<n>`, so both `123` and `#123` hit — and head branch when the detail
 /// sweep has it.
@@ -655,6 +655,35 @@ fn pr_matches_search(query_lower: &str, item: &MyPrItem) -> bool {
 /// is no stale "my PRs view" value to migrate.
 fn pr_sidebar_open_from_flags(flags: &BTreeSet<String>) -> bool {
     flags.contains(PR_SIDEBAR_FLAG)
+}
+
+/// Stable persistence key for a per-repo PR-sidebar section (the full
+/// `owner/name`, so two repos sharing a short name stay independent).
+fn pr_repo_section_key(repo: &str) -> String {
+    format!("repo:{repo}")
+}
+
+/// The UI-flag entry that records `section_key` as collapsed.
+fn pr_section_flag(section_key: &str) -> String {
+    format!("{PR_SECTION_COLLAPSED_PREFIX}{section_key}")
+}
+
+/// Restore the collapsed PR-sidebar section keys from the persisted UI-flag
+/// set; every other entry (the open flag, future flags, junk) is ignored.
+fn pr_collapsed_sections_from_flags(flags: &BTreeSet<String>) -> BTreeSet<String> {
+    flags
+        .iter()
+        .filter_map(|flag| flag.strip_prefix(PR_SECTION_COLLAPSED_PREFIX))
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a PR-sidebar section renders its rows. An active search query
+/// overrides the persisted collapsed state: matches always show, so a hit
+/// can never hide inside a folded section.
+fn pr_section_expanded(collapsed: &BTreeSet<String>, section_key: &str, searching: bool) -> bool {
+    searching || !collapsed.contains(section_key)
 }
 
 /// Jump-to-tile framing for a PR row click: center `rect` in the viewport,
@@ -1745,6 +1774,14 @@ const PR_SIDEBAR_W: f32 = 340.0;
 /// Entry in `overview_positions::UI_FLAGS_FILE` meaning "the My PRs sidebar
 /// is open".
 const PR_SIDEBAR_FLAG: &str = "prSidebarOpen";
+/// Prefix of the UI-flag entries naming PR-sidebar sections the user
+/// collapsed (`prSectionCollapsed:<section key>`). Same string-set file as
+/// [`PR_SIDEBAR_FLAG`]; see [`pr_section_key`] for the key shapes.
+const PR_SECTION_COLLAPSED_PREFIX: &str = "prSectionCollapsed:";
+/// Section key for the "Needs my review" PR-sidebar section.
+const PR_SECTION_NEEDS_REVIEW: &str = "needs-review";
+/// Section key for the "Needs your action" PR-sidebar section.
+const PR_SECTION_NEEDS_ACTION: &str = "needs-action";
 /// The embedded transcript's top inset (`Transcript::set_top_inset`): the
 /// panel's own header sits ABOVE the transcript rather than overlaying it,
 /// so only a little breathing room replaces the chat route's titlebar inset.
@@ -1881,12 +1918,19 @@ pub struct Overview {
     /// leftmost fixed-width column — `[sidebar | list/canvas | chat panel]`
     /// — so the canvas simply measures narrower (its `canvas_bounds` come
     /// from paint, so culling/fit/zoom math follow automatically). The
-    /// toolbar search filters its rows too ([`pr_matches_search`]).
+    /// sidebar has its own search box ([`Overview::pr_search`]).
     /// Persisted via `overview_positions::UI_FLAGS_FILE`.
     pr_sidebar_open: bool,
     /// The sidebar's own scroll (it is visible alongside the list, which
     /// owns `scroll`).
     pr_sidebar_scroll: ScrollHandle,
+    /// The sidebar's own search box. Filters ONLY the PR list
+    /// ([`pr_matches_search`]); the toolbar `search` filters chats only.
+    pr_search: Entity<ComposerInput>,
+    /// Section keys ([`PR_SECTION_NEEDS_REVIEW`], [`PR_SECTION_NEEDS_ACTION`],
+    /// [`pr_repo_section_key`]) the user folded. Persisted as
+    /// [`PR_SECTION_COLLAPSED_PREFIX`] entries in `UI_FLAGS_FILE`.
+    pr_collapsed_sections: BTreeSet<String>,
     /// See [`PendingFocus`].
     pending_focus: Option<PendingFocus>,
     /// The chat a canvas/list pass should bring into view THIS frame —
@@ -1986,6 +2030,7 @@ pub struct Overview {
     peek_focus: gpui::FocusHandle,
     _observe: Subscription,
     _search_events: Subscription,
+    _pr_search_events: Subscription,
     _link_input_events: Subscription,
 }
 
@@ -2030,6 +2075,16 @@ impl Overview {
                 this.rows_dirty = true;
                 this.grouped_layout_cache = None;
                 this.pending_fit_to_matches = true;
+                cx.notify();
+            }
+        });
+        let pr_search = cx.new(|cx| {
+            ComposerInput::with_context("Search PRs…", crate::composer::PALETTE_SEARCH_CONTEXT, cx)
+                .with_single_line()
+                .with_accessibility_role(gpui::Role::SearchInput)
+        });
+        let pr_search_events = cx.subscribe(&pr_search, |_: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
                 cx.notify();
             }
         });
@@ -2107,6 +2162,8 @@ impl Overview {
             review_prs_fetched_at: None,
             pr_sidebar_open: false,
             pr_sidebar_scroll: ScrollHandle::new(),
+            pr_search,
+            pr_collapsed_sections: BTreeSet::new(),
             pending_focus: None,
             focus_due: None,
             canvas_bounds: Rc::new(Cell::new(None)),
@@ -2129,6 +2186,7 @@ impl Overview {
             peek_focus: cx.focus_handle(),
             _observe: observe,
             _search_events: search_events,
+            _pr_search_events: pr_search_events,
             _link_input_events: link_input_events,
         }
     }
@@ -2172,6 +2230,8 @@ impl Overview {
         if pr_sidebar_open_from_flags(&flags) && !self.pr_sidebar_open {
             self.set_pr_sidebar_open(true, false, cx);
         }
+        self.pr_collapsed_sections
+            .extend(pr_collapsed_sections_from_flags(&flags));
         self.acknowledged_done
             .extend(overview_positions::load_string_set(&data_dir, overview_positions::ACKNOWLEDGED_DONE_FILE));
         self.hidden_repos
@@ -2192,27 +2252,43 @@ impl Overview {
     }
 
     /// Open/close the left My PRs sidebar. `persist`: write the UI-flag file
-    /// (false only when applying the value just loaded from it). The search
-    /// placeholder advertises that the query now reaches PRs too.
+    /// (false only when applying the value just loaded from it).
     fn set_pr_sidebar_open(&mut self, open: bool, persist: bool, cx: &mut Context<Self>) {
         self.pr_sidebar_open = open;
-        let placeholder = if open { "Search chats & PRs…" } else { "Search chats…" };
-        self.search
-            .update(cx, |search, cx| search.set_placeholder(placeholder, cx));
         if open {
             self.ensure_my_prs(cx);
         }
-        if persist && let Some(data_dir) = self.state.read(cx).data_dir.clone() {
-            // Read-modify-write so any other flag in the file survives.
-            let mut flags = overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
-            if open {
-                flags.insert(PR_SIDEBAR_FLAG.to_string());
-            } else {
-                flags.remove(PR_SIDEBAR_FLAG);
-            }
-            self.save_string_set(overview_positions::UI_FLAGS_FILE, &flags, cx);
+        if persist {
+            self.persist_ui_flag(PR_SIDEBAR_FLAG.to_string(), open, cx);
         }
         cx.notify();
+    }
+
+    /// Fold/unfold one PR-sidebar section and persist the collapsed set.
+    fn toggle_pr_section(&mut self, section_key: &str, cx: &mut Context<Self>) {
+        let collapsed = if self.pr_collapsed_sections.remove(section_key) {
+            false
+        } else {
+            self.pr_collapsed_sections.insert(section_key.to_string());
+            true
+        };
+        self.persist_ui_flag(pr_section_flag(section_key), collapsed, cx);
+        cx.notify();
+    }
+
+    /// Set/clear one entry of `UI_FLAGS_FILE`. Read-modify-write so every
+    /// other flag in the file survives.
+    fn persist_ui_flag(&self, flag: String, on: bool, cx: &Context<Self>) {
+        let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
+            return;
+        };
+        let mut flags = overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
+        if on {
+            flags.insert(flag);
+        } else {
+            flags.remove(&flag);
+        }
+        self.save_string_set(overview_positions::UI_FLAGS_FILE, &flags, cx);
     }
 
     /// A PR row's jump: open the chat in the right-hand panel (which also
@@ -5052,7 +5128,7 @@ impl Overview {
             "Small tiles under a card = its subagents, all of them (dot: blue running, green done). Hover for the full name; click one to peek at its transcript in a read-only side panel (a subagent can't be continued). ✕ or Escape closes it.",
             "Archive hides a chat from the default view (same as the sidebar's archive). \"Show archived\" brings archived chats back, dimmed.",
             "\"Repos\" hides whole repos everywhere (canvas, list, grouping, search). Search matches title, branch, last message, folder, ticket id and PR title, and zooms the canvas to 1-8 matches.",
-            "\"My PRs\" opens a left sidebar of every open PR you authored (\u{26a1} actionable first, then by repo) beside the list or canvas, with PRs awaiting your review in a \"Needs my review\" section on top. Its count lights red when something needs you — CI failing, changes requested, a merge conflict, no reviewer ever requested (ready-to-merge alone doesn't count), or a review requested from you. While it's open, search also filters PRs by repo, title, number (123 or #123) and branch. Clicking a PR with a linked chat opens that chat in the side panel and brings its tile/row into view; otherwise it opens the PR on GitHub.",
+            "\"My PRs\" opens a left sidebar of every open PR you authored (\u{26a1} actionable first, then by repo) beside the list or canvas, with PRs awaiting your review in a \"Needs my review\" section on top. Its count lights red when something needs you — CI failing, changes requested, a merge conflict, no reviewer ever requested (ready-to-merge alone doesn't count), or a review requested from you. The sidebar has its own search box that filters PRs by repo, title, number (123 or #123), branch and author (the toolbar search only filters chats). Click a section header to fold it; a PR search shows matches even inside folded sections. Clicking a PR with a linked chat opens that chat in the side panel and brings its tile/row into view; otherwise it opens the PR on GitHub.",
             "Canvas: scroll to pan, pinch or Ctrl+scroll to zoom, − / + to zoom around the center, click the % to reset, ⤢ to fit every card in view. Panned or zoomed away from every card? A \"Fit view\" pill appears — click it to snap back.",
         ];
         div()
@@ -6290,8 +6366,9 @@ impl Overview {
     /// see, in `renderPrPane`'s two-part shape (`session_canvas.html`): an
     /// actionable-first rollup ("⚡ Needs your action", anything with a
     /// non-empty `action_reasons()`, severity-sorted), then every PR grouped
-    /// by repo, repos alphabetical. The toolbar search filters both parts
-    /// ([`pr_matches_search`]). Header/border treatment mirrors the chat
+    /// by repo, repos alphabetical. The sidebar's own search box
+    /// ([`Overview::pr_search`], not the toolbar's) filters every part
+    /// ([`pr_matches_search`]); each section folds on a header click. Header/border treatment mirrors the chat
     /// panel's (mirrored to the left edge). A PR with no linked chat opens
     /// on GitHub instead of jumping, matching the reference's "no open chat
     /// for this PR" case.
@@ -6305,7 +6382,8 @@ impl Overview {
             return None;
         }
         self.ensure_my_prs(cx);
-        let query = self.search.read(cx).text().trim().to_lowercase();
+        let query = self.pr_search.read(cx).text().trim().to_lowercase();
+        let searching = !query.is_empty();
 
         // Clone out of `self.my_prs` up front — everything below needs
         // `&mut self` (badge/jump lookups reuse `self.link_status`), which a
@@ -6370,6 +6448,12 @@ impl Overview {
                     })),
             );
 
+        let search_bar = div()
+            .flex_none()
+            .px(px(8.0))
+            .pt(px(8.0))
+            .child(popover::search_input_frame(theme, self.pr_search.clone().into_any_element()));
+
         let body: gpui::AnyElement = if shown == 0 {
             let message = if total == 0 {
                 if (self.my_prs_pending && self.my_prs_fetched_at.is_none())
@@ -6421,6 +6505,8 @@ impl Overview {
             let mut sections: Vec<gpui::AnyElement> = Vec::new();
             if !review_items.is_empty() {
                 sections.push(self.render_pr_section(
+                    PR_SECTION_NEEDS_REVIEW.to_string(),
+                    searching,
                     format!("Needs my review ({})", review_items.len()),
                     &review_items,
                     true,
@@ -6432,6 +6518,8 @@ impl Overview {
             }
             if !actionable.is_empty() {
                 sections.push(self.render_pr_section(
+                    PR_SECTION_NEEDS_ACTION.to_string(),
+                    searching,
                     format!("⚡ Needs your action ({})", actionable.len()),
                     &actionable,
                     false,
@@ -6443,7 +6531,17 @@ impl Overview {
             }
             for (repo, items) in &by_repo {
                 let label = format!("{} ({})", repo.rsplit('/').next().unwrap_or(repo), items.len());
-                sections.push(self.render_pr_section(label, items, false, &mut next_ix, rows, theme, cx));
+                sections.push(self.render_pr_section(
+                    pr_repo_section_key(repo),
+                    searching,
+                    label,
+                    items,
+                    false,
+                    &mut next_ix,
+                    rows,
+                    theme,
+                    cx,
+                ));
             }
             div()
                 .id("overview-pr-sidebar-list")
@@ -6472,13 +6570,19 @@ impl Overview {
                 .border_color(theme.border)
                 .bg(theme.surface_raised)
                 .child(header)
+                .child(search_bar)
                 .child(body)
                 .into_any_element(),
         )
     }
 
+    /// One sidebar section: a click-to-fold header (chevron + label with its
+    /// count, which stays visible while folded) over its rows. `searching`
+    /// forces the rows visible ([`pr_section_expanded`]).
     fn render_pr_section(
         &mut self,
+        section_key: String,
+        searching: bool,
         label: String,
         items: &[MyPrItem],
         review: bool,
@@ -6487,25 +6591,51 @@ impl Overview {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let children: Vec<gpui::AnyElement> = items
-            .iter()
-            .map(|item| {
-                let ix = *next_ix;
-                *next_ix += 1;
-                self.render_pr_item(ix, item, review, rows, theme, cx)
-            })
-            .collect();
+        let expanded = pr_section_expanded(&self.pr_collapsed_sections, &section_key, searching);
+        // Element ids stay unique across sections via the running index, so
+        // a folded section still advances it by its item count.
+        let children: Vec<gpui::AnyElement> = if expanded {
+            items
+                .iter()
+                .map(|item| {
+                    let ix = *next_ix;
+                    *next_ix += 1;
+                    self.render_pr_item(ix, item, review, rows, theme, cx)
+                })
+                .collect()
+        } else {
+            *next_ix += items.len();
+            Vec::new()
+        };
+        let chevron = crate::icons::icon(if expanded {
+            crate::icons::ALT_ARROW_DOWN
+        } else {
+            crate::icons::ALT_ARROW_RIGHT
+        })
+        .size(px(13.0))
+        .text_color(theme.text_muted.opacity(0.7));
+        let toggle_key = section_key.clone();
         div()
             .flex()
             .flex_col()
             .child(
                 div()
+                    .id(SharedString::from(format!("overview-pr-section-{section_key}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
                     .px(px(10.0))
                     .pt(px(10.0))
                     .pb(px(2.0))
+                    .cursor_pointer()
                     .text_size(crate::typography::ui_rems(10.5))
                     .text_color(theme.text_muted.opacity(0.7))
-                    .child(SharedString::from(label)),
+                    .hover(|el| el.text_color(theme.text))
+                    .child(div().flex_none().size(px(14.0)).child(chevron))
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_pr_section(&toggle_key, cx);
+                    })),
             )
             .children(children)
             .into_any_element()
@@ -7134,6 +7264,32 @@ mod logic_tests {
         let pending = pr_item(7, "acme/api", "Bump deps", None);
         assert!(pr_matches_search("#7", &pending));
         assert!(!pr_matches_search("mikey/", &pending));
+    }
+
+    #[test]
+    fn pr_collapsed_sections_round_trip_through_the_flag_set() {
+        let mut flags = BTreeSet::new();
+        flags.insert(PR_SIDEBAR_FLAG.to_string());
+        flags.insert("someFutureFlag".to_string());
+        flags.insert(pr_section_flag(PR_SECTION_NEEDS_REVIEW));
+        flags.insert(pr_section_flag(&pr_repo_section_key("cofactr/zeron")));
+        flags.insert(PR_SECTION_COLLAPSED_PREFIX.to_string()); // empty key: junk
+        let collapsed = pr_collapsed_sections_from_flags(&flags);
+        assert_eq!(
+            collapsed,
+            BTreeSet::from(["needs-review".to_string(), "repo:cofactr/zeron".to_string()])
+        );
+        // The open flag and the collapsed entries don't read as each other.
+        assert!(pr_sidebar_open_from_flags(&flags));
+        assert!(pr_collapsed_sections_from_flags(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn pr_section_search_overrides_collapsed_state() {
+        let collapsed = BTreeSet::from([PR_SECTION_NEEDS_ACTION.to_string()]);
+        assert!(!pr_section_expanded(&collapsed, PR_SECTION_NEEDS_ACTION, false));
+        assert!(pr_section_expanded(&collapsed, PR_SECTION_NEEDS_ACTION, true));
+        assert!(pr_section_expanded(&collapsed, PR_SECTION_NEEDS_REVIEW, false));
     }
 
     #[test]

@@ -27,6 +27,13 @@
 //! what the live wire's untagged `Frame::User` branch already forwards as
 //! `ToolResult` events.
 //!
+//! # Auto-adopt
+//!
+//! [`ExternalSessionImporter::auto_adopt_external_sessions`] runs at boot and
+//! every 5 minutes (see `lib.rs`), importing settled external sessions
+//! automatically. Set `ZERON_DISABLE_AUTO_ADOPT=1` (any value except empty,
+//! `0`, `false`) to disable it entirely.
+//!
 //! Nested subagent threads (`isSidechain: true`) are out of scope for v1 —
 //! skipped entirely, matching ticket 001's scope cut.
 
@@ -178,6 +185,19 @@ struct SyncCursor {
     last_synced_mtime: Option<i64>,
     #[serde(default)]
     last_synced_len: Option<u64>,
+}
+
+/// Auto-adopt only considers transcripts modified within this window.
+const AUTO_ADOPT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+/// Cap per sweep; the remainder is picked up on the next interval.
+const AUTO_ADOPT_MAX_PER_SWEEP: usize = 50;
+
+/// Kill switch: `ZERON_DISABLE_AUTO_ADOPT` set to anything but empty/`0`/`false`.
+fn auto_adopt_disabled() -> bool {
+    match std::env::var("ZERON_DISABLE_AUTO_ADOPT") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"),
+        Err(_) => false,
+    }
 }
 
 /// `(mtime_ms, len)` of a file via a single `stat()`; `None` if unreadable.
@@ -1050,6 +1070,102 @@ impl ExternalSessionImporter {
         }
         candidates.sort_by(|a, b| b.modified_at_ms.cmp(&a.modified_at_ms));
         Ok(candidates)
+    }
+
+    /// Session ids recorded in any import cursor file. Covers a chat that was
+    /// imported and later deleted (its `harness_session_id` left the
+    /// workspace with the row, but the cursor file may linger), so the
+    /// auto-adopt sweep never resurrects something the user removed.
+    fn cursor_session_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let Ok(entries) = std::fs::read_dir(self.cursors_dir()) else {
+            return ids;
+        };
+        for entry in entries.flatten() {
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            if let Ok(cursor) = serde_json::from_slice::<SyncCursor>(&bytes) {
+                ids.insert(cursor.external_session_id);
+            }
+        }
+        ids
+    }
+
+    /// Background auto-adopt sweep: import external Claude Code sessions
+    /// (terminal, `agent-mode.sh`) that no Zeron chat has claimed yet, so the
+    /// overview is complete without the manual import picker. Mirrors the web
+    /// reference's `scan_external_claude_sessions`. Returns the number of
+    /// chats adopted. Blocking; run off the async path.
+    ///
+    /// Eligibility (all must hold):
+    /// - transcript mtime within [`AUTO_ADOPT_MAX_AGE`] (14 days);
+    /// - not claimed: [`Self::scan`] already excludes every chat's
+    ///   `harness_session_id` (Zeron-launched AND previously imported chats,
+    ///   the critical guard against duplicating Zeron's own chats), classifier/
+    ///   title-gen junk and transcripts with no real first user message; this
+    ///   sweep additionally excludes any session id in an import cursor;
+    /// - does NOT look live per [`crate::liveness::check_liveness`]. Adopting
+    ///   mid-flight is safe read-wise (import only reads the file, and
+    ///   `sync_stale_imports` catches up later) but surprising: a chat
+    ///   appearing for a session still being typed into. A live terminal
+    ///   session is therefore adopted by a later sweep once it settles.
+    ///
+    /// At most [`AUTO_ADOPT_MAX_PER_SWEEP`] chats are adopted per sweep (the
+    /// liveness process check shells out to `ps`/`lsof`); the rest follow on
+    /// the next interval. Disabled entirely when `ZERON_DISABLE_AUTO_ADOPT`
+    /// is set to a non-empty value other than `0`/`false`.
+    pub fn auto_adopt_external_sessions(&self) -> Result<usize, EngineError> {
+        self.auto_adopt_with(auto_adopt_disabled(), std::time::SystemTime::now(), |c| {
+            crate::liveness::check_liveness(
+                Path::new(&c.path),
+                &c.session_id,
+                c.cwd.as_deref().unwrap_or(""),
+            )
+            .is_concerning()
+        })
+    }
+
+    /// Testable core of [`Self::auto_adopt_external_sessions`]: `looks_live`
+    /// is the liveness predicate (the real one is mtime + process scan; the
+    /// process scan can't be exercised synthetically).
+    fn auto_adopt_with(
+        &self,
+        disabled: bool,
+        now: std::time::SystemTime,
+        looks_live: impl Fn(&ExternalSessionCandidate) -> bool,
+    ) -> Result<usize, EngineError> {
+        if disabled {
+            return Ok(0);
+        }
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let cutoff_ms = now_ms - AUTO_ADOPT_MAX_AGE.as_millis() as i64;
+        let cursor_ids = self.cursor_session_ids();
+        let mut adopted = 0usize;
+        for candidate in self.scan()? {
+            if adopted >= AUTO_ADOPT_MAX_PER_SWEEP {
+                break;
+            }
+            if candidate.modified_at_ms < cutoff_ms || cursor_ids.contains(&candidate.session_id) {
+                continue;
+            }
+            if looks_live(&candidate) {
+                continue;
+            }
+            let chat_id = uuid::Uuid::new_v4().to_string();
+            match self.import(&chat_id, &candidate.session_id, Path::new(&candidate.path)) {
+                Ok(_) => adopted += 1,
+                Err(err) => tracing::warn!(
+                    session_id = %candidate.session_id,
+                    error = %err,
+                    "auto-adopt import failed"
+                ),
+            }
+        }
+        Ok(adopted)
     }
 
     /// One-time migration: import every Claude Code session `scan()` still

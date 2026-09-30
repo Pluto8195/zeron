@@ -431,6 +431,31 @@ impl EngineCore {
                 Err(err) => tracing::warn!(error = %err, "stale import sync pass failed"),
             });
         }
+        // Auto-adopt externally started sessions: once at boot (queued after
+        // the stale-sync pass on the blocking pool) and then every 5 minutes
+        // for the engine's lifetime. Kill switch: ZERON_DISABLE_AUTO_ADOPT.
+        // Skipped for the Development scope (test/dev harness profiles) so
+        // synthetic-HOME tests aren't raced by a background adopter.
+        if profile.scope() != WorkspaceScope::Development {
+            let importer = external_import.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+                loop {
+                    interval.tick().await;
+                    let importer = importer.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        importer.auto_adopt_external_sessions()
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(n)) => tracing::info!(count = n, "auto-adopted external sessions"),
+                        Ok(Err(err)) => tracing::warn!(error = %err, "auto-adopt sweep failed"),
+                        Err(err) => tracing::warn!(error = %err, "auto-adopt sweep panicked"),
+                    }
+                }
+            });
+        }
         let agent_accounts = AgentAccounts::new(agent_accounts_config);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),

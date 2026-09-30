@@ -168,6 +168,16 @@ struct SyncCursor {
     category: String,
     #[serde(default)]
     origin: String,
+    /// [`CLASSIFIER_VERSION`] of the heuristic that wrote `category`. `None`
+    /// (every cursor written before versioning) means version 1 and is stale.
+    /// Only ever written alongside a classifier-produced category: there is
+    /// no manual-recategorize path anywhere (category is read-only in the RPC
+    /// and UI; see [`ExternalSessionImporter::reclassify_stale_classifier_version`]),
+    /// so a stale stamp always means "the classifier wrote this and a newer
+    /// classifier may disagree". If a manual category write is ever added it
+    /// must clear/sentinel this field so the reclassify pass skips it.
+    #[serde(default)]
+    classifier_version: Option<u32>,
     /// Tool-call tally and loaded-skill names as of the last import/sync —
     /// same bookkeeping-not-workspace-state reasoning as `category`/`origin`,
     /// read back via [`ExternalSessionImporter::tool_usage_for`]. `#[serde(default)]`
@@ -347,6 +357,7 @@ impl ExternalSessionImporter {
                 lines_consumed: parsed.total_lines,
                 category: parsed.category.clone(),
                 origin: parsed.origin.clone(),
+                classifier_version: Some(CLASSIFIER_VERSION),
                 tool_counts: parsed.tool_counts.clone(),
                 skills_loaded: parsed.skills_loaded.clone(),
                 last_synced_mtime: stamp.map(|s| s.0),
@@ -581,6 +592,7 @@ impl ExternalSessionImporter {
                 &SyncCursor {
                     category: parsed.category,
                     origin: parsed.origin,
+                    classifier_version: Some(CLASSIFIER_VERSION),
                     tool_counts: parsed.tool_counts,
                     skills_loaded: parsed.skills_loaded,
                     ..cursor
@@ -594,6 +606,71 @@ impl ExternalSessionImporter {
             repaired += 1;
         }
         Ok(repaired)
+    }
+
+    /// Re-run [`classify_heuristic`] on imported chats whose cursor's
+    /// `classifier_version` is older than (or absent vs.) [`CLASSIFIER_VERSION`],
+    /// so a heuristic change reaches chats classified before it. Updates
+    /// `category` and stamps the current version; a chat whose category comes
+    /// out the same only gets the stamp. Returns `(recategorized, restamped)`.
+    ///
+    /// Cost: one `read_chats` walk plus one tiny cursor-file read per chat.
+    /// Only stale chats pay more: the classifier's `turn_count`/`debug_prompt`
+    /// inputs are NOT cached on the cursor (only `tool_counts`/`skills_loaded`
+    /// are), so each stale chat costs ONE streaming tally pass over its
+    /// transcript ([`tally_transcript`]: JSON-parse per line, no message
+    /// entries built, no doc writes). Each stale chat is paid once ever: the
+    /// stamp makes every later boot a cursor-read-only no-op. Chats whose
+    /// transcript is gone are skipped unstamped (retried next boot at the cost
+    /// of one failed `open`). Chats with an empty category AND origin are left
+    /// to [`Self::repair_missing_classification`], which does the full
+    /// backfill and stamps them.
+    ///
+    /// Manual-override guard: none needed. Category has no manual write path
+    /// — the only writers are `import`, `repair_missing_classification` and
+    /// this pass, all classifier output; the RPC (`classification_for`) and
+    /// UI only read it. See [`SyncCursor::classifier_version`] for what to do
+    /// if one is added.
+    ///
+    /// The cursor is re-read right before the write (the tally can take a
+    /// while on a big transcript) so a concurrent `sync` advancing
+    /// `lines_consumed` in that window is not clobbered by a stale copy.
+    pub fn reclassify_stale_classifier_version(&self) -> Result<(usize, usize), EngineError> {
+        let mut recategorized = 0;
+        let mut restamped = 0;
+        for chat in self.workspace.read_chats()? {
+            let Some(cursor) = self.read_cursor(&chat.id)? else {
+                continue;
+            };
+            if cursor.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION {
+                continue;
+            }
+            if cursor.category.is_empty() && cursor.origin.is_empty() {
+                continue; // repair_missing_classification's job
+            }
+            let Some(tally) = tally_transcript(Path::new(&cursor.transcript_path)) else {
+                continue; // source file moved/deleted — skip, retry next boot
+            };
+            let category = tally.category();
+            let Some(fresh) = self.read_cursor(&chat.id)? else {
+                continue;
+            };
+            let changed = fresh.category != category;
+            self.write_cursor(
+                &chat.id,
+                &SyncCursor {
+                    category,
+                    classifier_version: Some(CLASSIFIER_VERSION),
+                    ..fresh
+                },
+            )?;
+            if changed {
+                recategorized += 1;
+            } else {
+                restamped += 1;
+            }
+        }
+        Ok((recategorized, restamped))
     }
 
     /// Sibling to [`Self::repair_missing_timestamps`]/
@@ -1525,6 +1602,13 @@ const RESEARCH_SKILLS: &[&str] = &[
     "firecrawl",
 ];
 
+/// Version of [`classify_heuristic`]'s behavior (including the tally inputs it
+/// is fed: `turn_count`, `debug_prompt`). **Bump this whenever the heuristic's
+/// behavior changes** so `reclassify_stale_classifier_version` re-runs it on
+/// chats classified by an older version. Version 1 is the pre-versioning
+/// heuristic; a cursor with no stamp is treated as version 1.
+pub const CLASSIFIER_VERSION: u32 = 2;
+
 /// Ported from `session_canvas_server.py`'s `classify_heuristic`
 /// (lines 469-482) — the real-time classifier (no LLM call) — plus a Zeron
 /// addition: `"debug"` (something broken and being hunted or fixed: bugs,
@@ -1812,6 +1896,24 @@ impl ClassificationTally {
         skills.sort();
         skills
     }
+}
+
+/// Streaming classification-only pass over a transcript: same tally
+/// `parse_transcript` feeds (every line observed, sidechains included), but
+/// no message entries, no turn merging. `None` if the file can't be opened.
+fn tally_transcript(path: &Path) -> Option<ClassificationTally> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    let mut tally = ClassificationTally::default();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(raw) = serde_json::from_str::<RawLine>(&line) {
+            tally.observe(&raw);
+        }
+    }
+    Some(tally)
 }
 
 struct TranscriptSummary {

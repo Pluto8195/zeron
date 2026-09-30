@@ -346,6 +346,18 @@ impl EngineCore {
                     Ok(n) => tracing::info!(count = n, "repaired missing classification on imported chats"),
                     Err(err) => tracing::warn!(error = %err, "classification repair pass failed"),
                 }
+                // Then (same thread, so the two never race on a cursor file)
+                // re-run the heuristic for chats classified by an older
+                // `CLASSIFIER_VERSION`.
+                match importer.reclassify_stale_classifier_version() {
+                    Ok((0, 0)) => {}
+                    Ok((changed, restamped)) => tracing::info!(
+                        recategorized = changed,
+                        restamped,
+                        "reclassified imported chats with a stale classifier version"
+                    ),
+                    Err(err) => tracing::warn!(error = %err, "classifier-version reclassify pass failed"),
+                }
             });
         }
         // Same reasoning again, for chats imported before `scan()`/

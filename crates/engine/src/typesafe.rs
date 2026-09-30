@@ -105,6 +105,12 @@ pub trait ChatCategoryClassifier: Send + Sync {
     /// nothing is stale for that reason, so a keyless boot never churns.
     fn available(&self) -> bool;
     fn classify(&self, input: &ChatClassificationInput) -> JevOutcome;
+    /// Whether calls are currently being short-circuited (the live
+    /// classifier's circuit breaker is open). A batch pass should stop
+    /// offering chats to Jev while this is true. Default: never.
+    fn circuit_open(&self) -> bool {
+        false
+    }
 }
 
 /// Default classifier: never available, never called. Keeps tests and any
@@ -364,6 +370,10 @@ impl ChatCategoryClassifier for LiveJevClassifier {
         api_key().is_some()
     }
 
+    fn circuit_open(&self) -> bool {
+        self.breaker_open()
+    }
+
     fn classify(&self, input: &ChatClassificationInput) -> JevOutcome {
         if self.breaker_open() || !self.available() {
             return JevOutcome::Failed;
@@ -612,6 +622,8 @@ mod tests {
             live.record(&JevOutcome::Failed);
         }
         assert!(live.breaker_open());
+        assert!(ChatCategoryClassifier::circuit_open(&live), "trait seam reports the open breaker");
+        assert!(!NoJev.circuit_open());
 
         let live = LiveJevClassifier::new();
         live.record(&JevOutcome::Failed);

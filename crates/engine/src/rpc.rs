@@ -2242,6 +2242,15 @@ impl RpcService for EngineRpc {
                     "skillsLoaded": skills_loaded,
                 }))
             }
+            methods::RECLASSIFY_OTHER_CHATS => {
+                // Up to 50 blocking Jev HTTP calls: never on a runtime worker.
+                let importer = self.external_importer()?.clone();
+                let report = tokio::task::spawn_blocking(move || importer.reclassify_other_chats())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&report)
+            }
             methods::CHAT_CONTEXT_USAGE => {
                 let p: ChatLinkStatusParams = parse_params(params)?;
                 let provider = self.context_usage()?.clone();
@@ -3286,6 +3295,31 @@ mod tests {
     fn chat_link_methods_are_ipc_only() {
         assert!(!forwardable(methods::CHAT_LINK_STATUS));
         assert!(!forwardable(methods::SET_CHAT_LINK));
+    }
+
+    /// `RECLASSIFY_OTHER_CHATS` rewrites this device's import cursors and
+    /// calls TypeSafe with a local key: never relay-forwarded. Its reply
+    /// field names are the UI's contract.
+    #[test]
+    fn reclassify_other_chats_is_ipc_only_and_replies_camel_case() {
+        assert!(!forwardable(methods::RECLASSIFY_OTHER_CHATS));
+        let report = crate::external_import::ReclassifyOtherReport {
+            examined: 5,
+            reclassified: 2,
+            unchanged: 2,
+            jev_calls: 4,
+            deferred: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({
+                "examined": 5,
+                "reclassified": 2,
+                "unchanged": 2,
+                "jevCalls": 4,
+                "deferred": 1,
+            })
+        );
     }
 
     /// `SCAN_CHAT_SUBAGENTS`/`READ_SUBAGENT_TRANSCRIPT` both read this

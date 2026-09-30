@@ -251,6 +251,37 @@ impl ReclassifyReport {
     }
 }
 
+/// The "uncategorized" bucket: `other`, or a cursor with no category at all.
+fn is_other_category(category: &str) -> bool {
+    category.is_empty() || category == "other"
+}
+
+/// Jev attempts per user-triggered "Reclassify other" run
+/// ([`ExternalSessionImporter::reclassify_other_chats`]). A manual click is
+/// consent to spend more than the silent boot pass's
+/// [`JEV_RECLASSIFY_MAX_PER_PASS`]; every attempt counts, successful or not.
+pub const JEV_RECLASSIFY_MAX_MANUAL: usize = 50;
+
+/// Outcome of [`ExternalSessionImporter::reclassify_other_chats`]. Serialized
+/// as-is for the `ReclassifyOtherChats` RPC reply (camelCase, pinned by test).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReclassifyOtherReport {
+    /// `other`/empty-category imported chats considered.
+    pub examined: usize,
+    /// Of those, given a different category by Jev.
+    pub reclassified: usize,
+    /// Of those, left as they were: Jev kept `other`, was inconclusive, the
+    /// call failed, or Jev is unavailable. Includes `examined - reclassified -
+    /// deferred`.
+    pub unchanged: usize,
+    /// Jev calls made (never above the budget).
+    pub jev_calls: usize,
+    /// Chats not offered to Jev because the budget ran out or the circuit
+    /// breaker opened; run again.
+    pub deferred: usize,
+}
+
 /// Auto-adopt only considers transcripts modified within this window.
 const AUTO_ADOPT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
 /// Cap per sweep; the remainder is picked up on the next interval.
@@ -802,20 +833,9 @@ impl ExternalSessionImporter {
             } else {
                 (heuristic, ClassifierSource::Heuristic, false)
             };
-            let Some(fresh) = self.read_cursor(&chat.id)? else {
+            let Some(changed) = self.stamp_classification(&chat.id, category, source, inconclusive)? else {
                 continue;
             };
-            let changed = fresh.category != category;
-            self.write_cursor(
-                &chat.id,
-                &SyncCursor {
-                    category,
-                    classifier_version: Some(CLASSIFIER_VERSION),
-                    classifier_source: source,
-                    jev_inconclusive_version: inconclusive.then_some(CLASSIFIER_VERSION),
-                    ..fresh
-                },
-            )?;
             if changed {
                 report.recategorized += 1;
             } else {
@@ -826,6 +846,119 @@ impl ExternalSessionImporter {
             }
         }
         Ok(report)
+    }
+
+    /// Shared tail of the reclassification passes: re-read the cursor (the
+    /// tally and the Jev call can take a while, so a concurrent `sync`
+    /// advancing `lines_consumed` in that window is not clobbered by a stale
+    /// copy), then write `category` with the current version and `source`
+    /// stamps (and the inconclusive park, if any). `Ok(None)` if the cursor
+    /// vanished meanwhile; otherwise whether the category changed.
+    fn stamp_classification(
+        &self,
+        chat_id: &str,
+        category: String,
+        source: ClassifierSource,
+        jev_inconclusive: bool,
+    ) -> Result<Option<bool>, EngineError> {
+        let Some(fresh) = self.read_cursor(chat_id)? else {
+            return Ok(None);
+        };
+        let changed = fresh.category != category;
+        self.write_cursor(
+            chat_id,
+            &SyncCursor {
+                category,
+                classifier_version: Some(CLASSIFIER_VERSION),
+                classifier_source: source,
+                jev_inconclusive_version: jev_inconclusive.then_some(CLASSIFIER_VERSION),
+                ..fresh
+            },
+        )?;
+        Ok(Some(changed))
+    }
+
+    /// User-triggered "Reclassify other": re-run the Jev-first classification
+    /// on every imported chat currently filed under `other` (or with an empty
+    /// category), **ignoring** the version/source stamps and
+    /// [`SyncCursor::jev_inconclusive_version`] — a manual click is consent to
+    /// retry chats the boot pass parked as too torn.
+    ///
+    /// Only a conclusive Jev answer changes anything: the new category is
+    /// written with the current version + `jev` source and the inconclusive
+    /// park cleared. A chat Jev keeps at `other` is restamped (`jev`). An
+    /// inconclusive answer leaves the category and records the park (so the
+    /// boot pass doesn't burn budget on it); a failed call or an unavailable
+    /// classifier writes nothing. Neither blocks the next manual run, which
+    /// ignores the park. There is deliberately no heuristic fallback here: the
+    /// `other` label already is the heuristic's (or Jev's) answer.
+    ///
+    /// Budget: at most [`JEV_RECLASSIFY_MAX_MANUAL`] Jev calls, every attempt
+    /// counting. Chats past the cap, or remaining once the classifier's
+    /// circuit breaker opens, are counted in `deferred` and left untouched.
+    /// Chats whose transcript is gone are skipped (not examined).
+    pub fn reclassify_other_chats(&self) -> Result<ReclassifyOtherReport, EngineError> {
+        self.reclassify_other_chats_with_budget(JEV_RECLASSIFY_MAX_MANUAL)
+    }
+
+    fn reclassify_other_chats_with_budget(&self, budget: usize) -> Result<ReclassifyOtherReport, EngineError> {
+        let mut report = ReclassifyOtherReport::default();
+        if !self.jev.available() {
+            // Nothing to ask; still report how many chats are eligible.
+            for chat in self.workspace.read_chats()? {
+                if self.is_other_cursor(&chat.id)?.is_some() {
+                    report.examined += 1;
+                    report.unchanged += 1;
+                }
+            }
+            return Ok(report);
+        }
+        let mut jev_budget = budget;
+        for chat in self.workspace.read_chats()? {
+            let Some(cursor) = self.is_other_cursor(&chat.id)? else {
+                continue;
+            };
+            if jev_budget == 0 || self.jev.circuit_open() {
+                report.examined += 1;
+                report.deferred += 1;
+                continue;
+            }
+            let Some(tally) = tally_transcript(Path::new(&cursor.transcript_path)) else {
+                continue; // source file moved/deleted — not examinable
+            };
+            report.examined += 1;
+            jev_budget -= 1;
+            report.jev_calls += 1;
+            match self.jev.classify(&tally.classification_input()) {
+                JevOutcome::Category(category) => {
+                    let moved = !is_other_category(&category);
+                    self.stamp_classification(&chat.id, category, ClassifierSource::Jev, false)?;
+                    if moved {
+                        report.reclassified += 1;
+                    } else {
+                        report.unchanged += 1;
+                    }
+                }
+                JevOutcome::Inconclusive => {
+                    // Park it so the boot pass doesn't spend budget on it; the
+                    // category and the other stamps stay exactly as they were.
+                    if let Some(fresh) = self.read_cursor(&chat.id)? {
+                        self.write_cursor(
+                            &chat.id,
+                            &SyncCursor { jev_inconclusive_version: Some(CLASSIFIER_VERSION), ..fresh },
+                        )?;
+                    }
+                    report.unchanged += 1;
+                }
+                JevOutcome::Failed => report.unchanged += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    /// The cursor of an imported chat whose category is `other` or empty.
+    fn is_other_cursor(&self, chat_id: &str) -> Result<Option<SyncCursor>, EngineError> {
+        Ok(self.read_cursor(chat_id)?.filter(|c| is_other_category(&c.category)))
     }
 
     /// Sibling to [`Self::repair_missing_timestamps`]/

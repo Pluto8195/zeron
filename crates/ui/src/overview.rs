@@ -753,6 +753,62 @@ fn restored_repo_filter_hides_everything(hidden: &BTreeSet<String>, known: &BTre
     !known.is_empty() && known.iter().all(|repo| hidden.contains(repo))
 }
 
+/// How long the reclassify button shows its result before reverting.
+const RECLASSIFY_NOTICE: Duration = Duration::from_secs(8);
+
+/// The "Reclassify 'other'" action's lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReclassifyState {
+    Idle,
+    /// `RECLASSIFY_OTHER_CHATS` in flight.
+    Running,
+    /// Result text shown in place of the label until the instant passes.
+    Done { text: String, until: Instant },
+}
+
+/// `RECLASSIFY_OTHER_CHATS` reply (`{examined, reclassified, unchanged,
+/// jevCalls, deferred}`; missing fields read as 0).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ReclassifyOtherReply {
+    examined: usize,
+    reclassified: usize,
+    unchanged: usize,
+    jev_calls: usize,
+    deferred: usize,
+}
+
+/// The transient result line, e.g. `5 reclassified, 12 unchanged`.
+fn reclassify_summary(reply: &ReclassifyOtherReply) -> String {
+    if reply.examined == 0 {
+        return "Nothing to reclassify".to_string();
+    }
+    if reply.jev_calls == 0 && reply.deferred == 0 {
+        return "TypeSafe unavailable, nothing changed".to_string();
+    }
+    let mut text = format!("{} reclassified, {} unchanged", reply.reclassified, reply.unchanged);
+    if reply.deferred > 0 {
+        text.push_str(" (more remaining \u{2014} run again)");
+    }
+    text
+}
+
+/// What the reclassify button shows: `None` hides it (no `other` chats and no
+/// result to display), otherwise `(label, clickable)`.
+fn reclassify_button_view(other_count: usize, state: &ReclassifyState) -> Option<(String, bool)> {
+    match state {
+        ReclassifyState::Running => Some(("Reclassifying\u{2026}".to_string(), false)),
+        ReclassifyState::Done { text, .. } => Some((text.clone(), false)),
+        ReclassifyState::Idle if other_count > 0 => Some((format!("Reclassify 'other' ({other_count})"), true)),
+        ReclassifyState::Idle => None,
+    }
+}
+
+/// Chats currently filed under `other` (the action's targets).
+fn count_other_rows<'a>(categories: impl Iterator<Item = Option<&'a str>>) -> usize {
+    categories.filter(|category| *category == Some("other")).count()
+}
+
 /// Whether a PR-sidebar section renders its rows. An active search query
 /// overrides the persisted collapsed state: matches always show, so a hit
 /// can never hide inside a folded section.
@@ -1964,6 +2020,10 @@ pub struct Overview {
     /// first non-empty chat list (see [`restored_repo_filter_hides_everything`]).
     /// One-shot so a deliberate "None" in the dropdown isn't undone later.
     repo_filter_needs_validation: bool,
+    /// Imported chats filed under `other` before the repo/search/stale
+    /// filters (set by `rows()`) — the reclassify button's count.
+    other_count: usize,
+    reclassify: ReclassifyState,
     /// The Repos dropdown — the app's standard `Popup` lifecycle (exit
     /// animation + the trigger-press note that keeps a trigger click from
     /// close-then-reopening).
@@ -2229,6 +2289,8 @@ impl Overview {
             prefs_loaded: false,
             view_prefs_touched: false,
             repo_filter_needs_validation: false,
+            other_count: 0,
+            reclassify: ReclassifyState::Idle,
             repo_filter: popover::Popup::default(),
             legend_open: false,
             unfiltered_count: 0,
@@ -2566,6 +2628,7 @@ impl Overview {
             });
         }
         self.known_repos = known_repos;
+        self.other_count = count_other_rows(all.iter().map(|row| row.category.as_deref()));
         if self.repo_filter_needs_validation && !self.known_repos.is_empty() {
             self.repo_filter_needs_validation = false;
             if restored_repo_filter_hides_everything(&self.hidden_repos, &self.known_repos) {
@@ -3037,6 +3100,87 @@ impl Overview {
             .ok();
         })
         .detach();
+    }
+
+    /// "Reclassify 'other'": ask the engine to re-run Jev on every `other`
+    /// chat (up to its manual budget), then show the tally in the button for
+    /// [`RECLASSIFY_NOTICE`] and refetch classifications so moved chats regroup.
+    fn start_reclassify_other(&mut self, cx: &mut Context<Self>) {
+        if self.reclassify == ReclassifyState::Running {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.reclassify = ReclassifyState::Running;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::RECLASSIFY_OTHER_CHATS, serde_json::json!({}))
+                .await;
+            this.update(cx, |this, cx| {
+                let text = match result.map(serde_json::from_value::<ReclassifyOtherReply>) {
+                    Ok(Ok(reply)) => reclassify_summary(&reply),
+                    Ok(Err(_)) => "Reclassify failed".to_string(),
+                    Err(err) => format!("Reclassify failed: {err}"),
+                };
+                this.reclassify = ReclassifyState::Done { text, until: Instant::now() + RECLASSIFY_NOTICE };
+                // Categories moved: drop the TTL so the next row pass refetches.
+                this.classification_fetched_at.clear();
+                this.rows_dirty = true;
+                this.grouped_layout_cache = None;
+                cx.notify();
+            })
+            .ok();
+            cx.background_executor().timer(RECLASSIFY_NOTICE).await;
+            this.update(cx, |this, cx| {
+                if matches!(&this.reclassify, ReclassifyState::Done { until, .. } if Instant::now() >= *until) {
+                    this.reclassify = ReclassifyState::Idle;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The toolbar's reclassify button (see [`reclassify_button_view`]).
+    fn render_reclassify_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (label, clickable) = reclassify_button_view(self.other_count, &self.reclassify)?;
+        let running = self.reclassify == ReclassifyState::Running;
+        let spinner = running.then(|| {
+            crate::loaders::mini_glyph_spinner("overview-reclassify-spinner", 1.75, theme.glyph, cx.entity_id(), cx)
+                .into_any_element()
+        });
+        Some(
+            div()
+                .id("overview-reclassify-other")
+                .debug_selector(|| "overview-reclassify-other".into())
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .px(px(7.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(theme.border)
+                .text_size(crate::typography::ui_rems(10.5))
+                .text_color(if clickable { theme.text } else { theme.text_muted })
+                .when(clickable, |el| {
+                    el.cursor_pointer().hover(|el| el.bg(theme.element_hover))
+                })
+                .when(!clickable, |el| el.opacity(0.75))
+                .children(spinner)
+                .child(SharedString::from(label))
+                .when(clickable, |el| {
+                    el.on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.start_reclassify_other(cx)),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     /// Fetch/refresh one chat's context-window fraction on
@@ -4891,6 +5035,8 @@ impl Render for Overview {
                     )
                     .children(chips),
             );
+            // Next to the category (Task) grouping it feeds.
+            toolbar = toolbar.children(self.render_reclassify_button(&theme, cx));
         }
 
         let header = div()
@@ -7690,6 +7836,174 @@ mod logic_tests {
             assert_eq!(o.rows(cx).len(), 0);
             assert_eq!(o.hidden_repos.len(), 2);
         });
+    }
+
+    #[test]
+    fn reclassify_reply_decodes_the_pinned_wire_fields() {
+        let reply: ReclassifyOtherReply = serde_json::from_value(serde_json::json!({
+            "examined": 17, "reclassified": 5, "unchanged": 12, "jevCalls": 17, "deferred": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            reply,
+            ReclassifyOtherReply { examined: 17, reclassified: 5, unchanged: 12, jev_calls: 17, deferred: 0 }
+        );
+        // Missing fields degrade to 0 rather than failing the decode.
+        let empty: ReclassifyOtherReply = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, ReclassifyOtherReply::default());
+    }
+
+    #[test]
+    fn reclassify_summary_reports_counts_and_hints_when_more_remain() {
+        let reply = ReclassifyOtherReply { examined: 17, reclassified: 5, unchanged: 12, jev_calls: 17, deferred: 0 };
+        assert_eq!(reclassify_summary(&reply), "5 reclassified, 12 unchanged");
+        let capped = ReclassifyOtherReply { examined: 60, reclassified: 40, unchanged: 10, jev_calls: 50, deferred: 10 };
+        assert_eq!(reclassify_summary(&capped), "40 reclassified, 10 unchanged (more remaining \u{2014} run again)");
+        assert_eq!(reclassify_summary(&ReclassifyOtherReply::default()), "Nothing to reclassify");
+        let offline = ReclassifyOtherReply { examined: 3, unchanged: 3, ..Default::default() };
+        assert_eq!(reclassify_summary(&offline), "TypeSafe unavailable, nothing changed");
+    }
+
+    #[test]
+    fn reclassify_button_shows_only_with_other_chats_or_a_result() {
+        assert_eq!(reclassify_button_view(0, &ReclassifyState::Idle), None);
+        assert_eq!(
+            reclassify_button_view(3, &ReclassifyState::Idle),
+            Some(("Reclassify 'other' (3)".to_string(), true))
+        );
+        assert_eq!(
+            reclassify_button_view(3, &ReclassifyState::Running),
+            Some(("Reclassifying\u{2026}".to_string(), false))
+        );
+        // The result stays visible even once the count drops to zero.
+        let done = ReclassifyState::Done { text: "2 reclassified, 1 unchanged".into(), until: Instant::now() };
+        assert_eq!(
+            reclassify_button_view(0, &done),
+            Some(("2 reclassified, 1 unchanged".to_string(), false))
+        );
+        assert_eq!(count_other_rows([Some("other"), Some("debug"), None, Some("other")].into_iter()), 2);
+    }
+
+    /// End to end: the button counts `other` chats, a click issues
+    /// `RECLASSIFY_OTHER_CHATS` (no params), the button is disabled while it
+    /// runs, shows the tally on completion, and classifications refetch.
+    #[gpui::test]
+    fn reclassify_button_counts_other_chats_and_runs_the_rpc(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.chats = ["c1", "c2", "c3"]
+                .iter()
+                .map(|id| {
+                    let mut chat = row_ex(id, "/r", None, 0, false).chat;
+                    chat.harness_session_id = Some(format!("s-{id}"));
+                    chat.last_message_at = Some(Utc::now());
+                    chat
+                })
+                .collect();
+        });
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let (overview, vcx) = cx.add_window_view(|_, cx| {
+            let mut overview =
+                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            for (id, category) in [("c1", "other"), ("c2", "debug"), ("c3", "other")] {
+                overview.classification.insert(
+                    id.to_string(),
+                    ClassificationInfo { category: category.into(), origin: "cli".into(), ..Default::default() },
+                );
+                overview.classification_fetched_at.insert(id.to_string(), Instant::now());
+            }
+            overview
+        });
+        vcx.run_until_parked();
+        // Drain the lookups rows() issued for the chats (all fail; irrelevant).
+        let answer_all = |requests: &mut tokio::sync::mpsc::Receiver<String>, reclassify: Option<serde_json::Value>| {
+            let mut saw_reclassify = false;
+            while let Ok(frame) = requests.try_recv() {
+                let request: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                let reply = if request["method"] == methods::RECLASSIFY_OTHER_CHATS {
+                    saw_reclassify = true;
+                    assert_eq!(request["params"], serde_json::json!({}));
+                    serde_json::json!({"id": request["id"], "ok": reclassify.clone().unwrap()})
+                } else {
+                    serde_json::json!({"id": request["id"], "err": "unavailable"})
+                };
+                runtime.block_on(async {
+                    replies.send(reply.to_string()).await.unwrap();
+                    while replies.capacity() < replies.max_capacity() {
+                        tokio::task::yield_now().await;
+                    }
+                });
+            }
+            saw_reclassify
+        };
+        assert!(!answer_all(&mut requests, Some(serde_json::json!({}))));
+        vcx.run_until_parked();
+
+        overview.update(vcx, |overview, cx| {
+            overview.rows(cx);
+            assert_eq!(overview.other_count, 2);
+        });
+        assert!(vcx.debug_bounds("overview-reclassify-other").is_some(), "button visible with n > 0");
+
+        overview.update(vcx, |overview, cx| overview.start_reclassify_other(cx));
+        assert_eq!(overview.read_with(vcx, |o, _| o.reclassify.clone()), ReclassifyState::Running);
+        // A second click while running is ignored.
+        overview.update(vcx, |overview, cx| overview.start_reclassify_other(cx));
+        vcx.run_until_parked();
+        assert!(answer_all(
+            &mut requests,
+            Some(serde_json::json!({"examined": 2, "reclassified": 1, "unchanged": 1, "jevCalls": 2, "deferred": 0}))
+        ));
+        vcx.run_until_parked();
+        overview.update(vcx, |overview, _| {
+            assert!(matches!(
+                &overview.reclassify,
+                ReclassifyState::Done { text, .. } if text == "1 reclassified, 1 unchanged"
+            ));
+            assert!(overview.classification_fetched_at.is_empty(), "classifications refetch");
+        });
+    }
+
+    /// With no `other` chats and nothing to report, there is no button.
+    #[gpui::test]
+    fn reclassify_button_is_hidden_without_other_chats(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            let mut chat = row_ex("c1", "/r", None, 0, false).chat;
+            chat.last_message_at = Some(Utc::now());
+            state.chats = vec![chat];
+        });
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let (overview, vcx) = cx.add_window_view(|_, cx| {
+            let mut overview =
+                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            overview.classification.insert(
+                "c1".into(),
+                ClassificationInfo { category: "debug".into(), origin: "cli".into(), ..Default::default() },
+            );
+            overview.classification_fetched_at.insert("c1".into(), Instant::now());
+            overview
+        });
+        vcx.run_until_parked();
+        overview.read_with(vcx, |o, _| assert_eq!(o.other_count, 0));
+        assert!(vcx.debug_bounds("overview-reclassify-other").is_none());
     }
 
     #[test]

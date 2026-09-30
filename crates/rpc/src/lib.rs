@@ -225,6 +225,14 @@ pub mod methods {
     /// time — never re-parses the transcript. IPC-only, same reason as its
     /// sibling external-import methods.
     pub const CHAT_CLASSIFICATION: &str = "ChatClassification";
+    /// User-triggered re-run of the Jev-first classification on every
+    /// imported chat currently labeled `other` (ignores version/source stamps
+    /// and the boot pass's inconclusive park; capped at 50 Jev calls). No
+    /// params → `{examined, reclassified, unchanged, jevCalls, deferred}`
+    /// (`deferred` > 0: the cap or the circuit breaker stopped the run early —
+    /// run again). IPC-only, same reason as its sibling external-import
+    /// methods (classification state is this device's import cursors).
+    pub const RECLASSIFY_OTHER_CHATS: &str = "ReclassifyOtherChats";
     /// Context-window occupancy for the overview's tile sizing (session-
     /// canvas parity): `{chatId}` → `{contextPct: number | null}`, `0.0..=1.0`
     /// (the UI maps this to pixels). A separate lazy-per-chat method rather
@@ -432,6 +440,11 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::sync::Mutex;
+
+    #[test]
+    fn reclassify_other_chats_wire_name_is_pinned() {
+        assert_eq!(methods::RECLASSIFY_OTHER_CHATS, "ReclassifyOtherChats");
+    }
 
     struct TestService;
 

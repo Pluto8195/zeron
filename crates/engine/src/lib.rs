@@ -420,6 +420,17 @@ impl EngineCore {
                 }
             });
         }
+        // Keep imported chats current with their (possibly still-growing)
+        // source transcripts: stat-only staleness check per chat, real sync
+        // only for changed files (see `sync_stale_imports`).
+        {
+            let importer = external_import.clone();
+            tokio::task::spawn_blocking(move || match importer.sync_stale_imports() {
+                Ok((0, _)) => {}
+                Ok((n, m)) => tracing::info!(count = n, new_messages = m, "synced stale imported chats"),
+                Err(err) => tracing::warn!(error = %err, "stale import sync pass failed"),
+            });
+        }
         let agent_accounts = AgentAccounts::new(agent_accounts_config);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),

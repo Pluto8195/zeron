@@ -169,6 +169,27 @@ struct SyncCursor {
     tool_counts: HashMap<String, usize>,
     #[serde(default)]
     skills_loaded: Vec<String>,
+    /// Source transcript mtime (ms since epoch) / byte length as observed
+    /// just BEFORE the last import/sync read it. `None` (legacy cursors)
+    /// means "unknown" and is treated as stale by
+    /// [`ExternalSessionImporter::sync_stale_imports`]. Stamped before the
+    /// read so a file that grows mid-sync just looks stale next boot.
+    #[serde(default)]
+    last_synced_mtime: Option<i64>,
+    #[serde(default)]
+    last_synced_len: Option<u64>,
+}
+
+/// `(mtime_ms, len)` of a file via a single `stat()`; `None` if unreadable.
+fn file_stamp(path: &Path) -> Option<(i64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((mtime, meta.len()))
 }
 
 /// Imports external Claude Code sessions into brand-new Zeron chats. Cheap to
@@ -200,6 +221,7 @@ impl ExternalSessionImporter {
         external_session_id: &str,
         transcript_path: &Path,
     ) -> Result<ImportedSession, EngineError> {
+        let stamp = file_stamp(transcript_path);
         let parsed = parse_transcript(transcript_path, &self.device_id)?;
         let cwd = parsed
             .cwd
@@ -305,6 +327,8 @@ impl ExternalSessionImporter {
                 origin: parsed.origin.clone(),
                 tool_counts: parsed.tool_counts.clone(),
                 skills_loaded: parsed.skills_loaded.clone(),
+                last_synced_mtime: stamp.map(|s| s.0),
+                last_synced_len: stamp.map(|s| s.1),
             },
         )?;
 
@@ -349,6 +373,7 @@ impl ExternalSessionImporter {
             EngineError::Other(format!("chat {chat_id} has no external-import record to sync"))
         })?;
         let path = Path::new(&cursor.transcript_path);
+        let stamp = file_stamp(path);
         let parsed = parse_transcript(path, &self.device_id)?;
 
         let new_entries: Vec<&SessionMessageEntry> = parsed
@@ -359,6 +384,14 @@ impl ExternalSessionImporter {
             .collect();
 
         if new_entries.is_empty() {
+            self.write_cursor(
+                chat_id,
+                &SyncCursor {
+                    last_synced_mtime: stamp.map(|s| s.0),
+                    last_synced_len: stamp.map(|s| s.1),
+                    ..cursor
+                },
+            )?;
             return Ok(SyncResult {
                 chat_id: chat_id.to_string(),
                 new_message_count: 0,
@@ -405,6 +438,8 @@ impl ExternalSessionImporter {
             chat_id,
             &SyncCursor {
                 lines_consumed: parsed.safe_lines_consumed.max(cursor.lines_consumed),
+                last_synced_mtime: stamp.map(|s| s.0),
+                last_synced_len: stamp.map(|s| s.1),
                 ..cursor
             },
         )?;
@@ -413,6 +448,40 @@ impl ExternalSessionImporter {
             chat_id: chat_id.to_string(),
             new_message_count,
         })
+    }
+
+    /// Boot-time pass: catch every imported chat up from its source
+    /// transcript if that file changed since the last import/sync. Staleness
+    /// is a single `stat()` compared to the cursor's `last_synced_mtime`/
+    /// `last_synced_len` (missing values = stale, so legacy cursors sync
+    /// once); only stale chats pay for a real [`Self::sync`] parse. A
+    /// missing/unreadable transcript is skipped silently. Returns
+    /// `(chats_synced, new_messages)` — chats counted only if they gained
+    /// messages. Reads source files only; `sync` pushes only closed turns.
+    pub fn sync_stale_imports(&self) -> Result<(usize, usize), EngineError> {
+        let (mut chats, mut messages) = (0, 0);
+        for chat in self.workspace.read_chats()? {
+            let Ok(Some(cursor)) = self.read_cursor(&chat.id) else {
+                continue;
+            };
+            let Some((mtime, len)) = file_stamp(Path::new(&cursor.transcript_path)) else {
+                continue; // source gone — chat keeps its history
+            };
+            if cursor.last_synced_mtime == Some(mtime) && cursor.last_synced_len == Some(len) {
+                continue;
+            }
+            match self.sync(&chat.id) {
+                Ok(r) if r.new_message_count > 0 => {
+                    chats += 1;
+                    messages += r.new_message_count;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(chat_id = %chat.id, error = %err, "stale import sync failed")
+                }
+            }
+        }
+        Ok((chats, messages))
     }
 
     /// One-time repair for chats imported before `import()`/`sync()` learned

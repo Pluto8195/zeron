@@ -59,6 +59,7 @@ use crate::EngineError;
 use crate::chat2_host::CHAT2_DOC_EPOCH;
 use crate::context_usage::ContextUsageProvider;
 use crate::repos::home_dir;
+use crate::typesafe::{ChatCategoryClassifier, ChatClassificationInput, JevOutcome, NoJev};
 use crate::workspace_host::{ChatLinkKind, WorkspaceHost};
 
 /// Result of a completed import, for the caller (RPC/UI layer, piece 3) to
@@ -178,6 +179,20 @@ struct SyncCursor {
     /// must clear/sentinel this field so the reclassify pass skips it.
     #[serde(default)]
     classifier_version: Option<u32>,
+    /// Who produced `category`: TypeSafe/Jev or [`classify_heuristic`]. Absent
+    /// (every cursor written before Jev classification) means heuristic. A
+    /// heuristic-sourced chat is re-offered to Jev whenever a key is present
+    /// (see [`ExternalSessionImporter::reclassify_stale_classifier_version`]).
+    #[serde(default)]
+    classifier_source: ClassifierSource,
+    /// Set to [`CLASSIFIER_VERSION`] when Jev answered but was too torn to
+    /// trust (below the probability floor) and the heuristic's category was
+    /// kept. That outcome is deterministic, so the key-present upgrade rule
+    /// skips the chat until the version moves on — otherwise the same
+    /// unclassifiable chats would eat the per-pass Jev budget every boot.
+    /// Transient failures (network, timeout) leave this unset and retry.
+    #[serde(default)]
+    jev_inconclusive_version: Option<u32>,
     /// Tool-call tally and loaded-skill names as of the last import/sync —
     /// same bookkeeping-not-workspace-state reasoning as `category`/`origin`,
     /// read back via [`ExternalSessionImporter::tool_usage_for`]. `#[serde(default)]`
@@ -196,6 +211,44 @@ struct SyncCursor {
     last_synced_mtime: Option<i64>,
     #[serde(default)]
     last_synced_len: Option<u64>,
+}
+
+/// Where a chat's `category` came from; the cursor's `classifierSource`.
+/// Wire spelling is lowercase (`"jev"` / `"heuristic"`); the default is
+/// heuristic so stamps written before Jev classification read correctly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassifierSource {
+    Jev,
+    #[default]
+    Heuristic,
+}
+
+/// Jev reclassifications per boot pass
+/// ([`ExternalSessionImporter::reclassify_stale_classifier_version`]); the rest
+/// wait for the next pass. Every attempt counts, successful or not, so a
+/// TypeSafe outage can't turn a pass into hundreds of failing calls. (Mirrors
+/// [`AUTO_ADOPT_MAX_PER_SWEEP`]'s per-sweep-cap convention; smaller because each
+/// unit here is a network call, not a file import.)
+pub const JEV_RECLASSIFY_MAX_PER_PASS: usize = 25;
+
+/// Outcome of [`ExternalSessionImporter::reclassify_stale_classifier_version_report`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReclassifyReport {
+    /// Category changed.
+    pub recategorized: usize,
+    /// Category unchanged; stamp (version/source) updated.
+    pub restamped: usize,
+    /// Of the above, how many were classified by Jev.
+    pub jev_classified: usize,
+    /// Chats left untouched because the Jev cap was reached; next pass.
+    pub jev_deferred: usize,
+}
+
+impl ReclassifyReport {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Auto-adopt only considers transcripts modified within this window.
@@ -231,6 +284,9 @@ pub struct ExternalSessionImporter {
     store: Arc<DocsStore>,
     device_id: String,
     workspace: WorkspaceHost,
+    /// TypeSafe/Jev category classifier; [`NoJev`] (heuristic only) unless the
+    /// embedder opts in via [`Self::with_chat_category_classifier`].
+    jev: Arc<dyn ChatCategoryClassifier>,
 }
 
 impl ExternalSessionImporter {
@@ -239,6 +295,28 @@ impl ExternalSessionImporter {
             store,
             device_id: device_id.to_string(),
             workspace,
+            jev: Arc::new(NoJev),
+        }
+    }
+
+    /// Route category classification through `classifier` (Jev first,
+    /// [`classify_heuristic`] fallback). Default is heuristic-only.
+    pub fn with_chat_category_classifier(mut self, classifier: Arc<dyn ChatCategoryClassifier>) -> Self {
+        self.jev = classifier;
+        self
+    }
+
+    /// One classification: Jev if available and conclusive, else the
+    /// heuristic `fallback`. Returns the category, its source, and whether Jev
+    /// answered but was inconclusive.
+    fn classify_category(&self, input: &ChatClassificationInput, fallback: String) -> (String, ClassifierSource, bool) {
+        if !self.jev.available() {
+            return (fallback, ClassifierSource::Heuristic, false);
+        }
+        match self.jev.classify(input) {
+            JevOutcome::Category(category) => (category, ClassifierSource::Jev, false),
+            JevOutcome::Inconclusive => (fallback, ClassifierSource::Heuristic, true),
+            JevOutcome::Failed => (fallback, ClassifierSource::Heuristic, false),
         }
     }
 
@@ -246,14 +324,38 @@ impl ExternalSessionImporter {
     /// not already exist), seed it to resume `external_session_id`, and
     /// attach it to a Space matching the transcript's own cwd (found or
     /// created). Blocking (fs + doc export); run off the async path.
+    ///
+    /// The category is classified by Jev first (bounded by its own short
+    /// timeout) with the heuristic as fallback; the cursor records which.
     pub fn import(
         &self,
         chat_id: &str,
         external_session_id: &str,
         transcript_path: &Path,
     ) -> Result<ImportedSession, EngineError> {
+        self.import_with(chat_id, external_session_id, transcript_path, true)
+    }
+
+    /// [`Self::import`], with Jev classification optional. The bulk session-canvas
+    /// migration passes `false`: it can import hundreds of chats in one go, and
+    /// its heuristic-stamped chats are picked up by the capped boot pass instead.
+    fn import_with(
+        &self,
+        chat_id: &str,
+        external_session_id: &str,
+        transcript_path: &Path,
+        use_jev: bool,
+    ) -> Result<ImportedSession, EngineError> {
         let stamp = file_stamp(transcript_path);
-        let parsed = parse_transcript(transcript_path, &self.device_id)?;
+        let mut parsed = parse_transcript(transcript_path, &self.device_id)?;
+        let (mut source, mut jev_inconclusive) = (ClassifierSource::Heuristic, false);
+        if use_jev {
+            let heuristic = parsed.category.clone();
+            let (category, s, inconclusive) = self.classify_category(&parsed.classification_input, heuristic);
+            parsed.category = category;
+            source = s;
+            jev_inconclusive = inconclusive;
+        }
         let cwd = parsed
             .cwd
             .ok_or_else(|| EngineError::Other("transcript carries no cwd".into()))?;
@@ -358,6 +460,8 @@ impl ExternalSessionImporter {
                 category: parsed.category.clone(),
                 origin: parsed.origin.clone(),
                 classifier_version: Some(CLASSIFIER_VERSION),
+                classifier_source: source,
+                jev_inconclusive_version: jev_inconclusive.then_some(CLASSIFIER_VERSION),
                 tool_counts: parsed.tool_counts.clone(),
                 skills_loaded: parsed.skills_loaded.clone(),
                 last_synced_mtime: stamp.map(|s| s.0),
@@ -593,6 +697,10 @@ impl ExternalSessionImporter {
                     category: parsed.category,
                     origin: parsed.origin,
                     classifier_version: Some(CLASSIFIER_VERSION),
+                    // Heuristic on purpose: the boot Jev pass (capped) upgrades
+                    // these, so this backfill stays offline and uncapped.
+                    classifier_source: ClassifierSource::Heuristic,
+                    jev_inconclusive_version: None,
                     tool_counts: parsed.tool_counts,
                     skills_loaded: parsed.skills_loaded,
                     ..cursor
@@ -608,23 +716,49 @@ impl ExternalSessionImporter {
         Ok(repaired)
     }
 
-    /// Re-run [`classify_heuristic`] on imported chats whose cursor's
+    /// Re-run classification on imported chats whose stamp is stale, so a
+    /// classifier change reaches chats classified before it. Returns
+    /// `(recategorized, restamped)`; see
+    /// [`Self::reclassify_stale_classifier_version_report`] for the full tally.
+    pub fn reclassify_stale_classifier_version(&self) -> Result<(usize, usize), EngineError> {
+        let report = self.reclassify_stale_classifier_version_report()?;
+        Ok((report.recategorized, report.restamped))
+    }
+
+    /// The boot reclassification pass. A chat is **stale** when its cursor's
     /// `classifier_version` is older than (or absent vs.) [`CLASSIFIER_VERSION`],
-    /// so a heuristic change reaches chats classified before it. Updates
-    /// `category` and stamps the current version; a chat whose category comes
-    /// out the same only gets the stamp. Returns `(recategorized, restamped)`.
+    /// OR when its category came from the heuristic
+    /// ([`ClassifierSource::Heuristic`]) while the Jev classifier is currently
+    /// available (API key present) — so heuristic-classified chats upgrade to Jev
+    /// once a key exists, and nothing churns when it doesn't (a keyless boot
+    /// leaves Jev-stamped chats alone and only handles version-stale ones, with
+    /// the heuristic, uncapped and offline as before). A chat where Jev was
+    /// already tried and was too torn to trust at the current version is not
+    /// re-offered (see [`SyncCursor::jev_inconclusive_version`]).
+    ///
+    /// Updates `category`, stamps the current version and the source. A chat
+    /// whose category comes out the same only gets the stamp.
+    ///
+    /// **Jev budget:** at most [`JEV_RECLASSIFY_MAX_PER_PASS`] Jev attempts per
+    /// run (successful or not). Past the cap, a version-stale chat is still
+    /// re-run through the heuristic and stamped `heuristic` (so categories are
+    /// never worse than before this pass existed; the key-present rule
+    /// re-offers it to Jev on a later pass), while a chat stale only by the
+    /// key-present rule is left untouched and counted in `jev_deferred`.
+    /// Failed Jev calls fall back to the heuristic and stamp `heuristic`.
     ///
     /// Cost: one `read_chats` walk plus one tiny cursor-file read per chat.
     /// Only stale chats pay more: the classifier's `turn_count`/`debug_prompt`
     /// inputs are NOT cached on the cursor (only `tool_counts`/`skills_loaded`
     /// are), so each stale chat costs ONE streaming tally pass over its
     /// transcript ([`tally_transcript`]: JSON-parse per line, no message
-    /// entries built, no doc writes). Each stale chat is paid once ever: the
-    /// stamp makes every later boot a cursor-read-only no-op. Chats whose
+    /// entries built, no doc writes), plus at most one Jev call within the
+    /// budget above. Each stale chat is paid once per stale condition: the
+    /// stamp makes later keyless boots a cursor-read-only no-op. Chats whose
     /// transcript is gone are skipped unstamped (retried next boot at the cost
-    /// of one failed `open`). Chats with an empty category AND origin are left
-    /// to [`Self::repair_missing_classification`], which does the full
-    /// backfill and stamps them.
+    /// of one failed `open`, and no Jev budget). Chats with an empty category
+    /// AND origin are left to [`Self::repair_missing_classification`], which
+    /// does the full backfill and stamps them (heuristic).
     ///
     /// Manual-override guard: none needed. Category has no manual write path
     /// — the only writers are `import`, `repair_missing_classification` and
@@ -632,26 +766,42 @@ impl ExternalSessionImporter {
     /// UI only read it. See [`SyncCursor::classifier_version`] for what to do
     /// if one is added.
     ///
-    /// The cursor is re-read right before the write (the tally can take a
-    /// while on a big transcript) so a concurrent `sync` advancing
+    /// The cursor is re-read right before the write (the tally and the Jev
+    /// call can take a while) so a concurrent `sync` advancing
     /// `lines_consumed` in that window is not clobbered by a stale copy.
-    pub fn reclassify_stale_classifier_version(&self) -> Result<(usize, usize), EngineError> {
-        let mut recategorized = 0;
-        let mut restamped = 0;
+    pub fn reclassify_stale_classifier_version_report(&self) -> Result<ReclassifyReport, EngineError> {
+        let jev_available = self.jev.available();
+        let mut jev_budget = JEV_RECLASSIFY_MAX_PER_PASS;
+        let mut report = ReclassifyReport::default();
         for chat in self.workspace.read_chats()? {
             let Some(cursor) = self.read_cursor(&chat.id)? else {
                 continue;
             };
-            if cursor.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION {
+            let version_stale = cursor.classifier_version.unwrap_or(1) < CLASSIFIER_VERSION;
+            let upgradable = jev_available
+                && cursor.classifier_source == ClassifierSource::Heuristic
+                && cursor.jev_inconclusive_version != Some(CLASSIFIER_VERSION);
+            if !version_stale && !upgradable {
                 continue;
             }
             if cursor.category.is_empty() && cursor.origin.is_empty() {
                 continue; // repair_missing_classification's job
             }
+            let use_jev = jev_available && jev_budget > 0;
+            if !version_stale && !use_jev {
+                report.jev_deferred += 1;
+                continue; // key-present upgrade only: wait for the next pass
+            }
             let Some(tally) = tally_transcript(Path::new(&cursor.transcript_path)) else {
                 continue; // source file moved/deleted — skip, retry next boot
             };
-            let category = tally.category();
+            let heuristic = tally.category();
+            let (category, source, inconclusive) = if use_jev {
+                jev_budget -= 1;
+                self.classify_category(&tally.classification_input(), heuristic)
+            } else {
+                (heuristic, ClassifierSource::Heuristic, false)
+            };
             let Some(fresh) = self.read_cursor(&chat.id)? else {
                 continue;
             };
@@ -661,16 +811,21 @@ impl ExternalSessionImporter {
                 &SyncCursor {
                     category,
                     classifier_version: Some(CLASSIFIER_VERSION),
+                    classifier_source: source,
+                    jev_inconclusive_version: inconclusive.then_some(CLASSIFIER_VERSION),
                     ..fresh
                 },
             )?;
             if changed {
-                recategorized += 1;
+                report.recategorized += 1;
             } else {
-                restamped += 1;
+                report.restamped += 1;
+            }
+            if source == ClassifierSource::Jev {
+                report.jev_classified += 1;
             }
         }
-        Ok((recategorized, restamped))
+        Ok(report)
     }
 
     /// Sibling to [`Self::repair_missing_timestamps`]/
@@ -1283,7 +1438,7 @@ impl ExternalSessionImporter {
         for (index, candidate) in candidates.iter().enumerate() {
             let chat_id = uuid::Uuid::new_v4().to_string();
             let path = Path::new(&candidate.path);
-            match self.import(&chat_id, &candidate.session_id, path) {
+            match self.import_with(&chat_id, &candidate.session_id, path, false) {
                 Ok(_) => {
                     imported += 1;
                     let mut did_archive = false;
@@ -1449,6 +1604,8 @@ struct ParsedTranscript {
     origin: String,
     tool_counts: HashMap<String, usize>,
     skills_loaded: Vec<String>,
+    /// What Jev sees; the same tally `category` was computed from.
+    classification_input: ChatClassificationInput,
 }
 
 /// One line of the on-disk transcript. Permissive by construction — unknown
@@ -1606,8 +1763,10 @@ const RESEARCH_SKILLS: &[&str] = &[
 /// is fed: `turn_count`, `debug_prompt`). **Bump this whenever the heuristic's
 /// behavior changes** so `reclassify_stale_classifier_version` re-runs it on
 /// chats classified by an older version. Version 1 is the pre-versioning
-/// heuristic; a cursor with no stamp is treated as version 1.
-pub const CLASSIFIER_VERSION: u32 = 2;
+/// heuristic; a cursor with no stamp is treated as version 1. Version 3 added
+/// TypeSafe/Jev classification (with the heuristic as fallback) and the
+/// `classifierSource` stamp.
+pub const CLASSIFIER_VERSION: u32 = 3;
 
 /// Ported from `session_canvas_server.py`'s `classify_heuristic`
 /// (lines 469-482) — the real-time classifier (no LLM call) — plus a Zeron
@@ -1730,6 +1889,9 @@ fn text_suggests_debugging(text: &str) -> bool {
 /// How many of a chat's leading human messages [`ClassificationTally`]
 /// scans for debug intent.
 const DEBUG_PROMPT_WINDOW: usize = 5;
+/// Per-message cap when retaining human messages for Jev (the client truncates
+/// again when building the payload); keeps tallies small.
+const JEV_MESSAGE_KEEP_CHARS: usize = 1000;
 
 /// Ported from `session_canvas_server.py`'s `ENTRYPOINT_LABELS`
 /// (lines 262-266) — the non-`agent_mode` half of `classify_origin`.
@@ -1770,6 +1932,8 @@ struct ClassificationTally {
     human_messages: usize,
     debug_prompt_hits: usize,
     first_prompt_debug: bool,
+    /// The same leading human messages, kept (truncated) as Jev's input.
+    first_messages: Vec<String>,
 }
 
 /// The exact synthetic-prompt prefixes `session_canvas_server.py` filters
@@ -1862,6 +2026,7 @@ impl ClassificationTally {
                         }
                         self.debug_prompt_hits += usize::from(debugging);
                         self.human_messages += 1;
+                        self.first_messages.push(text.chars().take(JEV_MESSAGE_KEEP_CHARS).collect());
                     }
                 }
             }
@@ -1878,6 +2043,16 @@ impl ClassificationTally {
 
     fn category(&self) -> String {
         classify_heuristic(&self.tool_counts, &self.skills_loaded, self.turn_count, self.debug_prompt())
+    }
+
+    /// The tally as Jev's classification input (same data the heuristic ran on).
+    fn classification_input(&self) -> ChatClassificationInput {
+        ChatClassificationInput {
+            first_messages: self.first_messages.clone(),
+            skills_loaded: self.skills_loaded_sorted(),
+            tool_counts: self.tool_counts.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            turn_count: self.turn_count,
+        }
     }
 
     fn origin(&self) -> String {
@@ -2459,6 +2634,7 @@ fn parse_transcript(path: &Path, device_id: &str) -> Result<ParsedTranscript, En
         origin: tally.origin(),
         tool_counts: tally.tool_counts.clone(),
         skills_loaded: tally.skills_loaded_sorted(),
+        classification_input: tally.classification_input(),
     })
 }
 

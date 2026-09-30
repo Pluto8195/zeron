@@ -46,6 +46,7 @@ pub mod subagent_transcript;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;
+pub mod typesafe;
 pub mod uploads;
 pub mod workspace_files;
 pub mod workspace_host;
@@ -317,11 +318,19 @@ impl EngineCore {
                 uploads.clone(),
             )
         });
-        let external_import = external_import::ExternalSessionImporter::new(
+        let mut external_import = external_import::ExternalSessionImporter::new(
             store_for_import.clone(),
             &device_id,
             workspace.clone(),
         );
+        // Category classification goes through TypeSafe/Jev (heuristic on any
+        // failure) in real profiles. The development profile — what every
+        // engine test assembles — stays heuristic-only so tests can never spend
+        // the real `TYPESAFE_API_KEY`; they inject a canned classifier instead.
+        if profile.scope() != WorkspaceScope::Development {
+            external_import = external_import
+                .with_chat_category_classifier(Arc::new(typesafe::LiveJevClassifier::new()));
+        }
         // One-time, idempotent repair for chats imported before `last_message_at`
         // stamping existed (see `repair_missing_timestamps`'s doc comment) —
         // off the boot path since it's a blocking doc-store walk.
@@ -349,11 +358,13 @@ impl EngineCore {
                 // Then (same thread, so the two never race on a cursor file)
                 // re-run the heuristic for chats classified by an older
                 // `CLASSIFIER_VERSION`.
-                match importer.reclassify_stale_classifier_version() {
-                    Ok((0, 0)) => {}
-                    Ok((changed, restamped)) => tracing::info!(
-                        recategorized = changed,
-                        restamped,
+                match importer.reclassify_stale_classifier_version_report() {
+                    Ok(r) if r.is_empty() => {}
+                    Ok(r) => tracing::info!(
+                        recategorized = r.recategorized,
+                        restamped = r.restamped,
+                        jev_classified = r.jev_classified,
+                        jev_deferred = r.jev_deferred,
                         "reclassified imported chats with a stale classifier version"
                     ),
                     Err(err) => tracing::warn!(error = %err, "classifier-version reclassify pass failed"),

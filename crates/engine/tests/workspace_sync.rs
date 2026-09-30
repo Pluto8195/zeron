@@ -564,6 +564,7 @@ async fn chat_config_selects_the_run_harness() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
             }),
             None,
         )
@@ -585,6 +586,88 @@ async fn chat_config_selects_the_run_harness() {
     .await;
 
     a.shutdown().await;
+}
+
+/// `setChatAutoApprove` (the composer's Ask/Auto chip) patches only the
+/// chat config's `autoApprove`, round-trips both ways, and no-ops (without
+/// erroring) on config-less or missing rows. `createChat`/`setChatConfig`
+/// carry the field in the full config too.
+#[tokio::test]
+async fn set_chat_auto_approve_round_trips_on_the_chat_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    core.workspace
+        .create_space("space-aa", "dev-a", "/tmp/aa", None, false)
+        .expect("create space");
+    let config = ChatConfig {
+        harness: HarnessId::Cursor,
+        model: Some("cursor-model".into()),
+        reasoning: Some(ReasoningLevel::High),
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: false,
+    };
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat", "chatId": "chat-aa", "spaceId": "space-aa",
+                "config": serde_json::to_value(&config).unwrap(),
+            }),
+        )
+        .await
+        .expect("createChat");
+    assert_eq!(core.workspace.chat_config("chat-aa"), Some(config.clone()));
+
+    let set = |chat_id: &'static str, auto_approve: bool| {
+        client.call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "setChatAutoApprove", "chatId": chat_id, "autoApprove": auto_approve }),
+        )
+    };
+    set("chat-aa", true).await.expect("set auto");
+    let stored = core.workspace.chat_config("chat-aa").expect("config kept");
+    assert!(stored.auto_approve);
+    // Only the flag moved.
+    assert_eq!(
+        ChatConfig {
+            auto_approve: false,
+            ..stored
+        },
+        config
+    );
+    set("chat-aa", false).await.expect("set ask");
+    assert_eq!(core.workspace.chat_config("chat-aa"), Some(config.clone()));
+
+    // Full-config replace carries it as well (the config-less chip path).
+    let yolo = ChatConfig {
+        auto_approve: true,
+        ..config.clone()
+    };
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({ "op": "setChatConfig", "chatId": "chat-aa", "config": serde_json::to_value(&yolo).unwrap() }),
+        )
+        .await
+        .expect("setChatConfig");
+    assert_eq!(core.workspace.chat_config("chat-aa"), Some(yolo));
+
+    // Config-less row: nothing to patch, row stays config-less.
+    core.workspace
+        .create_chat("chat-bare", Some("space-aa"), None, None, None)
+        .expect("create bare chat");
+    set("chat-bare", true)
+        .await
+        .expect("no-op on config-less row");
+    assert_eq!(core.workspace.chat_config("chat-bare"), None);
+    // Missing row: no-op, not an error.
+    set("chat-missing", true)
+        .await
+        .expect("no-op on missing row");
+
+    core.shutdown().await;
 }
 
 /// Live-edge variant: the same convergence through a real workspace room. Requires

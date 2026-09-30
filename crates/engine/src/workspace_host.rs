@@ -1122,6 +1122,29 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_config(chat_id, config))?)
     }
 
+    /// Flip only the chat's approval mode (zeron `setChatAutoApprove`): a
+    /// read-modify-write of the row's CURRENT config, so a concurrent
+    /// model/reasoning pick from another surface isn't clobbered by a stale
+    /// full-config replace. Returns false when the chat doesn't exist or has
+    /// no config yet — a config-less row can't be patched (`harness` is
+    /// required); the composer creates one via `setChatConfig` instead.
+    pub fn set_chat_auto_approve(
+        &self,
+        chat_id: &str,
+        auto_approve: bool,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| {
+            let Some(mut config) = doc.chat(chat_id)?.and_then(|chat| chat.config) else {
+                return Ok::<bool, zeron_doc::DocError>(false);
+            };
+            if config.auto_approve == auto_approve {
+                return Ok(true);
+            }
+            config.auto_approve = auto_approve;
+            doc.set_chat_config(chat_id, &config)
+        })?)
+    }
+
     /// LWW write of one durable link slot (`linkedPrUrl`/`linkedTicketId` +
     /// its source), gated by write-time precedence — manual > created_in_chat
     /// > mentioned (see [`zeron_proto::ChatLinkSource::can_overwrite`]).

@@ -1542,6 +1542,7 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
             reasoning: Some(ReasoningLevel::Medium),
             model_options: Default::default(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
         };
         core.workspace.set_chat_config(CHAT, &config).unwrap();
         core.doc_host
@@ -1578,6 +1579,55 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
 
 /// Normal queued turns each publish a completion; Send now's interrupted
 /// predecessor does not. The replacement's own completion must still arrive.
+/// The per-chat approval mode (`config.autoApprove`, the composer's Ask/Auto
+/// chip) is read at each turn: a mid-chat `setChatAutoApprove` applies to the
+/// NEXT queued turn instead of the previous run's carried value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_turn_uses_the_chats_current_approval_mode() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let config = zeron_proto::ChatConfig {
+        harness: HarnessId::Mock,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        auto_approve: false,
+    };
+    core.workspace.set_chat_config(CHAT, &config).unwrap();
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 1, "first turn").await;
+
+    let set_mode = |auto_approve: bool| {
+        client.call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({ "op": "setChatAutoApprove", "chatId": CHAT, "autoApprove": auto_approve }),
+        )
+    };
+    set_mode(true).await.expect("setChatAutoApprove true");
+    core.doc_host
+        .queue_message(CHAT, "yolo turn", Vec::new())
+        .unwrap();
+    let _ = harness.finish.send(());
+    wait_for(|| prompts.lock().unwrap().len() == 2, "auto-approve turn").await;
+
+    set_mode(false).await.expect("setChatAutoApprove false");
+    core.doc_host
+        .queue_message(CHAT, "ask turn", Vec::new())
+        .unwrap();
+    let _ = harness.finish.send(());
+    wait_for(|| prompts.lock().unwrap().len() == 3, "ask turn").await;
+    {
+        let requests = harness.requests.lock().unwrap();
+        let modes: Vec<bool> = requests.iter().map(|r| r.auto_approve).collect();
+        assert_eq!(modes, vec![false, true, false]);
+    }
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_completion_markers_distinguish_normal_turns_from_interrupts() {
     for send_now in [false, true] {

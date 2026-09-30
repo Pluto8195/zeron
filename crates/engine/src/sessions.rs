@@ -777,6 +777,7 @@ impl SessionsEngine {
                 request.prompt = prompt_text;
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
+                host.apply_chat_approval(&chat_id, &mut request);
                 let harness_id = host.harness_for_request(&chat_id, &request);
                 match host
                     .dispatch_with_source_context(
@@ -2491,6 +2492,7 @@ async fn drive_run(
                     tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
                     break;
                 };
+                host.apply_chat_approval(&chat, &mut request);
                 if let Err(err) = host
                     .dispatch_with_source_context(
                         &engine,

@@ -606,6 +606,13 @@ enum MutateParams {
     /// so they survive restarts and reach every device.
     #[serde(rename_all = "camelCase")]
     SetChatConfig { chat_id: String, config: ChatConfig },
+    /// Per-chat approval mode (`config.autoApprove`: Ask vs Auto-approve):
+    /// patches only that field of the row's current config (LWW-synced, so
+    /// it survives restarts and applies to every later turn). No-op on a
+    /// missing or config-less row — the composer's chip writes a full
+    /// `setChatConfig` there instead.
+    #[serde(rename_all = "camelCase")]
+    SetChatAutoApprove { chat_id: String, auto_approve: bool },
     /// Tombstone: removes the chats-map row; the session doc remains.
     #[serde(rename_all = "camelCase")]
     DeleteChat { chat_id: String },
@@ -1124,6 +1131,14 @@ impl EngineRpc {
             MutateParams::SetChatConfig { chat_id, config } => self
                 .workspace
                 .set_chat_config(&chat_id, &config)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::SetChatAutoApprove {
+                chat_id,
+                auto_approve,
+            } => self
+                .workspace
+                .set_chat_auto_approve(&chat_id, auto_approve)
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteChat { chat_id } => {

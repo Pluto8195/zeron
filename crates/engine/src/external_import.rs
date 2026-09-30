@@ -280,6 +280,7 @@ impl ExternalSessionImporter {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
             }),
             Some(cwd.clone()),
         )?;
@@ -638,6 +639,7 @@ impl ExternalSessionImporter {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
             };
             if self.workspace.set_chat_config(&chat.id, &config)? {
                 repaired += 1;

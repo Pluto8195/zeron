@@ -4085,6 +4085,7 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -4109,6 +4110,7 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
             },
         );
     }

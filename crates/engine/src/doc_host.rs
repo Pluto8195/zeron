@@ -3218,6 +3218,8 @@ impl DocHost {
             .request_from_chat_row(chat_id, &prompt)
             .map(|mut current| {
                 if let Some(previous) = &previous {
+                    // Config-less rows can't name an approval mode; keep the
+                    // previous run's (a configured row wins just below).
                     current.auto_approve = previous.auto_approve;
                     current.worktree = previous.worktree.clone();
                 }
@@ -3232,6 +3234,7 @@ impl DocHost {
         request.prompt = prompt;
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
+        self.apply_chat_approval(chat_id, &mut request);
         let harness = self.harness_for_request(chat_id, &request);
         self.dispatch_with_source_context(&sessions, chat_id, harness, request, Some(message_id))
             .await?;
@@ -4255,6 +4258,7 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
+                        auto_approve: request.auto_approve,
                     };
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
@@ -4356,6 +4360,7 @@ impl DocHost {
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
+                self.apply_chat_approval(chat_id, &mut request);
                 if let Err(err) = handle.doc.resolve_input(request_id) {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
@@ -4424,6 +4429,7 @@ impl DocHost {
                 // A reused config must not re-inline the PREVIOUS turn's
                 // images; this prompt's own refs (if any) ride its text.
                 request.attachments = Vec::new();
+                self.apply_chat_approval(chat_id, &mut request);
                 let harness = self.harness_for_request(chat_id, &request);
                 self.dispatch_with_source_context(sessions, chat_id, harness, request, message_id)
                     .await?;
@@ -4669,11 +4675,26 @@ impl DocHost {
                 .as_ref()
                 .map(|c| c.sandbox)
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
-            auto_approve: false,
+            auto_approve: config.as_ref().is_some_and(|c| c.auto_approve),
             attachments: Vec::new(),
             resume: None,
             worktree: None,
         })
+    }
+
+    /// Engine-initiated continuation turns (queue promotion, steer-turned-run,
+    /// dead-run answers, crash auto-resume, orphaned-steer re-dispatch) reuse
+    /// a prior request, which would freeze the approval mode the chat had at
+    /// its LAST explicit send. The chat row's `config.autoApprove` is the
+    /// user's current choice — a mid-chat toggle applies from the next turn —
+    /// so a configured row overrides the carried value. Config-less rows keep
+    /// whatever the request carried. Explicit composer `Run` commands are NOT
+    /// passed through here: they already resolved the chat's value at send
+    /// time, and a just-toggled value may not have synced to this host yet.
+    pub(crate) fn apply_chat_approval(&self, chat_id: &str, request: &mut zeron_proto::RunRequest) {
+        if let Some(config) = self.workspace().and_then(|ws| ws.chat_config(chat_id)) {
+            request.auto_approve = config.auto_approve;
+        }
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {

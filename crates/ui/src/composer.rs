@@ -7069,7 +7069,9 @@ impl Composer {
                         model_options: resolved.model_options.clone(),
                         cwd,
                         sandbox: SandboxLevel::WorkspaceWrite,
-                        auto_approve: false,
+                        // The chat's persisted approval mode (chip in the
+                        // pickers row; new-chat draft on first send).
+                        auto_approve: resolved.auto_approve,
                         resume: None,
                         attachments: attachment_paths,
                         worktree: run_worktree,

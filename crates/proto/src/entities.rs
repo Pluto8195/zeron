@@ -158,6 +158,12 @@ pub struct ChatConfig {
     #[serde(default)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub sandbox: SandboxLevel,
+    /// Per-chat approval mode: `false` = "Ask" (the harness surfaces
+    /// permission prompts in the UI), `true` = "Auto-approve" (the agent never
+    /// asks). Resolved into [`crate::RunRequest::auto_approve`] for every turn.
+    /// Serde-defaulted so rows written before this field existed read as Ask.
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 /// Provenance of a durable PR/ticket link stamped on a [`Chat`] row —
@@ -1194,6 +1200,31 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn chat_config_auto_approve_wire_name_is_pinned_and_defaults_to_ask() {
+        let config = ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["autoApprove"], serde_json::json!(true));
+        assert!(value.get("auto_approve").is_none());
+        assert_eq!(serde_json::from_value::<ChatConfig>(value).unwrap(), config);
+        // Rows stored before the field existed deserialize as "Ask".
+        let legacy = serde_json::json!({
+            "harness": "claude-code",
+            "model": null,
+            "reasoning": null,
+            "sandbox": "workspace-write",
+        });
+        let legacy: ChatConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.auto_approve);
+    }
 
     #[test]
     fn chat_link_source_wire_shape_is_snake_case() {

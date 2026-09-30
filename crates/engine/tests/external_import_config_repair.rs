@@ -191,6 +191,7 @@ async fn repair_never_overwrites_an_existing_config() {
         reasoning: None,
         model_options: Default::default(),
         sandbox: SandboxLevel::ReadOnly,
+        auto_approve: false,
     };
     core.workspace
         .set_chat_config(chat_id, &custom_config)

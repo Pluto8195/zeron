@@ -571,6 +571,7 @@ impl Tools {
             reasoning,
             model_options: Default::default(),
             sandbox,
+            auto_approve: false,
         };
 
         let (space, device_id) = match args.project.as_deref() {
@@ -925,7 +926,8 @@ impl Tools {
                         .as_ref()
                         .map(|c| c.sandbox)
                         .unwrap_or(SandboxLevel::WorkspaceWrite),
-                    auto_approve: false,
+                    // The chat's own approval mode (default Ask).
+                    auto_approve: config.as_ref().is_some_and(|c| c.auto_approve),
                     resume: None,
                     attachments: Vec::new(),
                     worktree: None,

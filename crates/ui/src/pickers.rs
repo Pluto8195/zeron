@@ -54,6 +54,9 @@ use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 use crate::workspace_chip::{WorkspaceChipTooltip, WorkspaceChoice, WorkspaceOutcome};
 
+pub mod approval;
+use approval::ApprovalMode;
+
 /// Dev/testing knob: `ZERON_SLOW_CATALOG_MS=<ms>` delays every harness and
 /// model catalog result app-side — the chip/tab/list loading states are
 /// sub-second against a warm local daemon and unstageable otherwise
@@ -102,6 +105,9 @@ pub struct DraftConfig {
     pub branch: Option<String>,
     /// Where the new session runs (the t3code env-mode).
     pub checkout: CheckoutKind,
+    /// New-chat approval chip pick (see [`approval`]): `false` = Ask. Never
+    /// remembered across chats — every new chat starts at Ask.
+    pub auto_approve: bool,
 }
 
 /// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
@@ -141,6 +147,9 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// The chat's approval mode (`ChatConfig.autoApprove`; false = Ask) —
+    /// what `RunRequest.auto_approve` carries.
+    pub auto_approve: bool,
 }
 
 impl ResolvedRunConfig {
@@ -152,6 +161,7 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: self.auto_approve,
         })
     }
 }
@@ -610,6 +620,10 @@ pub struct Pickers {
     /// Per-chat outcome of that pick (pending/decided), shown as a badge in
     /// the session footer. In-memory: it narrates this app session's sends.
     workspace_outcomes: HashMap<String, WorkspaceOutcome>,
+    /// The new-chat draft's approval pick, carried onto the chat that send
+    /// just minted (`(chat_id, auto_approve)`) until its row syncs a config —
+    /// see [`approval::effective_auto_approve`].
+    carried_auto_approve: Option<(String, bool)>,
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
@@ -665,10 +679,22 @@ impl Pickers {
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
             let selected = state.read(cx).selected_chat.clone();
             if selected != this.draft_owner {
+                // Leaving the new-chat canvas for a chat that has no row yet
+                // is the send that just minted it: carry the draft approval
+                // pick until the row (whose createChat config has the same
+                // value) lands. Any other selection change carries nothing.
+                this.carried_auto_approve = match (&this.draft_owner, &selected) {
+                    (None, Some(id)) if !state.read(cx).chats.iter().any(|c| &c.id == id) => {
+                        Some((id.clone(), this.config.auto_approve))
+                    }
+                    _ => None,
+                };
                 this.draft_owner = selected;
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
+                // Every new chat starts at Ask (per-chat only, no global).
+                this.config.auto_approve = false;
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
@@ -786,6 +812,7 @@ impl Pickers {
             import_bulk_confirm_pending: None,
             workspace_choice: WorkspaceChoice::default(),
             workspace_outcomes: HashMap::new(),
+            carried_auto_approve: None,
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
@@ -974,7 +1001,126 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            auto_approve: self.effective_auto_approve(cx),
         }
+    }
+
+    // ---- the per-chat approval chip (see [`approval`]) ----
+
+    /// The approval flag the next send carries (and the chip shows).
+    pub fn effective_auto_approve(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        approval::effective_auto_approve(
+            state.selected_chat.as_deref(),
+            state.selected_chat_row().and_then(|c| c.config.as_ref()),
+            self.carried_auto_approve
+                .as_ref()
+                .map(|(id, value)| (id.as_str(), *value)),
+            self.config.auto_approve,
+        )
+    }
+
+    /// Chip click: flip Ask ↔ Auto for the current chat (or the new-chat
+    /// draft). A configured row gets an optimistic stamp + `Mutate
+    /// setChatAutoApprove` (patches only that field); a config-less row gets
+    /// a full `setChatConfig` built like the model pickers' writes.
+    fn toggle_auto_approve(&mut self, cx: &mut Context<Self>) {
+        let next = ApprovalMode::from_auto_approve(self.effective_auto_approve(cx))
+            .next()
+            .auto_approve();
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            self.config.auto_approve = next;
+            cx.notify();
+            return;
+        };
+        let row_config = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.config.clone());
+        let Some(mut config) = row_config else {
+            self.update_chat_config(cx, move |config| config.auto_approve = next);
+            // Once written (harness known), the row's config owns the value;
+            // otherwise (row not synced yet) the carried pick does.
+            self.carried_auto_approve = if self
+                .state
+                .read(cx)
+                .selected_chat_row()
+                .is_some_and(|c| c.config.is_some())
+            {
+                None
+            } else {
+                Some((chat_id, next))
+            };
+            cx.notify();
+            return;
+        };
+        config.auto_approve = next;
+        self.state.update(cx, |state, cx| {
+            state.apply_chat_config(&chat_id, config);
+            cx.notify();
+        });
+        if let Some(engine) = self.engine(cx) {
+            self.mutate_task = Some(cx.spawn(async move |_, _| {
+                let params = serde_json::json!({
+                    "op": "setChatAutoApprove",
+                    "chatId": chat_id,
+                    "autoApprove": next,
+                });
+                if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                    tracing::warn!(error = %err, "setChatAutoApprove mutate failed");
+                }
+            }));
+        }
+        cx.notify();
+    }
+
+    /// The Ask / Auto chip beside the model chip. Auto wears the warning
+    /// accent — it's the "the agent won't ask" state.
+    fn render_approval_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let id = "picker-approval-mode";
+        let mode = ApprovalMode::from_auto_approve(self.effective_auto_approve(cx));
+        let (icon_path, text, icon_color, bg) = match mode {
+            ApprovalMode::Ask => (
+                crate::icons::KEY_MINIMALISTIC,
+                motion::hover_blend(id, theme.text_muted.opacity(0.7), theme.text.opacity(0.8)),
+                theme.text_muted.opacity(0.7),
+                motion::hover_blend(id, gpui::transparent_black(), theme.element_hover),
+            ),
+            ApprovalMode::Auto => (
+                crate::icons::DANGER_TRIANGLE,
+                motion::hover_blend(id, theme.warning.opacity(0.85), theme.warning),
+                theme.warning.opacity(0.85),
+                motion::hover_blend(id, theme.warning.opacity(0.10), theme.warning.opacity(0.18)),
+            ),
+        };
+        let tooltip = SharedString::from(mode.tooltip());
+        div()
+            .id(id)
+            .h(px(20.0))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .rounded(px(FOOTER_CHIP_RADIUS))
+            .text_size(crate::typography::ui_rems(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(text)
+            .bg(bg)
+            .on_hover(motion::hover_listener(id))
+            .cursor_pointer()
+            .tooltip(move |_, cx| cx.new(|_| WorkspaceChipTooltip(tooltip.clone())).into())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_auto_approve(cx)))
+            .child(
+                crate::icons::icon(icon_path)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(icon_color),
+            )
+            .child(SharedString::from(mode.label()))
+            .into_any_element()
     }
 
     // ---- open/close ----
@@ -5616,6 +5762,7 @@ impl Render for Pickers {
             .min_w_0()
             .gap(px(4.0))
             .child(model_chip)
+            .child(self.render_approval_chip(&theme, cx))
     }
 }
 
@@ -5665,6 +5812,92 @@ mod tests {
                 .child(div().track_focus(&self.neutral))
                 .child(self.pickers.clone())
         }
+    }
+
+    /// The approval chip reads the chat's persisted `autoApprove`, the
+    /// resolved run config (→ `RunRequest.auto_approve`, `createChat` config)
+    /// carries it, and a click writes it back onto the row — including a
+    /// config-less row, which gains a full config the way model picks do.
+    #[gpui::test]
+    fn approval_mode_resolves_from_the_chat_and_toggles_onto_its_config(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.chats.push(serde_json::from_value(serde_json::json!({
+                "id":"yolo-chat", "deviceId":"device", "archived":false, "createdAt":"2026-09-01T00:00:00Z",
+                "config":{"harness":"codex", "model":"m", "reasoning":null, "sandbox":"workspace-write", "autoApprove":true}
+            })).unwrap());
+            state.chats.push(serde_json::from_value(serde_json::json!({
+                "id":"bare-chat", "deviceId":"device", "archived":false, "createdAt":"2026-09-01T00:00:00Z"
+            })).unwrap());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let row_flag = |cx: &mut gpui::TestAppContext, id: &str| {
+            state.read_with(cx, |state, _| {
+                state
+                    .chats
+                    .iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.config.as_ref())
+                    .map(|c| c.auto_approve)
+            })
+        };
+
+        // New-chat canvas: default Ask; the draft pick rides createChat.
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults = ComposerDefaults::default();
+            pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            assert!(!pickers.resolved(cx).auto_approve);
+            pickers.toggle_auto_approve(cx);
+            let resolved = pickers.resolved(cx);
+            assert!(resolved.auto_approve);
+            assert!(resolved.chat_config().expect("harness known").auto_approve);
+        });
+
+        // A persisted Auto chat resolves Auto; a click flips the row to Ask
+        // and keeps the rest of its config.
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("yolo-chat".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            assert!(pickers.resolved(cx).auto_approve);
+            pickers.toggle_auto_approve(cx);
+            assert!(!pickers.resolved(cx).auto_approve);
+        });
+        assert_eq!(row_flag(cx, "yolo-chat"), Some(false));
+        state.read_with(cx, |state, _| {
+            let config = state.chats.iter().find(|c| c.id == "yolo-chat").unwrap();
+            assert_eq!(config.config.as_ref().unwrap().model.as_deref(), Some("m"));
+        });
+
+        // Config-less chat: Ask by default (the new-chat draft doesn't leak
+        // onto an existing chat); a click creates its config with Auto.
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("bare-chat".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            assert!(!pickers.resolved(cx).auto_approve);
+            pickers.toggle_auto_approve(cx);
+            assert!(pickers.resolved(cx).auto_approve);
+        });
+        assert_eq!(row_flag(cx, "bare-chat"), Some(true));
+
+        // Back to a fresh new chat: Ask again (per-chat only, no global).
+        state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            assert!(!pickers.resolved(cx).auto_approve)
+        });
     }
 
     #[gpui::test]

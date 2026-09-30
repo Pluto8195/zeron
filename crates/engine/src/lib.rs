@@ -352,7 +352,10 @@ impl EngineCore {
         // `bulk_import_from_session_canvas` learned to filter out
         // classifier/title-gen throwaway transcripts (see
         // `repair_junk_imports`'s doc comment) — hard-deletes the junk chats
-        // a bulk import from before this fix left behind.
+        // a bulk import from before this fix left behind. Also purges chats
+        // adopted from Zeron's own title-generator runs (first message =
+        // `TITLE_INSTRUCTIONS`; see `ZERON_TITLE_PROMPT_PREFIX`), since the
+        // pass keys off `is_synthetic_prompt`.
         {
             let importer = external_import.clone();
             tokio::task::spawn_blocking(move || {

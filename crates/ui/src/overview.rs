@@ -422,17 +422,47 @@ impl GroupKeyed for &OverviewRow {
     }
 }
 
-/// Exact port of `repoGroupKey` (`session_canvas.html:968-972`): the cwd's
-/// last path segment after stripping trailing slashes, `NONE_KEY` for no
-/// cwd (or a cwd that is nothing but slashes).
+/// Port of `repoGroupKey` (`session_canvas.html:968-972`): the cwd's last
+/// path segment after stripping trailing slashes, `NONE_KEY` for no cwd (or
+/// a cwd that is nothing but slashes).
+///
+/// Deliberate divergence from the reference: agent worktrees carry a
+/// `.workspace-root` file at their root whose first line is the absolute path
+/// of the superproject checkout. When `<cwd>/.workspace-root` exists and that
+/// trimmed first line is non-empty, the key is the last segment of THAT path
+/// instead, so worktree chats group under their real repo rather than each
+/// worktree name becoming its own one-chat "repo". A missing, unreadable, or
+/// empty file falls back to the reference behavior above.
+///
+/// Does a small fs read per call; only invoked from the cached `rows()`
+/// recompute (not per frame), so it is not memoized.
 fn repo_key(cwd: Option<&str>) -> String {
     let Some(cwd) = cwd else {
         return overview_grouping::NONE_KEY.to_string();
     };
-    match cwd.trim_end_matches('/').rsplit('/').next() {
-        Some(last) if !last.is_empty() => last.to_string(),
-        _ => overview_grouping::NONE_KEY.to_string(),
+    if let Some(root) = workspace_root_of(cwd) {
+        if let Some(key) = last_segment(&root) {
+            return key;
+        }
     }
+    last_segment(cwd).unwrap_or_else(|| overview_grouping::NONE_KEY.to_string())
+}
+
+fn last_segment(path: &str) -> Option<String> {
+    match path.trim_end_matches('/').rsplit('/').next() {
+        Some(last) if !last.is_empty() => Some(last.to_string()),
+        _ => None,
+    }
+}
+
+/// First line (trimmed) of `<cwd>/.workspace-root`, if present and non-empty.
+fn workspace_root_of(cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(std::path::Path::new(cwd).join(".workspace-root")).ok()?;
+    let line = contents.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_string())
 }
 
 /// Port of `ticketGroupKey` (`session_canvas.html:955-957`): ticket id, else
@@ -6762,6 +6792,43 @@ mod logic_tests {
         assert_eq!(repo_key(Some("/")), overview_grouping::NONE_KEY);
         assert_eq!(repo_key(Some("")), overview_grouping::NONE_KEY);
         assert_eq!(repo_key(None), overview_grouping::NONE_KEY);
+    }
+
+    #[test]
+    fn repo_key_resolves_worktree_via_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".workspace-root"),
+            "/Users/m/Projects/agent-mode-tools\n",
+        )
+        .unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        assert_eq!(repo_key(Some(cwd)), "agent-mode-tools");
+
+        // Trailing slash on the recorded root is stripped like a cwd's.
+        std::fs::write(dir.path().join(".workspace-root"), "/Users/m/Projects/zeron/\n").unwrap();
+        assert_eq!(repo_key(Some(cwd)), "zeron");
+    }
+
+    #[test]
+    fn repo_key_workspace_root_empty_or_missing_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let basename = dir.path().file_name().unwrap().to_str().unwrap();
+
+        // No file: unchanged behavior.
+        assert_eq!(repo_key(Some(cwd)), basename);
+
+        // Empty / whitespace-only file: fallback.
+        std::fs::write(dir.path().join(".workspace-root"), "").unwrap();
+        assert_eq!(repo_key(Some(cwd)), basename);
+        std::fs::write(dir.path().join(".workspace-root"), "  \n").unwrap();
+        assert_eq!(repo_key(Some(cwd)), basename);
+
+        // Unreadable (a directory, not a file): fallback, no panic.
+        std::fs::remove_file(dir.path().join(".workspace-root")).unwrap();
+        std::fs::create_dir(dir.path().join(".workspace-root")).unwrap();
+        assert_eq!(repo_key(Some(cwd)), basename);
     }
 
     #[test]

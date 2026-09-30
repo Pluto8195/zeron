@@ -288,10 +288,95 @@ pub fn create_chat_worktree(repo_path: &Path, name: &str) -> Result<ChatWorktree
     contents.push('\n');
     std::fs::write(candidate.join(".workspace-root"), contents)?;
 
+    // `git worktree add` only materializes TRACKED files, so untracked project
+    // config (e.g. `.claude/skills/*`) is missing from the new worktree and
+    // Claude Code — which resolves project skills from the worktree's own
+    // root — can't see it. Best-effort: a worktree without skills is still
+    // usable, so a failure is logged, never propagated.
+    let seed_failures = seed_claude_config(&repo_toplevel, &candidate);
+    if seed_failures > 0 {
+        tracing::warn!(
+            failures = seed_failures,
+            worktree = %candidate.display(),
+            "create_chat_worktree: some .claude entries could not be copied into the new worktree"
+        );
+    }
+
     Ok(ChatWorktree {
         worktree_path: candidate.to_string_lossy().into_owned(),
         branch: slug,
     })
+}
+
+/// Merge-copy `<src_root>/.claude` into `<dst_root>/.claude`, returning how
+/// many entries failed to copy (0 = clean; a missing source `.claude` is a
+/// no-op, not a failure). Mirrors `agent-mode.sh`'s `seed_claude_config`:
+///
+/// - An entry is copied only if it is MISSING in the worktree, recursing into
+///   directories that exist on both sides (dirs may be partially tracked), so
+///   anything git already materialized (tracked files) always wins.
+/// - Plain file copies, never symlinks (same reasoning as `.workspace-root`:
+///   a link back into the superproject can make Vite/Vitest loop). Symlinked
+///   files are copied by content; symlinked directories are skipped.
+/// - Any entry whose name matches `*.local.*` (e.g. `settings.local.json`),
+///   at any depth, is skipped: local settings can carry machine- or
+///   checkout-specific permission grants that shouldn't multiply into every
+///   worktree. Skills, agents, commands and `settings.json` are wanted.
+fn seed_claude_config(src_root: &Path, dst_root: &Path) -> usize {
+    let src = src_root.join(".claude");
+    if !src.is_dir() {
+        return 0;
+    }
+    let mut failures = 0;
+    merge_claude_dir(&src, &dst_root.join(".claude"), &mut failures);
+    failures
+}
+
+fn merge_claude_dir(src: &Path, dst: &Path, failures: &mut usize) {
+    if let Err(err) = std::fs::create_dir_all(dst) {
+        tracing::warn!(path = %dst.display(), error = %err, "seed .claude: cannot create directory");
+        *failures += 1;
+        return;
+    }
+    let entries = match std::fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(path = %src.display(), error = %err, "seed .claude: cannot read directory");
+            *failures += 1;
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().contains(".local.") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        // Follows symlinks: a symlinked file is copied by content.
+        let Ok(meta) = std::fs::metadata(&from) else {
+            continue; // dangling symlink
+        };
+        let is_link = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+        if meta.is_dir() {
+            if is_link {
+                continue; // never follow directory symlinks (loop risk)
+            }
+            // A tracked non-directory at this path wins; don't touch it.
+            if to.symlink_metadata().is_ok() && !to.is_dir() {
+                continue;
+            }
+            merge_claude_dir(&from, &to, failures);
+        } else if meta.is_file() {
+            if to.symlink_metadata().is_ok() {
+                continue; // already materialized by git: never overwrite
+            }
+            if let Err(err) = std::fs::copy(&from, &to) {
+                tracing::warn!(path = %from.display(), error = %err, "seed .claude: copy failed");
+                *failures += 1;
+            }
+        }
+    }
 }
 
 // ── PLAN_CHAT_CLOSEOUT / CLOSE_CHAT_WORKTREE ────────────────────────────────
@@ -435,6 +520,10 @@ fn inspect_worktree(cwd: &Path, chat_live: bool) -> Inspection {
         .map(|out| {
             out.lines()
                 .filter(|l| l.len() > 3 && &l[3..] != WORKSPACE_ROOT_MARKER)
+                // Untracked `.claude/` content is (mostly) what
+                // `seed_claude_config` copied in at creation; counting it
+                // would make every fresh worktree read as dirty.
+                .filter(|l| !l.starts_with("?? .claude/"))
                 .map(|l| l[3..].to_string())
                 .collect()
         })
@@ -1040,6 +1129,80 @@ mod tests {
         assert_eq!(workspace_root.trim_end(), root.to_string_lossy());
         // Never a symlink.
         assert!(!expected.join(".workspace-root").symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    /// Plain repo (as `init_repo` builds) plus: tracked `.claude/agents/x.md`,
+    /// tracked `.claude/skills/tracked/SKILL.md`, then untracked
+    /// `.claude/skills/y/SKILL.md`, an untracked sibling inside the tracked
+    /// skills dir, and local settings at two depths.
+    fn repo_with_claude_config(root: &Path) {
+        init_repo(root);
+        let claude = root.join(".claude");
+        std::fs::create_dir_all(claude.join("agents")).unwrap();
+        std::fs::create_dir_all(claude.join("skills/tracked")).unwrap();
+        std::fs::write(claude.join("agents/x.md"), "git agent\n").unwrap();
+        std::fs::write(claude.join("skills/tracked/SKILL.md"), "git skill\n").unwrap();
+        run_git(root, &["add", ".claude"]).unwrap();
+        run_git(root, &["commit", "-q", "-m", "claude config"]).unwrap();
+        // Dirty the working copy of a tracked file: git's version must win.
+        std::fs::write(claude.join("agents/x.md"), "locally edited agent\n").unwrap();
+        std::fs::create_dir_all(claude.join("skills/y")).unwrap();
+        std::fs::write(claude.join("skills/y/SKILL.md"), "untracked skill\n").unwrap();
+        std::fs::write(claude.join("skills/tracked/extra.md"), "untracked sibling\n").unwrap();
+        std::fs::write(claude.join("settings.local.json"), "{}\n").unwrap();
+        std::fs::write(claude.join("skills/y/notes.local.md"), "local\n").unwrap();
+    }
+
+    #[test]
+    fn create_chat_worktree_seeds_untracked_claude_config() {
+        let _guard = WORKSPACE_WORKTREES_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::remove_var("WORKSPACE_WORKTREES_DIR") };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        repo_with_claude_config(&root);
+
+        let outcome = create_chat_worktree(&root, "seed claude").expect("worktree created");
+        let wt = PathBuf::from(&outcome.worktree_path);
+        let claude = wt.join(".claude");
+
+        // Tracked files: git's content, not the source's dirty working copy.
+        assert_eq!(std::fs::read_to_string(claude.join("agents/x.md")).unwrap(), "git agent\n");
+        assert_eq!(
+            std::fs::read_to_string(claude.join("skills/tracked/SKILL.md")).unwrap(),
+            "git skill\n"
+        );
+        // Untracked skills arrive, including into a partially tracked dir.
+        assert_eq!(
+            std::fs::read_to_string(claude.join("skills/y/SKILL.md")).unwrap(),
+            "untracked skill\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("skills/tracked/extra.md")).unwrap(),
+            "untracked sibling\n"
+        );
+        // `*.local.*` excluded at any depth.
+        assert!(!claude.join("settings.local.json").exists());
+        assert!(!claude.join("skills/y/notes.local.md").exists());
+        // Plain files, never symlinks.
+        assert!(!claude.join("skills/y/SKILL.md").symlink_metadata().unwrap().file_type().is_symlink());
+        // The seeded (untracked) config doesn't make the fresh worktree dirty.
+        assert!(!plan_chat_closeout(&wt, false).dirty);
+    }
+
+    #[test]
+    fn create_chat_worktree_succeeds_without_a_source_claude_dir() {
+        let _guard = WORKSPACE_WORKTREES_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::remove_var("WORKSPACE_WORKTREES_DIR") };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        init_repo(&root);
+
+        let outcome = create_chat_worktree(&root, "no claude").expect("worktree created");
+        assert!(!PathBuf::from(outcome.worktree_path).join(".claude").exists());
     }
 
     #[test]

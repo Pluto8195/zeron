@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// (see [`CATEGORY_ORDER`]/[`ORIGIN_ORDER`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GroupDimension {
-    /// Task/work classification: implementing, pr_review, research,
+    /// Task/work classification: implementing, pr_review, debug, research,
     /// planning, quick_question, other.
     ///
     /// Wired: computed at external-import time by `external_import.rs`'s
@@ -80,10 +80,13 @@ pub const NONE_KEY: &str = "__none__";
 
 /// Fixed display/sort order for `Category`'s values — mirrors
 /// `session_canvas.html:861`'s `CATEGORY_ORDER`, which the reference notes
-/// matches `session_canvas_server.py`'s `TASK_CATEGORIES` list.
+/// matches `session_canvas_server.py`'s `TASK_CATEGORIES` list, plus Zeron's
+/// own `debug` (bugs / firefights / production errors). `other` MUST stay
+/// last: it is the catch-all bucket for unrecognized keys (see `group_rows`).
 pub const CATEGORY_ORDER: &[&str] = &[
     "implementing",
     "pr_review",
+    "debug",
     "research",
     "planning",
     "quick_question",
@@ -339,6 +342,23 @@ mod tests {
         assert_eq!(keys, vec!["implementing", "research", "other"]);
         let other = groups.iter().find(|g| g.key == "other").unwrap();
         assert_eq!(ids_in_order(&other.items), vec!["e"]);
+    }
+
+    #[test]
+    fn debug_category_sits_before_other_and_the_catch_all_stays_last() {
+        let pos = |k: &str| CATEGORY_ORDER.iter().position(|c| *c == k).unwrap();
+        assert!(pos("pr_review") < pos("debug") && pos("debug") < pos("research"));
+        assert_eq!(CATEGORY_ORDER.last(), Some(&"other"));
+        let rows = vec![
+            Row { id: "a", category: "research", repo: "zeron", ticket: NONE_KEY },
+            Row { id: "b", category: "debug", repo: "zeron", ticket: NONE_KEY },
+            Row { id: "c", category: "not_a_category_yet", repo: "zeron", ticket: NONE_KEY },
+        ];
+        let Partition::Groups { groups, .. } = partition(rows, &[GroupDimension::Category]) else {
+            panic!("expected Groups");
+        };
+        let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, vec!["debug", "research", "other"]);
     }
 
     #[test]

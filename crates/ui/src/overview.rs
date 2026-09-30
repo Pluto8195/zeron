@@ -484,6 +484,7 @@ fn category_label(key: &str) -> String {
     match key {
         "implementing" => "Implementing".into(),
         "pr_review" => "PR review".into(),
+        "debug" => "Debug / firefight".into(),
         "research" => "Research".into(),
         "planning" => "Planning".into(),
         "quick_question" => "Quick question".into(),
@@ -803,6 +804,7 @@ fn category_color(key: &str) -> gpui::Hsla {
     let hex = match key {
         "implementing" => 0x3987e5,
         "pr_review" => 0xd95926,
+        "debug" => 0x8b6fe0,
         "research" => 0x199e70,
         "planning" => 0xd55181,
         "quick_question" => 0xc98500,
@@ -7264,6 +7266,16 @@ mod logic_tests {
         let pending = pr_item(7, "acme/api", "Bump deps", None);
         assert!(pr_matches_search("#7", &pending));
         assert!(!pr_matches_search("mikey/", &pending));
+    }
+
+    #[test]
+    fn debug_category_has_its_own_label_and_color_and_unknown_keys_degrade() {
+        assert_eq!(category_label("debug"), "Debug / firefight");
+        assert_ne!(category_color("debug"), category_color("other"));
+        assert_ne!(category_color("debug"), category_color("pr_review"));
+        // A key the UI has never heard of: humanized label, neutral color.
+        assert_eq!(category_label("future_thing"), "future thing");
+        assert_eq!(category_color("future_thing"), category_color("other"));
     }
 
     #[test]

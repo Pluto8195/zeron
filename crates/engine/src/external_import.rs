@@ -71,8 +71,9 @@ pub struct ImportedSession {
     pub cwd: String,
     pub message_count: usize,
     pub title: Option<String>,
-    /// Heuristic task category (`implementing`/`pr_review`/`research`/
-    /// `planning`/`quick_question`/`other`) — see [`classify_heuristic`].
+    /// Heuristic task category (`implementing`/`pr_review`/`debug`/
+    /// `research`/`planning`/`quick_question`/`other`) — see
+    /// [`classify_heuristic`].
     pub category: String,
     /// Launch origin (`agent_mode`/`sdk_driven`/`claude_desktop`/`bare_cli`/
     /// `unknown`; `cursor` never applies to a Claude Code import) — see
@@ -1513,26 +1514,35 @@ fn truncate_preview(text: &str) -> String {
 /// Ported verbatim from `agent-mode-tools/session_canvas_server.py`'s
 /// `REVIEW_SKILLS`/`RESEARCH_SKILLS` (lines ~448-455).
 const REVIEW_SKILLS: &[&str] = &["code-review", "fix-ci", "pr-risk", "gh-stack", "open-pr"];
+/// Skills whose use means something is broken and being hunted: error
+/// trackers and log/metric tooling for production. Checked before
+/// [`RESEARCH_SKILLS`], so these no longer land in `research`.
+const DEBUG_SKILLS: &[&str] = &["sentry-api", "datadog-api", "rds-logs-and-metrics", "cc-logs"];
 const RESEARCH_SKILLS: &[&str] = &[
-    "sentry-api",
-    "datadog-api",
     "db-query",
-    "rds-logs-and-metrics",
-    "cc-logs",
     "segment-api",
     "metabase-api",
     "firecrawl",
 ];
 
-/// Ported verbatim from `session_canvas_server.py`'s `classify_heuristic`
-/// (lines 469-482) — the real-time classifier (no LLM call). `"planning"` is
-/// a valid bucket in the reference's `TASK_CATEGORIES` but is only ever
-/// reached through the (out-of-scope-here) LLM/TypeSafe classification path,
-/// never by this heuristic — matching upstream behavior exactly, not a gap.
+/// Ported from `session_canvas_server.py`'s `classify_heuristic`
+/// (lines 469-482) — the real-time classifier (no LLM call) — plus a Zeron
+/// addition: `"debug"` (something broken and being hunted or fixed: bugs,
+/// incidents, production errors, Sentry deep-dives). `"planning"` is a valid
+/// bucket in the reference's `TASK_CATEGORIES` but is only ever reached
+/// through the (out-of-scope-here) LLM/TypeSafe classification path, never
+/// by this heuristic — matching upstream behavior exactly, not a gap.
+///
+/// `debug` sits after `quick_question` (a short Q&A stays one) and
+/// `pr_review` (a review prompt that says "check for bugs" is still a
+/// review), but before `implementing`/`research`: a bug hunt reads and edits
+/// like either, which is exactly why it needs its own bucket. `debug_prompt`
+/// is [`ClassificationTally::debug_prompt`].
 fn classify_heuristic(
     tool_counts: &HashMap<String, usize>,
     skills_loaded: &HashSet<String>,
     turn_count: usize,
+    debug_prompt: bool,
 ) -> String {
     let edit_calls: usize = ["Edit", "Write", "NotebookEdit"]
         .iter()
@@ -1550,6 +1560,9 @@ fn classify_heuristic(
     if skills_loaded.iter().any(|s| REVIEW_SKILLS.contains(&s.as_str())) {
         return "pr_review".to_string();
     }
+    if debug_prompt || skills_loaded.iter().any(|s| DEBUG_SKILLS.contains(&s.as_str())) {
+        return "debug".to_string();
+    }
     if edit_calls >= 3 {
         return "implementing".to_string();
     }
@@ -1563,6 +1576,76 @@ fn classify_heuristic(
     }
     "other".to_string()
 }
+
+/// Words that on their own mean "something is broken". Matched against
+/// whole lowercased alphanumeric tokens (apostrophes dropped, so "doesn't"
+/// is `doesnt`), so "debug" does not hit on substrings like "debugger-ui".
+const DEBUG_STRONG_WORDS: &[&str] = &[
+    "bug",
+    "bugs",
+    "buggy",
+    "broken",
+    "sentry",
+    "crash",
+    "crashes",
+    "crashed",
+    "crashing",
+    "regression",
+    "regressed",
+    "firefight",
+    "firefighting",
+    "incident",
+    "outage",
+    "traceback",
+    "stacktrace",
+    "hotfix",
+    "debug",
+    "debugging",
+];
+/// Adjacent-word phrases with the same strong meaning.
+const DEBUG_STRONG_PHRASES: &[(&str, &str)] = &[
+    ("stack", "trace"),
+    ("root", "cause"),
+    ("not", "working"),
+    ("isnt", "working"),
+    ("doesnt", "work"),
+    ("wont", "work"),
+    ("started", "failing"),
+];
+/// Words too common in feature work ("add error handling") to count alone;
+/// they only signal debugging next to a [`DEBUG_FAILURE_WORDS`] hit.
+const DEBUG_WEAK_WORDS: &[&str] = &["error", "errors", "exception", "exceptions", "investigate", "investigating", "why"];
+const DEBUG_FAILURE_WORDS: &[&str] = &[
+    "fail", "fails", "failing", "failed", "failure", "failures", "wrong", "timeout", "timeouts", "hang", "hangs",
+    "stuck", "down", "500", "502", "503", "504",
+];
+
+/// Whether one human message reads like a bug hunt / firefight: any strong
+/// word or phrase, or a weak word (error, investigate, why…) alongside a
+/// failure word. Only the head of the text is scanned — a pasted log blob's
+/// tail says nothing the head doesn't.
+fn text_suggests_debugging(text: &str) -> bool {
+    let lowered: String = text
+        .chars()
+        .take(4000)
+        .filter(|c| !matches!(c, '\'' | '\u{2019}'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let words: Vec<&str> = lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |set: &[&str]| words.iter().any(|w| set.contains(w));
+    has(DEBUG_STRONG_WORDS)
+        || words
+            .windows(2)
+            .any(|pair| DEBUG_STRONG_PHRASES.contains(&(pair[0], pair[1])))
+        || (has(DEBUG_WEAK_WORDS) && has(DEBUG_FAILURE_WORDS))
+}
+
+/// How many of a chat's leading human messages [`ClassificationTally`]
+/// scans for debug intent.
+const DEBUG_PROMPT_WINDOW: usize = 5;
 
 /// Ported from `session_canvas_server.py`'s `ENTRYPOINT_LABELS`
 /// (lines 262-266) — the non-`agent_mode` half of `classify_origin`.
@@ -1597,6 +1680,12 @@ struct ClassificationTally {
     /// A `stop_hook_summary` line whose hook command contains
     /// `peon_hook.py` — the agent-mode.sh signal (see `RawLine::hook_infos`).
     agent_mode_signal: bool,
+    /// Human messages seen so far (capped scanning at
+    /// [`DEBUG_PROMPT_WINDOW`]) and how many of those read like debugging
+    /// ([`text_suggests_debugging`]); `first_prompt_debug` is the opener's.
+    human_messages: usize,
+    debug_prompt_hits: usize,
+    first_prompt_debug: bool,
 }
 
 /// The exact synthetic-prompt prefixes `session_canvas_server.py` filters
@@ -1682,14 +1771,29 @@ impl ClassificationTally {
                     && !is_synthetic_prompt(&text)
                 {
                     self.turn_count += 1;
+                    if self.human_messages < DEBUG_PROMPT_WINDOW {
+                        let debugging = text_suggests_debugging(&text);
+                        if self.human_messages == 0 {
+                            self.first_prompt_debug = debugging;
+                        }
+                        self.debug_prompt_hits += usize::from(debugging);
+                        self.human_messages += 1;
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    /// The chat is framed as debugging: its opener says so, or at least two
+    /// of its first few messages do (one stray "there's a bug" in a feature
+    /// chat is not enough).
+    fn debug_prompt(&self) -> bool {
+        self.first_prompt_debug || self.debug_prompt_hits >= 2
+    }
+
     fn category(&self) -> String {
-        classify_heuristic(&self.tool_counts, &self.skills_loaded, self.turn_count)
+        classify_heuristic(&self.tool_counts, &self.skills_loaded, self.turn_count, self.debug_prompt())
     }
 
     fn origin(&self) -> String {
@@ -2614,5 +2718,51 @@ mod title_registry_tests {
         ] {
             assert!(!is_synthetic_prompt(real), "wrongly flagged real chat: {real:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn strong_words_and_phrases_signal_debugging() {
+        for text in [
+            "There's a bug in the BOM import",
+            "prod is broken again",
+            "Sentry shows a spike on the quote endpoint",
+            "this doesn't work since the deploy",
+            "Here is the stack trace: ...",
+            "we have a firefight on our hands",
+            "find the root cause of the regression",
+        ] {
+            assert!(text_suggests_debugging(text), "missed: {text:?}");
+        }
+    }
+
+    #[test]
+    fn weak_words_need_failure_context() {
+        assert!(text_suggests_debugging("why is the export timing out with a 500"));
+        assert!(text_suggests_debugging("investigate the error, the job keeps failing"));
+        for text in [
+            "add error handling to the importer",
+            "investigate how pricing tiers are modeled",
+            "why do we use loro here",
+            "rename the debugger-ui module",
+        ] {
+            assert!(!text_suggests_debugging(text), "false positive: {text:?}");
+        }
+    }
+
+    #[test]
+    fn opener_or_repeated_hits_frame_the_chat_as_debug() {
+        let mut tally = ClassificationTally::default();
+        tally.first_prompt_debug = true;
+        assert!(tally.debug_prompt());
+        let mut tally = ClassificationTally::default();
+        tally.debug_prompt_hits = 1; // a stray mention later in a feature chat
+        assert!(!tally.debug_prompt());
+        tally.debug_prompt_hits = 2;
+        assert!(tally.debug_prompt());
     }
 }

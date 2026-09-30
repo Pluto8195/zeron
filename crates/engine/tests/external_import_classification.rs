@@ -114,6 +114,57 @@ async fn a_review_skill_is_pr_review_even_with_reads() {
     assert_eq!(result.category, "pr_review");
 }
 
+fn reads(n: usize) -> Vec<(&'static str, &'static str)> {
+    vec![("Read", r#"{"file_path":"a.rs"}"#); n]
+}
+
+#[tokio::test]
+async fn sentry_skill_is_debug_not_research() {
+    let lines = vec![
+        user_line("u1", "look at the latest issues", None),
+        assistant_line("a1", &[("Skill", r#"{"skill":"sentry-api"}"#), ("Read", r#"{"file_path":"a.rs"}"#), ("Read", r#"{"file_path":"b.rs"}"#)]),
+    ];
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_eq!(import_transcript(&lines).await.category, "debug");
+}
+
+#[tokio::test]
+async fn a_bug_hunt_opener_is_debug_even_when_it_ends_in_edits() {
+    let mut edits = reads(1);
+    edits.extend([("Edit", r#"{"file_path":"a.rs"}"#); 3]);
+    let lines = vec![
+        user_line("u1", "checkout is broken in prod, find the root cause", None),
+        assistant_line("a1", &edits),
+    ];
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_eq!(import_transcript(&lines).await.category, "debug");
+}
+
+#[tokio::test]
+async fn failure_words_need_context_and_a_review_skill_still_wins() {
+    // "error" alone is feature work, not a firefight.
+    let feature = vec![
+        user_line("u1", "add error handling to the importer", None),
+        assistant_line("a1", &[("Edit", r#"{"file_path":"a.rs"}"#); 3]),
+    ];
+    let feature: Vec<&str> = feature.iter().map(String::as_str).collect();
+    assert_eq!(import_transcript(&feature).await.category, "implementing");
+
+    let review = vec![
+        user_line("u1", "review this PR for bugs", None),
+        assistant_line("a1", &[("Read", r#"{"file_path":"a.rs"}"#), ("Read", r#"{"file_path":"b.rs"}"#), ("Skill", r#"{"skill":"code-review"}"#)]),
+    ];
+    let review: Vec<&str> = review.iter().map(String::as_str).collect();
+    assert_eq!(import_transcript(&review).await.category, "pr_review");
+}
+
+#[tokio::test]
+async fn a_short_debug_question_stays_quick_question() {
+    let lines = vec![user_line("u1", "why is this crashing", None), assistant_line("a1", &[])];
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_eq!(import_transcript(&lines).await.category, "quick_question");
+}
+
 #[tokio::test]
 async fn bash_only_activity_falls_to_other() {
     let lines = vec![

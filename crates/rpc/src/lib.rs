@@ -282,6 +282,23 @@ pub mod methods {
     /// `Mutate` writes) so the chat's next dispatch runs there automatically.
     /// IPC-only: device-local filesystem + git state.
     pub const CREATE_CHAT_WORKTREE: &str = "CreateChatWorktree";
+    /// Read-only close-out inspection of a chat's agent worktree: `{chatId,
+    /// cwd}` → `{isWorktree, worktreePath, branch, chatLive, dirty,
+    /// dirtyFiles, unmergedCommits, defaultBranch}`. `isWorktree` requires a
+    /// `.workspace-root` file AND a registered linked git worktree (never a
+    /// repo's main working tree); when false the other fields are
+    /// empty/null/0. `chatLive` reuses the engine's session + process
+    /// liveness signals. IPC-only: device-local filesystem + git state.
+    pub const PLAN_CHAT_CLOSEOUT: &str = "PlanChatCloseout";
+    /// Destructive counterpart to `PlanChatCloseout`: `{chatId, cwd, force}`
+    /// → `{removed, branchDeleted, archived}`. Hard refusals (live chat, not
+    /// a closeable worktree, default branch, main working tree) error even
+    /// with `force`; soft ones (uncommitted files, unmerged commits) error
+    /// unless `force`. On success removes the worktree, deletes its own
+    /// branch (`-d`, `-D` when forced) and archives the chat
+    /// (`WorkspaceHost::set_chat_archived`, the `setChatArchived` mutation).
+    /// Errors say why. IPC-only: device-local filesystem + git state.
+    pub const CLOSE_CHAT_WORKTREE: &str = "CloseChatWorktree";
     // Project Actions are private state on the device that owns the project.
     pub const LIST_PROJECT_ACTIONS: &str = "ListProjectActions";
     pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";

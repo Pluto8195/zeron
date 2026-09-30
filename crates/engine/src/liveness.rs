@@ -67,6 +67,16 @@ pub fn check_liveness(transcript_path: &Path, session_id: &str, cwd: &str) -> Li
     }
 }
 
+/// Process-only half of [`check_liveness`]: is a running `claude` process
+/// tied to `session_id` (in its args) or to `cwd` (its real working
+/// directory)? Skips the transcript-mtime signal, which exists to warn before
+/// importing a session — it would read a chat whose turn just finished as
+/// "live" for [`RECENT_MTIME_THRESHOLD`], wrongly blocking a close-out.
+/// Blocking (`ps`/`lsof`).
+pub fn live_process_matches(session_id: &str, cwd: &str) -> bool {
+    claude_process_matches("claude", session_id, cwd)
+}
+
 fn mtime_is_recent(path: &Path, now: SystemTime) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false; // can't stat it — not concerning, just undetermined

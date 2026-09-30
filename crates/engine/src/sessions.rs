@@ -282,6 +282,14 @@ impl SessionsEngine {
             .is_some_and(is_active)
     }
 
+    /// Whether this engine holds a live run (in-flight turn OR a warm
+    /// persistent child parked between turns) for the chat. Close-out uses
+    /// this: tearing down a worktree under a warm child would pull its cwd
+    /// out from under it.
+    pub fn has_live_run(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {

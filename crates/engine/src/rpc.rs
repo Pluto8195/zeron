@@ -216,6 +216,24 @@ struct CreateChatWorktreeParams {
     name: String,
 }
 
+/// `PLAN_CHAT_CLOSEOUT` request: `{chatId, cwd}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanChatCloseoutParams {
+    chat_id: String,
+    cwd: String,
+}
+
+/// `CLOSE_CHAT_WORKTREE` request: `{chatId, cwd, force}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseChatWorktreeParams {
+    chat_id: String,
+    cwd: String,
+    #[serde(default)]
+    force: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueMessageParams {
@@ -755,6 +773,29 @@ impl EngineRpc {
         self.local_import
             .as_ref()
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
+    }
+
+    /// Whether `chat_id`'s session is live, for close-out: this engine holds
+    /// a run for it (in-flight or warm between turns), OR a `claude` process
+    /// on this machine is tied to the chat's harness session id or sits in
+    /// `cwd` — the process half of the signal the auto-adopt sweep uses
+    /// ([`crate::liveness`]), minus the transcript-mtime check (a turn that
+    /// just finished must not block close-out for minutes).
+    async fn chat_is_live(&self, chat_id: &str, cwd: &str) -> bool {
+        if self.sessions.has_live_run(chat_id) || self.sessions.turn_in_flight(chat_id) {
+            return true;
+        }
+        let session_id = self
+            .workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .and_then(|c| c.harness_session_id)
+            .unwrap_or_default();
+        let cwd = cwd.to_string();
+        tokio::task::spawn_blocking(move || crate::liveness::live_process_matches(&session_id, &cwd))
+            .await
+            .unwrap_or(false)
     }
 
     fn external_importer(&self) -> Result<&crate::external_import::ExternalSessionImporter, RpcError> {
@@ -2249,6 +2290,43 @@ impl RpcService for EngineRpc {
                 }
                 RpcReply::value(&worktree)
             }
+            methods::PLAN_CHAT_CLOSEOUT => {
+                let p: PlanChatCloseoutParams = parse_params(params)?;
+                let chat_live = self.chat_is_live(&p.chat_id, &p.cwd).await;
+                let cwd = std::path::PathBuf::from(&p.cwd);
+                let plan = tokio::task::spawn_blocking(move || {
+                    crate::chat_workspace_plan::plan_chat_closeout(&cwd, chat_live)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&plan)
+            }
+            methods::CLOSE_CHAT_WORKTREE => {
+                let p: CloseChatWorktreeParams = parse_params(params)?;
+                let chat_live = self.chat_is_live(&p.chat_id, &p.cwd).await;
+                let cwd = std::path::PathBuf::from(&p.cwd);
+                let force = p.force;
+                let mut outcome = tokio::task::spawn_blocking(move || {
+                    crate::chat_workspace_plan::close_chat_worktree(&cwd, force, chat_live)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Archive via the same LWW flag `Mutate{setChatArchived}`
+                // writes. Best-effort like `CreateChatWorktree`'s cwd stamp:
+                // the worktree is already gone, so a missing chat row
+                // (`Ok(false)`) or write error reports `archived: false`
+                // rather than failing the close-out.
+                match self.workspace.set_chat_archived(&p.chat_id, true) {
+                    Ok(archived) => outcome.archived = archived,
+                    Err(err) => tracing::warn!(
+                        chat = %p.chat_id,
+                        error = %err,
+                        "CloseChatWorktree: archiving the chat failed"
+                    ),
+                }
+                RpcReply::value(&outcome)
+            }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
                 let version = self
@@ -3208,6 +3286,29 @@ mod tests {
     fn chat_workspace_plan_methods_are_ipc_only() {
         assert!(!forwardable(methods::PLAN_CHAT_WORKSPACE));
         assert!(!forwardable(methods::CREATE_CHAT_WORKTREE));
+        assert!(!forwardable(methods::PLAN_CHAT_CLOSEOUT));
+        assert!(!forwardable(methods::CLOSE_CHAT_WORKTREE));
+    }
+
+    #[test]
+    fn closeout_params_parse_camel_case() {
+        let p: PlanChatCloseoutParams = parse_params(serde_json::json!({
+            "chatId": "chat-1",
+            "cwd": "/repo/.worktrees/workspace/eng-42",
+        }))
+        .unwrap();
+        assert_eq!(p.chat_id, "chat-1");
+        assert_eq!(p.cwd, "/repo/.worktrees/workspace/eng-42");
+
+        let p: CloseChatWorktreeParams = parse_params(serde_json::json!({
+            "chatId": "chat-1",
+            "cwd": "/repo/.worktrees/workspace/eng-42",
+            "force": true,
+        }))
+        .unwrap();
+        assert_eq!(p.chat_id, "chat-1");
+        assert_eq!(p.cwd, "/repo/.worktrees/workspace/eng-42");
+        assert!(p.force);
     }
 
     #[test]

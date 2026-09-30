@@ -294,6 +294,316 @@ pub fn create_chat_worktree(repo_path: &Path, name: &str) -> Result<ChatWorktree
     })
 }
 
+// ── PLAN_CHAT_CLOSEOUT / CLOSE_CHAT_WORKTREE ────────────────────────────────
+
+/// Cap on `PLAN_CHAT_CLOSEOUT`'s `dirtyFiles` list — the UI shows a preview,
+/// not an exhaustive status; `dirty` itself is exact.
+const DIRTY_FILES_CAP: usize = 20;
+/// The plain-text marker `create_chat_worktree` writes into every agent
+/// worktree. Its presence is one of the two `isWorktree` requirements, and —
+/// being untracked by construction — it is never counted as "dirty" and is
+/// deleted before a non-forced `git worktree remove` (which would otherwise
+/// refuse on it).
+const WORKSPACE_ROOT_MARKER: &str = ".workspace-root";
+
+/// `PLAN_CHAT_CLOSEOUT`'s response. Wire field names are pinned by
+/// [`tests::closeout_plan_wire_shape_is_camel_case`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseoutPlan {
+    /// `cwd` is a closeable agent worktree: it has a `.workspace-root` file
+    /// AND is a registered linked git worktree (never a repo's main working
+    /// tree). When `false` the remaining fields are empty/null/0.
+    pub is_worktree: bool,
+    pub worktree_path: String,
+    /// Checked-out branch, `null` when detached.
+    pub branch: Option<String>,
+    pub chat_live: bool,
+    pub dirty: bool,
+    /// Up to [`DIRTY_FILES_CAP`] `git status --porcelain` entries.
+    pub dirty_files: Vec<String>,
+    pub unmerged_commits: u32,
+    pub default_branch: Option<String>,
+}
+
+/// `CLOSE_CHAT_WORKTREE`'s response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseoutOutcome {
+    pub removed: bool,
+    pub branch_deleted: bool,
+    pub archived: bool,
+}
+
+/// Everything `plan_chat_closeout`/`close_chat_worktree` learn about a
+/// candidate worktree in one pass.
+struct Inspection {
+    plan: CloseoutPlan,
+    /// Working tree of the repo that owns this worktree — where every
+    /// mutating git command must run. `None` when not a closeable worktree.
+    repo: Option<PathBuf>,
+    /// Canonicalized worktree path (for comparisons against git's output).
+    canonical: Option<PathBuf>,
+    /// Exact uncommitted-entry count (`plan.dirty_files` is capped).
+    dirty_count: usize,
+    /// Set when `rev-list` failed although a branch and default both exist —
+    /// `close_chat_worktree` fails closed on this; the plan reports 0.
+    unmerged_error: Option<String>,
+    /// Why `plan.is_worktree` is false (for close's error message).
+    reject_reason: Option<String>,
+}
+
+fn not_a_worktree(worktree_path: String, chat_live: bool, reason: String) -> Inspection {
+    Inspection {
+        plan: CloseoutPlan {
+            is_worktree: false,
+            worktree_path,
+            branch: None,
+            chat_live,
+            dirty: false,
+            dirty_files: Vec::new(),
+            unmerged_commits: 0,
+            default_branch: None,
+        },
+        repo: None,
+        canonical: None,
+        dirty_count: 0,
+        unmerged_error: None,
+        reject_reason: Some(reason),
+    }
+}
+
+/// Read-only inspection of `cwd` for chat close-out. Blocking (shells out to
+/// `git`) — run on a blocking-safe thread. `chat_live` is supplied by the
+/// caller (the engine's session/process liveness lives outside this module).
+pub fn plan_chat_closeout(cwd: &Path, chat_live: bool) -> CloseoutPlan {
+    inspect_worktree(cwd, chat_live).plan
+}
+
+fn inspect_worktree(cwd: &Path, chat_live: bool) -> Inspection {
+    let worktree_path = normalize_path(cwd).to_string_lossy().into_owned();
+    let reject = |reason: &str| not_a_worktree(worktree_path.clone(), chat_live, reason.to_string());
+
+    if !cwd.join(WORKSPACE_ROOT_MARKER).is_file() {
+        return reject("it has no .workspace-root file, so it is not an agent worktree");
+    }
+    let Ok(canonical) = cwd.canonicalize() else {
+        return reject("the path cannot be resolved");
+    };
+    // `cwd` must itself be the worktree root, not a subdirectory of one.
+    match git_toplevel(&canonical).and_then(|t| t.canonicalize().ok()) {
+        Some(top) if top == canonical => {}
+        _ => return reject("it is not the root of a git working tree"),
+    }
+    let (Some(git_dir), Some(common_dir)) = (
+        git_path(&canonical, "--git-dir"),
+        git_path(&canonical, "--git-common-dir"),
+    ) else {
+        return reject("its git directory could not be resolved");
+    };
+    if git_dir == common_dir {
+        return reject("it is a repository's main working tree, not a linked worktree");
+    }
+    // `<repo>/.git` → `<repo>`; a bare repo's common dir is the repo itself.
+    let repo = if common_dir.file_name().is_some_and(|n| n == ".git") {
+        common_dir.parent().map(Path::to_path_buf).unwrap_or(common_dir.clone())
+    } else {
+        common_dir.clone()
+    };
+    let registered = run_git(&repo, &["worktree", "list", "--porcelain"])
+        .map(|out| parse_worktree_list(&out))
+        .unwrap_or_default();
+    // First entry is the main working tree; it must never be closeable.
+    let is_registered_linked = registered
+        .iter()
+        .skip(1)
+        .filter_map(|p| p.canonicalize().ok())
+        .any(|p| p == canonical);
+    if !is_registered_linked {
+        return reject("it is not a registered linked git worktree");
+    }
+
+    let branch = run_git(&canonical, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|out| out.trim().to_string())
+        .filter(|out| !out.is_empty());
+    // Resolved from the owning repo — from inside the linked worktree the
+    // `HEAD` fallback would just return the worktree's own branch.
+    let default = default_branch(&repo);
+
+    let dirty_entries: Vec<String> = run_git(&canonical, &["status", "--porcelain", "-uall"])
+        .map(|out| {
+            out.lines()
+                .filter(|l| l.len() > 3 && &l[3..] != WORKSPACE_ROOT_MARKER)
+                .map(|l| l[3..].to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let dirty_count = dirty_entries.len();
+
+    let (unmerged_commits, unmerged_error) = match (&branch, &default) {
+        (Some(b), Some(d)) if b != d => match count_unmerged(&repo, d, b) {
+            Ok(n) => (n, None),
+            Err(e) => (0, Some(e)),
+        },
+        _ => (0, None),
+    };
+
+    Inspection {
+        plan: CloseoutPlan {
+            is_worktree: true,
+            worktree_path,
+            branch,
+            chat_live,
+            dirty: dirty_count > 0,
+            dirty_files: dirty_entries.into_iter().take(DIRTY_FILES_CAP).collect(),
+            unmerged_commits,
+            default_branch: default,
+        },
+        repo: Some(repo),
+        canonical: Some(canonical),
+        dirty_count,
+        unmerged_error,
+        reject_reason: None,
+    }
+}
+
+/// `git rev-list --count <default>..<branch>`.
+fn count_unmerged(repo: &Path, default: &str, branch: &str) -> Result<u32, String> {
+    let range = format!("{default}..{branch}");
+    run_git(repo, &["rev-list", "--count", &range])?
+        .trim()
+        .parse()
+        .map_err(|e| format!("could not parse commit count for {range}: {e}"))
+}
+
+/// Absolute, canonical form of a `git rev-parse <flag>` path (git prints
+/// these relative to the cwd in some layouts).
+fn git_path(cwd: &Path, flag: &str) -> Option<PathBuf> {
+    let out = run_git(cwd, &["rev-parse", flag]).ok()?;
+    let p = PathBuf::from(out.trim());
+    let p = if p.is_absolute() { p } else { cwd.join(p) };
+    p.canonicalize().ok()
+}
+
+/// Paths from `git worktree list --porcelain`, main working tree first.
+fn parse_worktree_list(porcelain: &str) -> Vec<PathBuf> {
+    porcelain
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn plural(n: usize, singular: &str) -> String {
+    format!("{n} {singular}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Tear down a chat's agent worktree: `git worktree remove`, then delete the
+/// worktree's own branch. `force` overrides only the SOFT refusals (dirty
+/// tree, unmerged commits); the HARD ones (live chat, not a closeable
+/// worktree, default branch, main working tree) always error. Blocking — run
+/// on a blocking-safe thread. The returned outcome has `archived: false`;
+/// archiving is the RPC layer's job (it owns the workspace doc).
+pub fn close_chat_worktree(
+    cwd: &Path,
+    force: bool,
+    chat_live: bool,
+) -> Result<CloseoutOutcome, EngineError> {
+    let refuse = |msg: String| Err(EngineError::Other(msg));
+    if chat_live {
+        return refuse("chat is live; stop its session before closing out the worktree".into());
+    }
+    let inspection = inspect_worktree(cwd, chat_live);
+    let (Some(repo), Some(canonical)) = (&inspection.repo, &inspection.canonical) else {
+        return refuse(format!(
+            "not a closeable agent worktree: {}: {}",
+            inspection.plan.worktree_path,
+            inspection.reject_reason.as_deref().unwrap_or("unknown reason")
+        ));
+    };
+    if canonical == repo {
+        return refuse(format!(
+            "refusing to remove a repository's main working tree: {}",
+            canonical.display()
+        ));
+    }
+    let plan = &inspection.plan;
+    if let (Some(branch), Some(default)) = (&plan.branch, &plan.default_branch) {
+        if branch == default {
+            return refuse(format!(
+                "refusing to close out: worktree is on the repository's default branch `{default}`"
+            ));
+        }
+    }
+
+    if !force {
+        if inspection.dirty_count > 0 {
+            return refuse(format!(
+                "{} in the worktree",
+                plural(inspection.dirty_count, "uncommitted file")
+            ));
+        }
+        if let Some(err) = &inspection.unmerged_error {
+            return refuse(format!("could not verify the branch is merged: {err}"));
+        }
+        if let (Some(branch), None) = (&plan.branch, &plan.default_branch) {
+            return refuse(format!(
+                "could not resolve the default branch to verify `{branch}` is merged"
+            ));
+        }
+        if plan.unmerged_commits > 0 {
+            return refuse(format!(
+                "{} on {}",
+                plural(plan.unmerged_commits as usize, "unmerged commit"),
+                plan.branch.as_deref().unwrap_or("HEAD")
+            ));
+        }
+    }
+
+    // The marker is untracked, so git would refuse to remove a worktree
+    // holding it; take it out first (restored below if the removal fails).
+    let marker = canonical.join(WORKSPACE_ROOT_MARKER);
+    let marker_contents = std::fs::read(&marker).ok();
+    if !force {
+        let _ = std::fs::remove_file(&marker);
+    }
+    let path_arg = canonical.to_string_lossy().into_owned();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path_arg);
+    if let Err(err) = run_git(repo, &args) {
+        if let (false, Some(bytes)) = (force, marker_contents) {
+            let _ = std::fs::write(&marker, bytes);
+        }
+        return Err(EngineError::Other(err));
+    }
+
+    // Only the worktree's own checked-out branch, and never the default
+    // (guarded above, re-checked here so the invariant is local).
+    let mut branch_deleted = false;
+    if let Some(branch) = plan.branch.as_deref() {
+        if plan.default_branch.as_deref() != Some(branch) {
+            let flag = if force { "-D" } else { "-d" };
+            match run_git(repo, &["branch", flag, branch]) {
+                Ok(_) => branch_deleted = true,
+                // The worktree is already gone; don't fail the whole close-out
+                // over a branch git wants kept (e.g. `-d` not merged into the
+                // main repo's current HEAD). Reported via `branchDeleted`.
+                Err(err) => tracing::warn!(branch, error = %err, "close-out: branch not deleted"),
+            }
+        }
+    }
+
+    Ok(CloseoutOutcome {
+        removed: true,
+        branch_deleted,
+        archived: false,
+    })
+}
+
 /// `name` sanitized to a kebab-case slug — the ticket id when `name` itself
 /// contains one that `extract_ticket_id` recognizes (preferred over
 /// sanitizing the whole free-text name), else a plain kebab-case of `name`.
@@ -769,5 +1079,320 @@ mod tests {
 
         let outcome = result.expect("worktree created under override dir");
         assert!(PathBuf::from(&outcome.worktree_path).starts_with(&override_dir));
+    }
+
+    // ── PLAN_CHAT_CLOSEOUT / CLOSE_CHAT_WORKTREE ─────────────────────────
+
+    #[test]
+    fn closeout_plan_wire_shape_is_camel_case() {
+        let plan = CloseoutPlan {
+            is_worktree: true,
+            worktree_path: "/r/.worktrees/workspace/eng-1".into(),
+            branch: Some("eng-1".into()),
+            chat_live: false,
+            dirty: true,
+            dirty_files: vec!["a.txt".into()],
+            unmerged_commits: 3,
+            default_branch: Some("main".into()),
+        };
+        let value = serde_json::to_value(&plan).unwrap();
+        let obj = value.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "branch",
+                "chatLive",
+                "defaultBranch",
+                "dirty",
+                "dirtyFiles",
+                "isWorktree",
+                "unmergedCommits",
+                "worktreePath"
+            ]
+        );
+        assert_eq!(value["isWorktree"], serde_json::json!(true));
+        assert_eq!(value["worktreePath"], serde_json::json!("/r/.worktrees/workspace/eng-1"));
+        assert_eq!(value["branch"], serde_json::json!("eng-1"));
+        assert_eq!(value["chatLive"], serde_json::json!(false));
+        assert_eq!(value["dirty"], serde_json::json!(true));
+        assert_eq!(value["dirtyFiles"], serde_json::json!(["a.txt"]));
+        assert_eq!(value["unmergedCommits"], serde_json::json!(3));
+        assert_eq!(value["defaultBranch"], serde_json::json!("main"));
+
+        let detached = CloseoutPlan {
+            branch: None,
+            default_branch: None,
+            ..plan
+        };
+        let value = serde_json::to_value(&detached).unwrap();
+        assert_eq!(value["branch"], serde_json::Value::Null);
+        assert_eq!(value["defaultBranch"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn closeout_outcome_wire_shape_is_camel_case() {
+        let value = serde_json::to_value(CloseoutOutcome {
+            removed: true,
+            branch_deleted: true,
+            archived: false,
+        })
+        .unwrap();
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["archived", "branchDeleted", "removed"]);
+        assert_eq!(value["removed"], serde_json::json!(true));
+        assert_eq!(value["branchDeleted"], serde_json::json!(true));
+        assert_eq!(value["archived"], serde_json::json!(false));
+    }
+
+    /// Fresh plain repo + one chat worktree (`name` → branch/slug). Holds the
+    /// env lock for the duration of the creation only; the returned tempdir
+    /// keeps everything alive.
+    fn repo_with_worktree(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let _guard = WORKSPACE_WORKTREES_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe { std::env::remove_var("WORKSPACE_WORKTREES_DIR") };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        init_repo(&root);
+        let wt = create_chat_worktree(&root, name).expect("worktree created");
+        (tmp, root, PathBuf::from(wt.worktree_path))
+    }
+
+    fn commit_file(dir: &Path, file: &str) {
+        std::fs::write(dir.join(file), "x\n").unwrap();
+        run_git(dir, &["add", file]).unwrap();
+        run_git(dir, &["-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-q", "-m", file])
+            .unwrap();
+    }
+
+    #[test]
+    fn plan_clean_merged_worktree_is_closeable() {
+        let (_tmp, _root, wt) = repo_with_worktree("eng-7-clean");
+        let plan = plan_chat_closeout(&wt, false);
+        assert!(plan.is_worktree);
+        assert_eq!(plan.worktree_path, wt.to_string_lossy());
+        assert_eq!(plan.branch.as_deref(), Some("eng-7"));
+        assert_eq!(plan.default_branch.as_deref(), Some("main"));
+        assert!(!plan.chat_live);
+        // The `.workspace-root` marker is untracked but must not read as dirty.
+        assert!(!plan.dirty);
+        assert!(plan.dirty_files.is_empty());
+        assert_eq!(plan.unmerged_commits, 0);
+    }
+
+    #[test]
+    fn plan_reports_chat_live_as_given() {
+        let (_tmp, _root, wt) = repo_with_worktree("live-flag");
+        assert!(plan_chat_closeout(&wt, true).chat_live);
+    }
+
+    #[test]
+    fn plan_dirty_worktree_lists_files_capped() {
+        let (_tmp, _root, wt) = repo_with_worktree("dirty-one");
+        std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "n\n").unwrap();
+        let plan = plan_chat_closeout(&wt, false);
+        assert!(plan.dirty);
+        assert_eq!(plan.dirty_files.len(), 2);
+        assert!(plan.dirty_files.contains(&"README.md".to_string()));
+        assert!(plan.dirty_files.contains(&"new.txt".to_string()));
+
+        for i in 0..30 {
+            std::fs::write(wt.join(format!("bulk-{i:02}.txt")), "b\n").unwrap();
+        }
+        let plan = plan_chat_closeout(&wt, false);
+        assert_eq!(plan.dirty_files.len(), DIRTY_FILES_CAP);
+    }
+
+    #[test]
+    fn plan_counts_unmerged_commits() {
+        let (_tmp, _root, wt) = repo_with_worktree("ahead");
+        commit_file(&wt, "a.txt");
+        commit_file(&wt, "b.txt");
+        let plan = plan_chat_closeout(&wt, false);
+        assert!(plan.is_worktree);
+        assert!(!plan.dirty);
+        assert_eq!(plan.unmerged_commits, 2);
+    }
+
+    #[test]
+    fn plan_detached_worktree_has_null_branch_and_zero_unmerged() {
+        let (_tmp, _root, wt) = repo_with_worktree("detach-me");
+        run_git(&wt, &["checkout", "-q", "--detach"]).unwrap();
+        commit_file(&wt, "a.txt");
+        let plan = plan_chat_closeout(&wt, false);
+        assert!(plan.is_worktree);
+        assert_eq!(plan.branch, None);
+        assert_eq!(plan.unmerged_commits, 0);
+    }
+
+    #[test]
+    fn plan_non_worktree_cwd_is_not_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().canonicalize().unwrap().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plan = plan_chat_closeout(&plain, false);
+        assert!(!plan.is_worktree);
+        assert!(plan.dirty_files.is_empty());
+        assert_eq!(plan.unmerged_commits, 0);
+        assert_eq!(plan.branch, None);
+
+        // Missing path entirely.
+        assert!(!plan_chat_closeout(&plain.join("nope"), false).is_worktree);
+    }
+
+    #[test]
+    fn plan_main_working_tree_is_not_a_worktree_even_with_marker() {
+        let (_tmp, root, _wt) = repo_with_worktree("has-sibling");
+        // A stray marker in the main checkout must not make it closeable.
+        std::fs::write(root.join(".workspace-root"), "x\n").unwrap();
+        assert!(!plan_chat_closeout(&root, false).is_worktree);
+    }
+
+    #[test]
+    fn plan_linked_worktree_without_marker_is_not_a_worktree() {
+        let (_tmp, _root, wt) = repo_with_worktree("no-marker");
+        std::fs::remove_file(wt.join(".workspace-root")).unwrap();
+        assert!(!plan_chat_closeout(&wt, false).is_worktree);
+    }
+
+    #[test]
+    fn plan_subdirectory_of_a_worktree_is_not_a_worktree() {
+        let (_tmp, _root, wt) = repo_with_worktree("subdir");
+        let sub = wt.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".workspace-root"), "x\n").unwrap();
+        assert!(!plan_chat_closeout(&sub, false).is_worktree);
+    }
+
+    fn close_err(cwd: &Path, force: bool) -> String {
+        close_chat_worktree(cwd, force, false).unwrap_err().to_string()
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        run_git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+    }
+
+    #[test]
+    fn close_happy_path_removes_worktree_and_branch() {
+        let (_tmp, root, wt) = repo_with_worktree("happy-path");
+        let outcome = close_chat_worktree(&wt, false, false).expect("closed");
+        assert!(outcome.removed);
+        assert!(outcome.branch_deleted);
+        assert!(!outcome.archived, "archiving is the RPC layer's job");
+        assert!(!wt.exists());
+        assert!(!branch_exists(&root, "happy-path"));
+        assert!(branch_exists(&root, "main"));
+        // The main checkout is untouched.
+        assert!(root.join("README.md").exists());
+    }
+
+    #[test]
+    fn close_refuses_dirty_without_force_and_succeeds_with_force() {
+        let (_tmp, root, wt) = repo_with_worktree("dirty-close");
+        std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+        std::fs::write(wt.join("a.txt"), "a\n").unwrap();
+        std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+
+        let err = close_err(&wt, false);
+        assert!(err.contains("3 uncommitted files"), "{err}");
+        assert!(wt.exists(), "a refused close must leave the worktree alone");
+        assert!(wt.join(".workspace-root").exists(), "marker survives a refusal");
+        assert!(branch_exists(&root, "dirty-close"));
+
+        let outcome = close_chat_worktree(&wt, true, false).expect("forced close");
+        assert!(outcome.removed);
+        assert!(outcome.branch_deleted);
+        assert!(!wt.exists());
+        assert!(!branch_exists(&root, "dirty-close"));
+    }
+
+    #[test]
+    fn close_refuses_unmerged_without_force_and_force_deletes_the_branch() {
+        let (_tmp, root, wt) = repo_with_worktree("ahead-close");
+        commit_file(&wt, "a.txt");
+        commit_file(&wt, "b.txt");
+
+        let err = close_err(&wt, false);
+        assert!(err.contains("2 unmerged commits on ahead-close"), "{err}");
+        assert!(wt.exists());
+        assert!(branch_exists(&root, "ahead-close"));
+
+        let outcome = close_chat_worktree(&wt, true, false).expect("forced close");
+        assert!(outcome.removed && outcome.branch_deleted);
+        assert!(!branch_exists(&root, "ahead-close"));
+    }
+
+    #[test]
+    fn close_singular_wording() {
+        let (_tmp, _root, wt) = repo_with_worktree("one-ahead");
+        commit_file(&wt, "a.txt");
+        assert!(close_err(&wt, false).contains("1 unmerged commit on one-ahead"));
+        std::fs::write(wt.join("z.txt"), "z\n").unwrap();
+        assert!(close_err(&wt, false).contains("1 uncommitted file in"));
+    }
+
+    #[test]
+    fn close_refuses_a_live_chat_even_with_force() {
+        let (_tmp, _root, wt) = repo_with_worktree("live-close");
+        let err = close_chat_worktree(&wt, true, true).unwrap_err().to_string();
+        assert!(err.contains("live"), "{err}");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn close_refuses_a_non_worktree_and_the_main_working_tree_even_with_force() {
+        let (_tmp, root, _wt) = repo_with_worktree("sibling");
+        std::fs::write(root.join(".workspace-root"), "x\n").unwrap();
+        let err = close_err(&root, true);
+        assert!(err.contains("not a closeable agent worktree"), "{err}");
+        assert!(root.join(".git").exists());
+        assert!(branch_exists(&root, "main"));
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let err = close_err(tmp2.path(), true);
+        assert!(err.contains("not a closeable agent worktree"), "{err}");
+    }
+
+    #[test]
+    fn close_never_deletes_the_default_branch() {
+        let (_tmp, root, wt) = repo_with_worktree("make-room");
+        // Make `main` the declared default (origin/HEAD) while the owning repo
+        // sits on another branch, then put the linked worktree on `main`.
+        run_git(&root, &["update-ref", "refs/remotes/origin/main", "main"]).unwrap();
+        run_git(
+            &root,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        )
+        .unwrap();
+        run_git(&root, &["checkout", "-q", "-b", "elsewhere"]).unwrap();
+        run_git(&wt, &["checkout", "-q", "main"]).unwrap();
+
+        let plan = plan_chat_closeout(&wt, false);
+        assert_eq!(plan.branch.as_deref(), Some("main"));
+        assert_eq!(plan.default_branch.as_deref(), Some("main"));
+
+        for force in [false, true] {
+            let err = close_err(&wt, force);
+            assert!(err.contains("default branch"), "{err}");
+            assert!(wt.exists());
+            assert!(branch_exists(&root, "main"));
+        }
+    }
+
+    #[test]
+    fn close_detached_worktree_removes_it_without_touching_any_branch() {
+        let (_tmp, root, wt) = repo_with_worktree("detached-close");
+        run_git(&wt, &["checkout", "-q", "--detach"]).unwrap();
+        let outcome = close_chat_worktree(&wt, false, false).expect("closed");
+        assert!(outcome.removed);
+        assert!(!outcome.branch_deleted);
+        assert!(!wt.exists());
+        assert!(branch_exists(&root, "main"));
+        assert!(branch_exists(&root, "detached-close"), "not the worktree's checked-out branch");
     }
 }

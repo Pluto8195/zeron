@@ -176,12 +176,14 @@ pub fn compute_order<T: GroupKeyed>(rows: &[T], dim: GroupDimension) -> Vec<Stri
             keys.push(key);
         }
     }
-    keys.sort_by(|a, b| match (a.as_str() == NONE_KEY, b.as_str() == NONE_KEY) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (false, false) => a.cmp(b),
-    });
+    keys.sort_by(
+        |a, b| match (a.as_str() == NONE_KEY, b.as_str() == NONE_KEY) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.cmp(b),
+        },
+    );
     keys
 }
 
@@ -200,8 +202,11 @@ fn group_rows<T: GroupKeyed>(rows: Vec<T>, dim: GroupDimension) -> Vec<(String, 
     if order.is_empty() {
         return Vec::new();
     }
-    let index_of: HashMap<&str, usize> =
-        order.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
+    let index_of: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
     let fallback_index = order.len() - 1;
     let mut buckets: Vec<Vec<T>> = (0..order.len()).map(|_| Vec::new()).collect();
     for row in rows {
@@ -309,11 +314,36 @@ mod tests {
 
     fn sample_rows() -> Vec<Row> {
         vec![
-            Row { id: "a", category: "implementing", repo: "zeron", ticket: "ENG-1" },
-            Row { id: "b", category: "implementing", repo: "zeron", ticket: NONE_KEY },
-            Row { id: "c", category: "research", repo: "workspace", ticket: "ENG-1" },
-            Row { id: "d", category: "research", repo: "workspace", ticket: NONE_KEY },
-            Row { id: "e", category: "quirky_unrecognized", repo: NONE_KEY, ticket: "ENG-2" },
+            Row {
+                id: "a",
+                category: "implementing",
+                repo: "zeron",
+                ticket: "ENG-1",
+            },
+            Row {
+                id: "b",
+                category: "implementing",
+                repo: "zeron",
+                ticket: NONE_KEY,
+            },
+            Row {
+                id: "c",
+                category: "research",
+                repo: "workspace",
+                ticket: "ENG-1",
+            },
+            Row {
+                id: "d",
+                category: "research",
+                repo: "workspace",
+                ticket: NONE_KEY,
+            },
+            Row {
+                id: "e",
+                category: "quirky_unrecognized",
+                repo: NONE_KEY,
+                ticket: "ENG-2",
+            },
         ]
     }
 
@@ -375,9 +405,24 @@ mod tests {
         assert!(pos("pr_review") < pos("debug") && pos("debug") < pos("research"));
         assert_eq!(CATEGORY_ORDER.last(), Some(&"other"));
         let rows = vec![
-            Row { id: "a", category: "research", repo: "zeron", ticket: NONE_KEY },
-            Row { id: "b", category: "debug", repo: "zeron", ticket: NONE_KEY },
-            Row { id: "c", category: "not_a_category_yet", repo: "zeron", ticket: NONE_KEY },
+            Row {
+                id: "a",
+                category: "research",
+                repo: "zeron",
+                ticket: NONE_KEY,
+            },
+            Row {
+                id: "b",
+                category: "debug",
+                repo: "zeron",
+                ticket: NONE_KEY,
+            },
+            Row {
+                id: "c",
+                category: "not_a_category_yet",
+                repo: "zeron",
+                ticket: NONE_KEY,
+            },
         ];
         let Partition::Groups { groups, .. } = partition(rows, &[GroupDimension::Category]) else {
             panic!("expected Groups");
@@ -398,7 +443,10 @@ mod tests {
         };
         assert_eq!(*dimension, GroupDimension::Repo);
         let zeron_group = groups.iter().find(|g| g.key == "zeron").unwrap();
-        let Partition::Groups { dimension: inner_dim, groups: inner_groups } = &zeron_group.items
+        let Partition::Groups {
+            dimension: inner_dim,
+            groups: inner_groups,
+        } = &zeron_group.items
         else {
             panic!("expected nested Groups");
         };
@@ -414,13 +462,19 @@ mod tests {
             sample_rows(),
             &[GroupDimension::Ticket, GroupDimension::Repo],
         );
-        let Partition::Groups { dimension: outer_dim2, groups: outer_groups2 } = &ticket_then_repo
+        let Partition::Groups {
+            dimension: outer_dim2,
+            groups: outer_groups2,
+        } = &ticket_then_repo
         else {
             panic!("expected Groups");
         };
         assert_eq!(*outer_dim2, GroupDimension::Ticket);
         let eng1_group = outer_groups2.iter().find(|g| g.key == "ENG-1").unwrap();
-        let Partition::Groups { dimension: inner_dim2, groups: inner_groups2 } = &eng1_group.items
+        let Partition::Groups {
+            dimension: inner_dim2,
+            groups: inner_groups2,
+        } = &eng1_group.items
         else {
             panic!("expected nested Groups");
         };
@@ -435,13 +489,22 @@ mod tests {
         let mut ids_b = ids_in_order(&ticket_then_repo);
         ids_a.sort_unstable();
         ids_b.sort_unstable();
-        assert_eq!(ids_a, ids_b, "same underlying rows either way, only the nesting differs");
+        assert_eq!(
+            ids_a, ids_b,
+            "same underlying rows either way, only the nesting differs"
+        );
     }
 
     #[test]
     fn empty_rows_produce_no_groups_for_a_dynamic_dimension() {
         let result = partition(Vec::<Row>::new(), &[GroupDimension::Repo]);
-        assert_eq!(result, Partition::Groups { dimension: GroupDimension::Repo, groups: vec![] });
+        assert_eq!(
+            result,
+            Partition::Groups {
+                dimension: GroupDimension::Repo,
+                groups: vec![]
+            }
+        );
     }
 
     #[test]
@@ -452,6 +515,12 @@ mod tests {
         // still drops all of them. This exercises that path explicitly
         // rather than assuming it degrades gracefully.
         let result = partition(Vec::<Row>::new(), &[GroupDimension::Category]);
-        assert_eq!(result, Partition::Groups { dimension: GroupDimension::Category, groups: vec![] });
+        assert_eq!(
+            result,
+            Partition::Groups {
+                dimension: GroupDimension::Category,
+                groups: vec![]
+            }
+        );
     }
 }

@@ -154,7 +154,9 @@ pub fn pack_rects(items: &[PackItem], gap: f32) -> PackResult {
 
         let mut next: Vec<FreeRect> = Vec::new();
         for &fr in &free_rects {
-            if !rects_overlap(fr.x, fr.y, fr.w, fr.h, placed.x, placed.y, placed.w, placed.h) {
+            if !rects_overlap(
+                fr.x, fr.y, fr.w, fr.h, placed.x, placed.y, placed.w, placed.h,
+            ) {
                 next.push(fr);
                 continue;
             }
@@ -262,7 +264,11 @@ pub struct PositionedItem {
 /// before render).
 pub fn repair_overlaps(items: &[PositionedItem], gap: f32) -> HashMap<String, PackedPosition> {
     let mut order: Vec<&PositionedItem> = items.iter().collect();
-    order.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap().then(a.x.partial_cmp(&b.x).unwrap()));
+    order.sort_by(|a, b| {
+        a.y.partial_cmp(&b.y)
+            .unwrap()
+            .then(a.x.partial_cmp(&b.x).unwrap())
+    });
 
     struct Settled {
         x: f32,

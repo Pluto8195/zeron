@@ -46,13 +46,26 @@ async fn repairs_a_chat_left_over_by_the_old_pre_fix_import_path() {
     drop(store);
 
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/project".into()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/project".into()),
+        )
         .expect("create chat row");
     core.workspace
         .set_chat_harness_session(chat_id, "some-external-session-id", "/work/project");
 
-    let before = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
-    assert!(before.last_message_at.is_none(), "precondition: simulating the pre-fix broken state");
+    let before = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
+    assert!(
+        before.last_message_at.is_none(),
+        "precondition: simulating the pre-fix broken state"
+    );
 
     let repaired = core
         .external_import
@@ -60,7 +73,11 @@ async fn repairs_a_chat_left_over_by_the_old_pre_fix_import_path() {
         .expect("repair pass");
     assert_eq!(repaired, 1);
 
-    let after = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
+    let after = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
     assert_eq!(
         after.last_message_at.expect("stamped").timestamp_millis(),
         1_700_000_000_000,
@@ -68,7 +85,10 @@ async fn repairs_a_chat_left_over_by_the_old_pre_fix_import_path() {
          (a 'now' stamp would make every imported chat look freshly active and defeat \
          staleness detection entirely)"
     );
-    assert_eq!(after.last_message_preview.as_deref(), Some("hello from before the fix"));
+    assert_eq!(
+        after.last_message_preview.as_deref(),
+        Some("hello from before the fix")
+    );
 
     // Idempotent: a second pass finds nothing left to repair.
     let repaired_again = core
@@ -83,7 +103,11 @@ async fn repairs_a_chat_left_over_by_the_old_pre_fix_import_path() {
 #[tokio::test]
 async fn a_chat_with_no_harness_session_is_never_touched() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     // An ordinary Zeron-native chat (no harness_session_id at all) must be
     // left alone by this repair — it's scoped to external-session imports only.
@@ -97,7 +121,11 @@ async fn a_chat_with_no_harness_session_is_never_touched() {
         .expect("repair pass");
     assert_eq!(repaired, 0);
 
-    let chat = core.workspace.chat("native-chat").expect("read chat").expect("chat exists");
+    let chat = core
+        .workspace
+        .chat("native-chat")
+        .expect("read chat")
+        .expect("chat exists");
     assert!(chat.last_message_at.is_none());
 
     core.shutdown().await;

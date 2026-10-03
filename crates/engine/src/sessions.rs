@@ -236,6 +236,13 @@ impl SessionsEngine {
         let _ = self.inner.turn_listener.set(listener);
     }
 
+    /// Resolve a chat cwd exactly as run dispatch does. Non-agent surfaces
+    /// (terminal and command discovery) must not accidentally revive the old
+    /// behavior where project-less chats ran from the person's HOME.
+    pub(crate) fn resolve_cwd(&self, chat_id: &str, cwd: &str) -> Result<String, EngineError> {
+        resolve_run_cwd(&self.inner.journal, chat_id, cwd)
+    }
+
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
@@ -366,9 +373,13 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
-        // Project-less chats store cwd `~` (the creating device can't know the
-        // host's home); expand it here, on the host, where the run spawns.
-        request.cwd = expand_home(&request.cwd);
+        // Project-less chats store the portable marker `~` (the creating
+        // device cannot name a host-local path). Never expand that marker to
+        // the person's real HOME: agent startup and broad file tools would
+        // then probe Desktop/Documents/Music/Pictures and macOS attributes the
+        // privacy prompts to Zeron. Existing `~` chats migrate automatically
+        // to a stable per-chat Zeron-owned directory on their next dispatch.
+        request.cwd = resolve_run_cwd(&self.inner.journal, chat_id, &request.cwd)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -610,6 +621,14 @@ impl SessionsEngine {
     /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
     /// (bounded) for that settlement so callers observe a consistent doc.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        // An explicit Stop is terminal. A marker can survive from a prior
+        // graceful-restart recovery attempt, so clear it before interrupting
+        // to ensure the user's Stop is never auto-resumed on the next boot.
+        self.inner.journal.clear_graceful_restart(chat_id);
+        self.interrupt_preserving_restart(chat_id).await
+    }
+
+    async fn interrupt_preserving_restart(&self, chat_id: &str) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -666,23 +685,35 @@ impl SessionsEngine {
         Ok(true)
     }
 
-    /// Boot recovery: for every journal whose last event is not `Done` (a run died
-    /// mid-stream), stamp this device's abandoned `streaming` doc entries `aborted`
-    /// with a VISIBLE "Run interrupted by engine restart" error part, close the
-    /// journal with a synthetic `Done{interrupted}` — and then PICK THE RUN BACK
-    /// UP: a fresh crashed turn with revival budget left is re-dispatched against
-    /// the remembered harness session (zeron: "not just eulogized";
-    /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
+    /// Boot recovery: process journals whose last event is not `Done` (a run
+    /// died mid-stream), plus terminal interrupted journals carrying a fresh
+    /// graceful-restart marker. Stamp this device's abandoned `streaming` doc
+    /// entries `aborted` with a VISIBLE "Run interrupted by engine restart"
+    /// error part, close the journal with a synthetic `Done{interrupted}` — and
+    /// then PICK THE RUN BACK UP: a fresh interrupted turn with revival budget
+    /// left is re-dispatched against the remembered harness session (zeron:
+    /// "not just eulogized"; `MAX_AUTO_RESUME` = 3 consecutive revivals,
+    /// fresh = interrupted < 12h ago).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
 
         let stale = self.inner.journal.stale_sessions()?;
+        let mut recoverable: std::collections::BTreeSet<String> = stale.into_iter().collect();
+        recoverable.extend(self.inner.journal.graceful_restart_sessions()?);
         let mut recovered = 0usize;
-        for chat_id in stale {
+        for chat_id in recoverable {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }
+            let graceful_restart = self.inner.journal.graceful_restart_marked(&chat_id);
+            let graceful_restart_is_fresh = self
+                .inner
+                .journal
+                .graceful_restart_marked_at(&chat_id)
+                .is_some_and(|marked_at| {
+                    restart_marker_is_fresh(marked_at, now_ms(), RESUME_FRESH_MS)
+                });
             let handle = self.doc_handle(&chat_id)?;
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
@@ -708,7 +739,7 @@ impl SessionsEngine {
                     })
             });
             let attempts = self.inner.journal.resume_attempts(&chat_id);
-            let fresh = handle
+            let crashed_stream_is_fresh = handle
                 .doc()
                 .read_entries()
                 .ok()
@@ -720,7 +751,18 @@ impl SessionsEngine {
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
+            // Graceful shutdown has already finalized the streaming entry as
+            // aborted and appended a terminal Done, so neither of the normal
+            // crash signals survives. The marker is the durable evidence that
+            // this was an app restart rather than the user's Stop.
+            let fresh = crashed_stream_is_fresh || graceful_restart_is_fresh;
             let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+
+            if graceful_restart && !will_resume {
+                // Do not make every later boot reconsider an unrecoverable or
+                // exhausted restart forever.
+                self.inner.journal.clear_graceful_restart(&chat_id);
+            }
 
             let note = if will_resume {
                 "Run interrupted by engine restart — resuming"
@@ -801,11 +843,84 @@ impl SessionsEngine {
         Ok(recovered)
     }
 
+    /// Repair a completed journal turn whose durable transcript stops at its
+    /// user message. A crash used to be able to append terminal `Done` before
+    /// `finish_segment` committed the assistant entry; imported native chats
+    /// can have the same shape when their EOF assistant tail lags the cursor.
+    ///
+    /// This deliberately handles only the unambiguous shape: a hosted chat,
+    /// terminal completed journal, last doc entry is a user message older than
+    /// that journal, and the journal's final assistant id is absent. Replaying
+    /// it is idempotent by that provider id.
+    pub fn recover_completed_tails(&self) -> Result<usize, EngineError> {
+        let Some(workspace) = self.inner.workspace() else {
+            return Ok(0);
+        };
+        let mut recovered = 0usize;
+        for chat in workspace.read_chats()? {
+            if chat.device_id != self.inner.device_id {
+                continue;
+            }
+            let events = self.inner.journal.replay(&chat.id, 0)?;
+            let Some(tail) = completed_journal_tail(&events) else {
+                continue;
+            };
+            let handle = self.doc_handle(&chat.id)?;
+            let entries = handle.doc().read_entries()?;
+            let Some(last) = entries
+                .last()
+                .filter(|entry| entry.role == MessageRole::User)
+            else {
+                continue;
+            };
+            // A later user entry can legitimately sit after the journal's last
+            // completed turn (for example, a paused queue). Never attach the
+            // older response beneath that newer prompt.
+            if self
+                .inner
+                .journal
+                .modified_at_ms(&chat.id)
+                .is_some_and(|modified| last.created_at > modified)
+            {
+                continue;
+            }
+            if entries
+                .iter()
+                .any(|entry| entry.id == tail.assistant_message_id)
+            {
+                continue;
+            }
+            // Apply the same doc-boundary redaction/capping as the live writer;
+            // full tool output remains journal-only by policy.
+            let parts = render_parts(&tail.parts);
+            let text = folded_text(&parts);
+            handle.doc().push_message(&SessionMessageEntry {
+                id: tail.assistant_message_id.clone(),
+                role: MessageRole::Assistant,
+                parts,
+                created_at: last.created_at.saturating_add(1),
+                device_id: self.inner.device_id.clone(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })?;
+            self.inner.note_message(&chat.id, &text);
+            recovered += 1;
+            tracing::info!(chat = %chat.id, "recovered completed assistant tail from run journal");
+        }
+        Ok(recovered)
+    }
+
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
-            if let Err(err) = self.interrupt(&chat_id).await {
+            if self.turn_in_flight(&chat_id) {
+                self.inner.journal.mark_graceful_restart(&chat_id);
+            } else {
+                // A parked warm child has no turn to recover.
+                self.inner.journal.clear_graceful_restart(&chat_id);
+            }
+            if let Err(err) = self.interrupt_preserving_restart(&chat_id).await {
                 tracing::warn!(chat = %chat_id, error = %err, "shutdown interrupt failed");
             }
         }
@@ -1357,6 +1472,85 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
         .collect()
 }
 
+struct CompletedJournalTail {
+    assistant_message_id: String,
+    parts: Vec<MessagePart>,
+}
+
+/// Rebuild the journal's final completed top-level assistant segment. Provider
+/// completion ids are stable across transcript import and make the repair
+/// idempotent even though older live writers used an engine-minted doc id.
+fn completed_journal_tail(events: &[(u64, AgentEvent)]) -> Option<CompletedJournalTail> {
+    if !matches!(
+        events.last(),
+        Some((
+            _,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        ))
+    ) {
+        return None;
+    }
+    let after_previous_done = events[..events.len() - 1]
+        .iter()
+        .rposition(|(_, event)| matches!(event, AgentEvent::Done { .. }))
+        .map_or(0, |index| index + 1);
+    let turn = &events[after_previous_done..];
+    // A persistent harness can emit several turns without another
+    // SessionStarted; the latest Steered is authoritative. Otherwise use the
+    // first SessionStarted in this run (later re-emissions are not boundaries
+    // once content has folded).
+    let boundary = turn
+        .iter()
+        .rposition(|(_, event)| matches!(event, AgentEvent::Steered { .. }))
+        .or_else(|| {
+            turn.iter()
+                .position(|(_, event)| matches!(event, AgentEvent::SessionStarted { .. }))
+        })?;
+    let mut parts = Vec::new();
+    let mut fallback_id = None;
+    let mut completed_id = None;
+    for (_, event) in &turn[boundary..] {
+        match event {
+            AgentEvent::SessionStarted {
+                assistant_message_id,
+                ..
+            } => fallback_id = Some(assistant_message_id.clone()),
+            AgentEvent::Steered {
+                assistant_message_id,
+                next_assistant_message_id,
+            } => {
+                fallback_id = next_assistant_message_id
+                    .clone()
+                    .or_else(|| assistant_message_id.clone())
+            }
+            AgentEvent::AssistantMessageCompleted {
+                assistant_message_id,
+            } => completed_id = Some(assistant_message_id.clone()),
+            _ => {}
+        }
+        let skip_fold = matches!(event, AgentEvent::SessionStarted { .. }) && !parts.is_empty();
+        if !skip_fold {
+            fold_event_into_parts(&mut parts, event);
+        }
+    }
+    for part in &mut parts {
+        if let MessagePart::Input { resolved, .. } = part {
+            *resolved = true;
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let assistant_message_id = completed_id.or(fallback_id).filter(|id| !id.is_empty())?;
+    Some(CompletedJournalTail {
+        assistant_message_id,
+        parts,
+    })
+}
+
 /// The persisted assistant text of a folded segment (workspace preview source).
 fn folded_text(parts: &[MessagePart]) -> String {
     parts
@@ -1409,16 +1603,44 @@ fn finish_segment<'a>(
     }
 }
 
-/// `~` / `~/…` → this host's home directory. Anything else passes through.
-fn expand_home(cwd: &str) -> String {
-    match cwd.strip_prefix("~") {
-        Some("") => crate::repos::home_dir().to_string_lossy().into_owned(),
-        Some(rest) if rest.starts_with('/') => crate::repos::home_dir()
+/// Resolve the portable project-less marker and legacy persisted HOME values
+/// to a Zeron-owned per-chat directory. Explicit `~/some/path` values retain
+/// their conventional HOME expansion.
+fn resolve_run_cwd(journal: &RunJournal, chat_id: &str, cwd: &str) -> Result<String, EngineError> {
+    if matches!(cwd, "~" | "~/") {
+        return Ok(journal
+            .projectless_cwd(chat_id)?
+            .to_string_lossy()
+            .into_owned());
+    }
+    if let Some(rest) = cwd.strip_prefix('~').filter(|rest| rest.starts_with('/')) {
+        return Ok(crate::repos::home_dir()
             .join(&rest[1..])
             .to_string_lossy()
-            .into_owned(),
-        _ => cwd.to_string(),
+            .into_owned());
     }
+    if is_home_cwd(std::path::Path::new(cwd)) {
+        return Ok(journal
+            .projectless_cwd(chat_id)?
+            .to_string_lossy()
+            .into_owned());
+    }
+    Ok(cwd.to_string())
+}
+
+/// Old database rows contain the expanded HOME path. Also catch equivalent
+/// spellings and symlink aliases without treating a real child project as
+/// project-less.
+fn is_home_cwd(path: &std::path::Path) -> bool {
+    let home = crate::repos::home_dir();
+    if path == home {
+        return true;
+    }
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    path == home
 }
 
 /// Resume bookkeeping for one run task: which user entry the run answers (so
@@ -1576,7 +1798,8 @@ async fn drive_run(
     // so a PR URL found there stamps `created_in_chat` rather than the
     // weaker `mentioned`. Never pruned: a run's tool ids are unique and this
     // set is scoped to one run's lifetime anyway.
-    let mut pr_create_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pr_create_tool_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut seen_images = std::collections::HashSet::new();
     for entry in doc_ref.read_entries().unwrap_or_default() {
         for part in entry.parts {
@@ -2321,7 +2544,14 @@ async fn drive_run(
             _ => {}
         }
 
-        inner.publish(&chat_id, &event);
+        // Terminal Done is the journal's durable "this turn is complete"
+        // marker. Commit the assistant segment first so a process death can
+        // never leave a clean journal pointing at a user-only transcript.
+        // Non-terminal events retain journal-before-fold ordering.
+        let terminal_done = matches!(&event, AgentEvent::Done { .. });
+        if !terminal_done {
+            inner.publish(&chat_id, &event);
+        }
 
         // Defensive rule from zeron: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
@@ -2383,10 +2613,12 @@ async fn drive_run(
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
             }
+            inner.publish(&chat_id, &event);
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival
                 // budget: only consecutive crash-revive-crash cycles spend it.
                 inner.journal.clear_resume_attempts(&chat_id);
+                inner.journal.clear_graceful_restart(&chat_id);
             }
             // Exchange completed on an untitled chat → name it (fire-and-forget;
             // interrupted/errored turns never trigger naming).
@@ -2514,8 +2746,83 @@ async fn drive_run(
     }
 }
 
+fn restart_marker_is_fresh(marked_at: i64, now: i64, freshness_ms: i64) -> bool {
+    (0..freshness_ms).contains(&now.saturating_sub(marked_at)) && marked_at <= now
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_home_cwds_resolve_to_projectless_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path().join("journals")).unwrap();
+        let home = crate::repos::home_dir();
+        let expected = dir.path().join("projectless/chat-legacy-home");
+
+        for cwd in [
+            "~".to_string(),
+            "~/".to_string(),
+            home.to_string_lossy().into_owned(),
+            home.join(".").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                resolve_run_cwd(&journal, "chat-legacy-home", &cwd).unwrap(),
+                expected.to_string_lossy()
+            );
+        }
+        assert!(expected.is_dir());
+    }
+
+    #[test]
+    fn explicit_home_child_cwds_remain_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path().join("journals")).unwrap();
+        let home = crate::repos::home_dir();
+
+        assert_eq!(
+            resolve_run_cwd(&journal, "chat-project", "~/Projects/example").unwrap(),
+            home.join("Projects/example").to_string_lossy()
+        );
+        let absolute = home.join("Projects/example").to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_run_cwd(&journal, "chat-project", &absolute).unwrap(),
+            absolute
+        );
+    }
+
+    #[test]
+    fn restart_marker_freshness_rejects_old_and_future_markers() {
+        const HOUR: i64 = 60 * 60 * 1_000;
+        let now = 20 * HOUR;
+        assert!(super::restart_marker_is_fresh(now - HOUR, now, 12 * HOUR));
+        assert!(!super::restart_marker_is_fresh(
+            now - 13 * HOUR,
+            now,
+            12 * HOUR
+        ));
+        assert!(!super::restart_marker_is_fresh(now + HOUR, now, 12 * HOUR));
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_clears_a_restart_resume_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        journal.mark_graceful_restart("chat");
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+
+        assert!(!sessions.interrupt("chat").await.unwrap());
+        assert!(
+            !journal.graceful_restart_marked("chat"),
+            "an explicit Stop must never survive as restart work"
+        );
+    }
+
     #[test]
     fn cursor_without_a_session_id_retains_only_preceding_user_messages() {
         let doc = zeron_doc::SessionDoc::init("cursor-unstarted").unwrap();

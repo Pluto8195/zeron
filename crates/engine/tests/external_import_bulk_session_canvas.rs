@@ -50,7 +50,11 @@ async fn bulk_imports_every_session_and_carries_over_session_canvas_archive_stat
         std::env::set_var("HOME", fake_home.path());
     }
 
-    let projects_dir = fake_home.path().join(".claude").join("projects").join("proj-1");
+    let projects_dir = fake_home
+        .path()
+        .join(".claude")
+        .join("projects")
+        .join("proj-1");
     std::fs::create_dir_all(&projects_dir).expect("projects dir");
 
     let sessions = [
@@ -105,7 +109,10 @@ async fn bulk_imports_every_session_and_carries_over_session_canvas_archive_stat
     assert!(errors.is_empty(), "unexpected errors: {errors:?}");
 
     // A Start, one Item per candidate, and the Summary itself.
-    assert!(matches!(events.first(), Some(BulkImportEvent::Start { total: 3 })));
+    assert!(matches!(
+        events.first(),
+        Some(BulkImportEvent::Start { total: 3 })
+    ));
     let item_count = events
         .iter()
         .filter(|e| matches!(e, BulkImportEvent::Item { .. }))
@@ -141,7 +148,10 @@ async fn bulk_imports_every_session_and_carries_over_session_canvas_archive_stat
     else {
         panic!("expected a Summary event on the second run");
     };
-    assert_eq!(second_total, 0, "re-running should find nothing left to import");
+    assert_eq!(
+        second_total, 0,
+        "re-running should find nothing left to import"
+    );
     assert_eq!(second_imported, 0);
 
     core.shutdown().await;

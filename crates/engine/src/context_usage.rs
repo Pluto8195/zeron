@@ -55,6 +55,7 @@ use std::time::SystemTime;
 use loro::LoroDoc;
 use serde_json::Value;
 use zeron_doc::SessionDoc;
+use zeron_proto::HarnessId;
 use zeron_sync::DocsStore;
 
 use crate::EngineError;
@@ -177,7 +178,10 @@ impl ContextUsageProvider {
             return Ok(None); // corrupt/partial snapshot — not fatal here
         }
         let doc = SessionDoc::from_doc(loro);
-        Ok(doc.context_usage().and_then(|usage| usage.tokens).map(pct_from_tokens))
+        Ok(doc
+            .context_usage()
+            .and_then(|usage| usage.tokens)
+            .map(pct_from_tokens))
     }
 
     /// Fallback path's transcript resolution when the chat never went
@@ -187,16 +191,73 @@ impl ContextUsageProvider {
     /// hasn't landed yet this process. The empty-string "do not resume"
     /// tombstone (`WorkspaceHost::chat_harness_session`'s own contract)
     /// resolves to no session, same as having none at all.
-    fn resolve_from_harness_session(&self, workspace: &WorkspaceHost, chat_id: &str) -> Option<PathBuf> {
-        let (session_id, _cwd) = workspace.chat_harness_session(chat_id)?;
+    fn resolve_from_harness_session(
+        &self,
+        workspace: &WorkspaceHost,
+        chat_id: &str,
+    ) -> Option<PathBuf> {
+        let chat = workspace.chat(chat_id).ok()??;
+        let session_id = chat.harness_session_id?;
         if session_id.is_empty() {
             return None;
         }
-        self.resolve_transcript_path(&session_id)
+        match chat.config.map(|config| config.harness) {
+            Some(HarnessId::Codex) => self.resolve_codex_transcript_path(&session_id),
+            Some(HarnessId::ClaudeCode) => self.resolve_transcript_path(&session_id),
+            // Legacy rows may predate persisted chat config. Preserve the
+            // historical Claude lookup, then try Codex's date tree rather
+            // than making those sessions permanently unclassifiable.
+            _ => self
+                .resolve_transcript_path(&session_id)
+                .or_else(|| self.resolve_codex_transcript_path(&session_id)),
+        }
     }
 
     fn resolve_transcript_path(&self, session_id: &str) -> Option<PathBuf> {
         self.resolve_transcript_path_under(&default_projects_root(), session_id)
+    }
+
+    /// Codex stores rollouts below a date tree such as
+    /// `~/.codex/sessions/2026/10/01/rollout-...-<session-id>.jsonl`, unlike
+    /// Claude's single project-directory level. Keep this separate from the
+    /// Claude resolver so the latter's cheap, shallow lookup is unchanged.
+    fn resolve_codex_transcript_path(&self, session_id: &str) -> Option<PathBuf> {
+        self.resolve_codex_transcript_path_under(&default_codex_sessions_root(), session_id)
+    }
+
+    fn resolve_codex_transcript_path_under(
+        &self,
+        sessions_root: &Path,
+        session_id: &str,
+    ) -> Option<PathBuf> {
+        if let Some(path) = lock(&self.inner.session_paths).get(session_id) {
+            return Some(path.clone());
+        }
+        let suffix = format!("{session_id}.jsonl");
+        let mut dirs = vec![(sessions_root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() && depth < 3 {
+                    dirs.push((path, depth + 1));
+                } else if file_type.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(&suffix))
+                {
+                    lock(&self.inner.session_paths).insert(session_id.to_string(), path.clone());
+                    return Some(path);
+                }
+            }
+        }
+        None
     }
 
     /// Split out from [`Self::resolve_transcript_path`] so the resolution
@@ -207,7 +268,11 @@ impl ContextUsageProvider {
     /// "already imported" de-dupe relies on — so this stops at the first
     /// match rather than needing to reproduce Claude Code's own cwd → project
     /// directory name sanitization scheme.
-    fn resolve_transcript_path_under(&self, projects_root: &Path, session_id: &str) -> Option<PathBuf> {
+    fn resolve_transcript_path_under(
+        &self,
+        projects_root: &Path,
+        session_id: &str,
+    ) -> Option<PathBuf> {
         if let Some(path) = lock(&self.inner.session_paths).get(session_id) {
             return Some(path.clone());
         }
@@ -242,6 +307,13 @@ impl ContextUsageProvider {
 
 fn default_projects_root() -> PathBuf {
     crate::repos::home_dir().join(".claude").join("projects")
+}
+
+fn default_codex_sessions_root() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::repos::home_dir().join(".codex"))
+        .join("sessions")
 }
 
 /// The most recent NON-sidechain `assistant` message's summed
@@ -343,7 +415,11 @@ mod tests {
         assert_eq!(pct_from_tokens(0), 0.0);
         assert_eq!(pct_from_tokens(100_000), 0.5);
         assert_eq!(pct_from_tokens(200_000), 1.0);
-        assert_eq!(pct_from_tokens(400_000), 1.0, "must cap at 1.0, never exceed it");
+        assert_eq!(
+            pct_from_tokens(400_000),
+            1.0,
+            "must cap at 1.0, never exceed it"
+        );
     }
 
     #[test]
@@ -374,7 +450,8 @@ mod tests {
 
     #[test]
     fn parse_assistant_usage_line_excludes_sidechain_subagent_lines() {
-        let line = r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":999}}}"#;
+        let line =
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":999}}}"#;
         assert_eq!(
             parse_assistant_usage_line(line),
             None,
@@ -469,7 +546,8 @@ mod tests {
         // under the SAME root (proves it read from `session_paths`, not disk,
         // on the second call).
         let missing_root = tempfile::tempdir().unwrap();
-        let found_again = provider.resolve_transcript_path_under(missing_root.path(), "session-abc");
+        let found_again =
+            provider.resolve_transcript_path_under(missing_root.path(), "session-abc");
         assert_eq!(found_again.as_deref(), Some(transcript.as_path()));
     }
 
@@ -488,6 +566,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_codex_transcript_path_under_walks_the_date_tree() {
+        let provider = ContextUsageProvider::new(Arc::new(
+            DocsStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let transcript = root
+            .path()
+            .join("2026/10/01")
+            .join("rollout-2026-10-01T09-58-03-session-abc.jsonl");
+        write(&transcript, "{}\n");
+
+        let found = provider.resolve_codex_transcript_path_under(root.path(), "session-abc");
+        assert_eq!(found.as_deref(), Some(transcript.as_path()));
+    }
+
+    #[test]
     fn tail_pct_caches_by_mtime_and_reflects_a_real_content_change() {
         let provider = ContextUsageProvider::new(Arc::new(
             DocsStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
@@ -502,8 +596,15 @@ mod tests {
         // Same mtime (file untouched): a cache-poisoning direct overwrite of
         // the cached tokens must still be served back — proves the mtime
         // check, not a fresh read, decided this.
-        lock(&provider.inner.tail_cache).get_mut(&path).unwrap().tokens = Some(999_999_999);
-        assert_eq!(provider.tail_pct(&path), Some(1.0), "must serve the cached value, not re-read");
+        lock(&provider.inner.tail_cache)
+            .get_mut(&path)
+            .unwrap()
+            .tokens = Some(999_999_999);
+        assert_eq!(
+            provider.tail_pct(&path),
+            Some(1.0),
+            "must serve the cached value, not re-read"
+        );
 
         // Bump mtime forward and change content: must re-read and get the
         // new value, not the stale cached one.
@@ -526,7 +627,8 @@ mod tests {
         let store = Arc::new(DocsStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let chat_id = "chat-1";
         let doc = SessionDoc::init(chat_id).unwrap();
-        doc.update_context_usage(Some(60_000), Some(1_000_000)).unwrap();
+        doc.update_context_usage(Some(60_000), Some(1_000_000))
+            .unwrap();
         let bytes = doc.export_snapshot().unwrap();
         store
             .save_snapshot_with_cursor(chat_id, &bytes, 0, crate::chat2_host::CHAT2_DOC_EPOCH)
@@ -535,7 +637,10 @@ mod tests {
         let provider = ContextUsageProvider::new(store);
         // Fixed 200k divisor, NOT the doc's own recorded 1_000_000 window —
         // the whole point of not reusing `ContextUsage::fraction()`.
-        assert_eq!(provider.live_pct(chat_id).unwrap(), Some(pct_from_tokens(60_000)));
+        assert_eq!(
+            provider.live_pct(chat_id).unwrap(),
+            Some(pct_from_tokens(60_000))
+        );
     }
 
     #[test]

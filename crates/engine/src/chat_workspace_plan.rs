@@ -70,12 +70,26 @@ const NEEDS_WORKTREE_INSTRUCTIONS: &str = "Will completing this task require mod
 /// Imperative code words → `needsWorktree: true` in the fallback heuristic.
 /// Ticket brief's own list, not ported from the reference tool.
 const IMPERATIVE_CODE_WORDS: &[&str] = &[
-    "implement", "fix", "add", "refactor", "build", "update", "migrate", "write",
+    "implement",
+    "fix",
+    "add",
+    "refactor",
+    "build",
+    "update",
+    "migrate",
+    "write",
 ];
 /// Investigation words → `needsWorktree: false`, but only when no code word
 /// also matched (code words win ties — see [`heuristic_needs_worktree`]).
 const INVESTIGATION_WORDS: &[&str] = &[
-    "why", "how", "investigate", "explain", "find", "look", "research", "what",
+    "why",
+    "how",
+    "investigate",
+    "explain",
+    "find",
+    "look",
+    "research",
+    "what",
 ];
 
 /// Where a `PLAN_CHAT_WORKSPACE` judgment came from — the RPC's `source`
@@ -104,7 +118,11 @@ pub struct WorkspacePlan {
 /// for a future cwd-aware refinement (e.g. "already inside a worktree"); the
 /// judgment itself is message-only today, same as it would be phrased to
 /// Jev, and the heuristic never inspects `cwd` either.
-pub async fn plan_chat_workspace(http: &reqwest::Client, message: &str, _cwd: &str) -> WorkspacePlan {
+pub async fn plan_chat_workspace(
+    http: &reqwest::Client,
+    message: &str,
+    _cwd: &str,
+) -> WorkspacePlan {
     if let Some(probability) = ask_jev_needs_worktree(http, message).await {
         return WorkspacePlan {
             needs_worktree: probability >= 0.5,
@@ -124,7 +142,9 @@ pub async fn plan_chat_workspace(http: &reqwest::Client, message: &str, _cwd: &s
 /// tool's `classify_with_typesafe`/`classify_validity_with_typesafe` contract
 /// of never raising past a failed TypeSafe call.
 async fn ask_jev_needs_worktree(http: &reqwest::Client, message: &str) -> Option<f64> {
-    let api_key = std::env::var("TYPESAFE_API_KEY").ok().filter(|s| !s.is_empty())?;
+    let api_key = std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     let payload = build_jev_payload(message);
     let call = async {
         let response = http
@@ -238,8 +258,9 @@ pub fn create_chat_worktree(repo_path: &Path, name: &str) -> Result<ChatWorktree
         ));
     }
 
-    let repo_toplevel = git_toplevel(repo_path)
-        .ok_or_else(|| EngineError::Other(format!("not a git repository: {}", repo_path.display())))?;
+    let repo_toplevel = git_toplevel(repo_path).ok_or_else(|| {
+        EngineError::Other(format!("not a git repository: {}", repo_path.display()))
+    })?;
     let (superproject_root, label) = match superproject_working_tree(repo_path) {
         Some(super_root) => {
             let label = repo_toplevel
@@ -252,7 +273,11 @@ pub fn create_chat_worktree(repo_path: &Path, name: &str) -> Result<ChatWorktree
     };
 
     let worktrees_base = worktrees_base_dir(&superproject_root)?;
-    assert_outside_submodules(&worktrees_base, &superproject_root, "WORKSPACE_WORKTREES_DIR")?;
+    assert_outside_submodules(
+        &worktrees_base,
+        &superproject_root,
+        "WORKSPACE_WORKTREES_DIR",
+    )?;
 
     let candidate = normalize_path(&worktrees_base.join(&label).join(&slug));
     assert_outside_submodules(&candidate, &superproject_root, "worktree target")?;
@@ -263,8 +288,9 @@ pub fn create_chat_worktree(repo_path: &Path, name: &str) -> Result<ChatWorktree
         )));
     }
 
-    let default_branch = default_branch(&repo_toplevel)
-        .ok_or_else(|| EngineError::Other("could not resolve the repository's default branch".into()))?;
+    let default_branch = default_branch(&repo_toplevel).ok_or_else(|| {
+        EngineError::Other("could not resolve the repository's default branch".into())
+    })?;
 
     if let Some(parent) = candidate.parent() {
         std::fs::create_dir_all(parent)?;
@@ -467,7 +493,8 @@ pub fn plan_chat_closeout(cwd: &Path, chat_live: bool) -> CloseoutPlan {
 
 fn inspect_worktree(cwd: &Path, chat_live: bool) -> Inspection {
     let worktree_path = normalize_path(cwd).to_string_lossy().into_owned();
-    let reject = |reason: &str| not_a_worktree(worktree_path.clone(), chat_live, reason.to_string());
+    let reject =
+        |reason: &str| not_a_worktree(worktree_path.clone(), chat_live, reason.to_string());
 
     if !cwd.join(WORKSPACE_ROOT_MARKER).is_file() {
         return reject("it has no .workspace-root file, so it is not an agent worktree");
@@ -491,7 +518,10 @@ fn inspect_worktree(cwd: &Path, chat_live: bool) -> Inspection {
     }
     // `<repo>/.git` → `<repo>`; a bare repo's common dir is the repo itself.
     let repo = if common_dir.file_name().is_some_and(|n| n == ".git") {
-        common_dir.parent().map(Path::to_path_buf).unwrap_or(common_dir.clone())
+        common_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(common_dir.clone())
     } else {
         common_dir.clone()
     };
@@ -608,7 +638,10 @@ pub fn close_chat_worktree(
         return refuse(format!(
             "not a closeable agent worktree: {}: {}",
             inspection.plan.worktree_path,
-            inspection.reject_reason.as_deref().unwrap_or("unknown reason")
+            inspection
+                .reject_reason
+                .as_deref()
+                .unwrap_or("unknown reason")
         ));
     };
     if canonical == repo {
@@ -811,7 +844,10 @@ fn normalize_path(path: &Path) -> PathBuf {
     for component in path.components() {
         match component {
             Component::ParentDir => {
-                if !matches!(out.components().next_back(), None | Some(Component::RootDir)) {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir)
+                ) {
                     out.pop();
                 }
             }
@@ -846,12 +882,16 @@ mod tests {
 
     #[test]
     fn heuristic_true_on_ticket_id_hit() {
-        assert!(heuristic_needs_worktree("investigate why eng-2715 is failing"));
+        assert!(heuristic_needs_worktree(
+            "investigate why eng-2715 is failing"
+        ));
     }
 
     #[test]
     fn heuristic_true_on_imperative_code_words() {
-        assert!(heuristic_needs_worktree("please implement the new login flow"));
+        assert!(heuristic_needs_worktree(
+            "please implement the new login flow"
+        ));
         assert!(heuristic_needs_worktree("fix the flaky test"));
         assert!(heuristic_needs_worktree("add a retry to the uploader"));
         assert!(heuristic_needs_worktree("refactor the session cache"));
@@ -870,9 +910,15 @@ mod tests {
         assert!(!heuristic_needs_worktree("how does the auth flow work"));
         assert!(!heuristic_needs_worktree("investigate the memory leak"));
         assert!(!heuristic_needs_worktree("explain this error message"));
-        assert!(!heuristic_needs_worktree("find where this constant is defined"));
-        assert!(!heuristic_needs_worktree("look at the logs for this request"));
-        assert!(!heuristic_needs_worktree("research alternatives to this library"));
+        assert!(!heuristic_needs_worktree(
+            "find where this constant is defined"
+        ));
+        assert!(!heuristic_needs_worktree(
+            "look at the logs for this request"
+        ));
+        assert!(!heuristic_needs_worktree(
+            "research alternatives to this library"
+        ));
         assert!(!heuristic_needs_worktree("what does this function return"));
     }
 
@@ -916,10 +962,18 @@ mod tests {
         assert_eq!(payload["model"], serde_json::json!("jev-latest"));
         let state: serde_json::Value =
             serde_json::from_str(payload["state"].as_str().unwrap()).unwrap();
-        assert_eq!(state["first_message"], serde_json::json!("fix the login bug"));
+        assert_eq!(
+            state["first_message"],
+            serde_json::json!("fix the login bug")
+        );
         let question = &payload["questions"]["needs_worktree"];
         assert_eq!(question["type"], serde_json::json!("noul"));
-        assert!(question["instructions"].as_str().unwrap().contains("modifying files"));
+        assert!(
+            question["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("modifying files")
+        );
         assert!(question["criteria"]["true"].is_string());
         assert!(question["criteria"]["false"].is_string());
     }
@@ -1028,7 +1082,10 @@ mod tests {
     #[test]
     fn kebab_case_sanitizes_free_text() {
         assert_eq!(kebab_case("Fix the Login Bug!!"), "fix-the-login-bug");
-        assert_eq!(kebab_case("  leading and trailing  "), "leading-and-trailing");
+        assert_eq!(
+            kebab_case("  leading and trailing  "),
+            "leading-and-trailing"
+        );
         assert_eq!(kebab_case("snake_case_name"), "snake-case-name");
         assert_eq!(kebab_case("already-kebab-case"), "already-kebab-case");
         assert_eq!(kebab_case("Multiple   Spaces"), "multiple-spaces");
@@ -1098,7 +1155,14 @@ mod tests {
         assert!(err.to_string().contains("submodule"));
 
         // A sibling of the submodule (not nested under it) is fine.
-        assert!(assert_outside_submodules(&root.join(".worktrees").join("workspace").join("x"), &root, "worktree target").is_ok());
+        assert!(
+            assert_outside_submodules(
+                &root.join(".worktrees").join("workspace").join("x"),
+                &root,
+                "worktree target"
+            )
+            .is_ok()
+        );
     }
 
     /// `WORKSPACE_WORKTREES_DIR` is process-global state, and Rust runs
@@ -1122,13 +1186,23 @@ mod tests {
 
         let outcome = create_chat_worktree(&root, "Fix the login bug").expect("worktree created");
         assert_eq!(outcome.branch, "fix-the-login-bug");
-        let expected = root.join(".worktrees").join("workspace").join("fix-the-login-bug");
+        let expected = root
+            .join(".worktrees")
+            .join("workspace")
+            .join("fix-the-login-bug");
         assert_eq!(PathBuf::from(&outcome.worktree_path), expected);
         assert!(expected.join(".git").exists());
         let workspace_root = std::fs::read_to_string(expected.join(".workspace-root")).unwrap();
         assert_eq!(workspace_root.trim_end(), root.to_string_lossy());
         // Never a symlink.
-        assert!(!expected.join(".workspace-root").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            !expected
+                .join(".workspace-root")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     /// Plain repo (as `init_repo` builds) plus: tracked `.claude/agents/x.md`,
@@ -1148,7 +1222,11 @@ mod tests {
         std::fs::write(claude.join("agents/x.md"), "locally edited agent\n").unwrap();
         std::fs::create_dir_all(claude.join("skills/y")).unwrap();
         std::fs::write(claude.join("skills/y/SKILL.md"), "untracked skill\n").unwrap();
-        std::fs::write(claude.join("skills/tracked/extra.md"), "untracked sibling\n").unwrap();
+        std::fs::write(
+            claude.join("skills/tracked/extra.md"),
+            "untracked sibling\n",
+        )
+        .unwrap();
         std::fs::write(claude.join("settings.local.json"), "{}\n").unwrap();
         std::fs::write(claude.join("skills/y/notes.local.md"), "local\n").unwrap();
     }
@@ -1168,7 +1246,10 @@ mod tests {
         let claude = wt.join(".claude");
 
         // Tracked files: git's content, not the source's dirty working copy.
-        assert_eq!(std::fs::read_to_string(claude.join("agents/x.md")).unwrap(), "git agent\n");
+        assert_eq!(
+            std::fs::read_to_string(claude.join("agents/x.md")).unwrap(),
+            "git agent\n"
+        );
         assert_eq!(
             std::fs::read_to_string(claude.join("skills/tracked/SKILL.md")).unwrap(),
             "git skill\n"
@@ -1186,7 +1267,14 @@ mod tests {
         assert!(!claude.join("settings.local.json").exists());
         assert!(!claude.join("skills/y/notes.local.md").exists());
         // Plain files, never symlinks.
-        assert!(!claude.join("skills/y/SKILL.md").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            !claude
+                .join("skills/y/SKILL.md")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         // The seeded (untracked) config doesn't make the fresh worktree dirty.
         assert!(!plan_chat_closeout(&wt, false).dirty);
     }
@@ -1202,7 +1290,11 @@ mod tests {
         init_repo(&root);
 
         let outcome = create_chat_worktree(&root, "no claude").expect("worktree created");
-        assert!(!PathBuf::from(outcome.worktree_path).join(".claude").exists());
+        assert!(
+            !PathBuf::from(outcome.worktree_path)
+                .join(".claude")
+                .exists()
+        );
     }
 
     #[test]
@@ -1276,7 +1368,10 @@ mod tests {
             ]
         );
         assert_eq!(value["isWorktree"], serde_json::json!(true));
-        assert_eq!(value["worktreePath"], serde_json::json!("/r/.worktrees/workspace/eng-1"));
+        assert_eq!(
+            value["worktreePath"],
+            serde_json::json!("/r/.worktrees/workspace/eng-1")
+        );
         assert_eq!(value["branch"], serde_json::json!("eng-1"));
         assert_eq!(value["chatLive"], serde_json::json!(false));
         assert_eq!(value["dirty"], serde_json::json!(true));
@@ -1302,7 +1397,12 @@ mod tests {
             archived: false,
         })
         .unwrap();
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["archived", "branchDeleted", "removed"]);
         assert_eq!(value["removed"], serde_json::json!(true));
@@ -1328,8 +1428,20 @@ mod tests {
     fn commit_file(dir: &Path, file: &str) {
         std::fs::write(dir.join(file), "x\n").unwrap();
         run_git(dir, &["add", file]).unwrap();
-        run_git(dir, &["-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-q", "-m", file])
-            .unwrap();
+        run_git(
+            dir,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "-m",
+                file,
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1433,11 +1545,22 @@ mod tests {
     }
 
     fn close_err(cwd: &Path, force: bool) -> String {
-        close_chat_worktree(cwd, force, false).unwrap_err().to_string()
+        close_chat_worktree(cwd, force, false)
+            .unwrap_err()
+            .to_string()
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
-        run_git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+        run_git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok()
     }
 
     #[test]
@@ -1464,7 +1587,10 @@ mod tests {
         let err = close_err(&wt, false);
         assert!(err.contains("3 uncommitted files"), "{err}");
         assert!(wt.exists(), "a refused close must leave the worktree alone");
-        assert!(wt.join(".workspace-root").exists(), "marker survives a refusal");
+        assert!(
+            wt.join(".workspace-root").exists(),
+            "marker survives a refusal"
+        );
         assert!(branch_exists(&root, "dirty-close"));
 
         let outcome = close_chat_worktree(&wt, true, false).expect("forced close");
@@ -1502,7 +1628,9 @@ mod tests {
     #[test]
     fn close_refuses_a_live_chat_even_with_force() {
         let (_tmp, _root, wt) = repo_with_worktree("live-close");
-        let err = close_chat_worktree(&wt, true, true).unwrap_err().to_string();
+        let err = close_chat_worktree(&wt, true, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("live"), "{err}");
         assert!(wt.exists());
     }
@@ -1529,7 +1657,11 @@ mod tests {
         run_git(&root, &["update-ref", "refs/remotes/origin/main", "main"]).unwrap();
         run_git(
             &root,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
         )
         .unwrap();
         run_git(&root, &["checkout", "-q", "-b", "elsewhere"]).unwrap();
@@ -1556,6 +1688,9 @@ mod tests {
         assert!(!outcome.branch_deleted);
         assert!(!wt.exists());
         assert!(branch_exists(&root, "main"));
-        assert!(branch_exists(&root, "detached-close"), "not the worktree's checked-out branch");
+        assert!(
+            branch_exists(&root, "detached-close"),
+            "not the worktree's checked-out branch"
+        );
     }
 }

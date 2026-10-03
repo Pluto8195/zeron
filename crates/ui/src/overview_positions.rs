@@ -81,7 +81,11 @@ pub fn save_string_set(data_dir: &Path, file_name: &str, set: &BTreeSet<String>)
 
 /// Temp file + rename so a crash mid-write never corrupts the file, matching
 /// `SettingsStore::save`'s idiom.
-fn write_json_atomic<T: serde::Serialize>(data_dir: &Path, dest: &Path, value: &T) -> io::Result<()> {
+fn write_json_atomic<T: serde::Serialize>(
+    data_dir: &Path,
+    dest: &Path,
+    value: &T,
+) -> io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
     let tmp = dest.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(value)

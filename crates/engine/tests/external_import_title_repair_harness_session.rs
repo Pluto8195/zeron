@@ -56,13 +56,22 @@ async fn repair_resolves_a_cursor_less_chat_via_its_harness_session() {
     }
 
     let session_id = "29fd48ab-0258-4406-b725-26265045e05f";
-    let project_dir = fake_home.path().join(".claude").join("projects").join("proj-1");
+    let project_dir = fake_home
+        .path()
+        .join(".claude")
+        .join("projects")
+        .join("proj-1");
     std::fs::create_dir_all(&project_dir).expect("project dir");
     let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
     std::fs::write(
         &transcript_path,
         transcript_with_lines(vec![
-            user_line(session_id, "u1", "/work/zeron", "review the zeron fork changes"),
+            user_line(
+                session_id,
+                "u1",
+                "/work/zeron",
+                "review the zeron fork changes",
+            ),
             assistant_ack_line(session_id, "a1", "u1", "/work/zeron"),
         ]),
     )
@@ -71,31 +80,62 @@ async fn repair_resolves_a_cursor_less_chat_via_its_harness_session() {
     // The registry entry a real "review-zeron-fork" launch would have left —
     // keyed by the chat's own (harness) session id, same as the cursor-based
     // case.
-    let registry_dir = fake_home.path().join(".config").join("agent-mode").join("session-ids");
+    let registry_dir = fake_home
+        .path()
+        .join(".config")
+        .join("agent-mode")
+        .join("session-ids");
     std::fs::create_dir_all(&registry_dir).expect("registry dir");
-    std::fs::write(registry_dir.join("review-zeron-fork.session-id"), format!("{session_id}\n"))
-        .expect("write registry entry");
+    std::fs::write(
+        registry_dir.join("review-zeron-fork.session-id"),
+        format!("{session_id}\n"),
+    )
+    .expect("write registry entry");
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(EngineProfile::development(data_dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        data_dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let chat_id = "5c2fbb5f-cda0-42d5-9215-7f28ad99e4d9";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/zeron".to_string()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/zeron".to_string()),
+        )
         .expect("create chat");
-    core.workspace.set_chat_harness_session(chat_id, session_id, "/work/zeron");
+    core.workspace
+        .set_chat_harness_session(chat_id, session_id, "/work/zeron");
 
     assert!(
-        core.external_import.transcript_path_for(chat_id).expect("transcript_path_for").is_none(),
+        core.external_import
+            .transcript_path_for(chat_id)
+            .expect("transcript_path_for")
+            .is_none(),
         "this chat must have no import cursor for this test to exercise the fix"
     );
-    assert!(core.workspace.chat(chat_id).expect("read").expect("exists").title.is_none());
+    assert!(
+        core.workspace
+            .chat(chat_id)
+            .expect("read")
+            .expect("exists")
+            .title
+            .is_none()
+    );
 
     let repaired = core
         .external_import
         .repair_missing_titles(&core.context_usage)
         .expect("repair pass");
-    assert_eq!(repaired, 1, "the cursor-less chat with a harness session must now be resolved");
+    assert_eq!(
+        repaired, 1,
+        "the cursor-less chat with a harness session must now be resolved"
+    );
 
     let chat_after = core.workspace.chat(chat_id).expect("read").expect("exists");
     assert_eq!(chat_after.title.as_deref(), Some("zeron-fork"));

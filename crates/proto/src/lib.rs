@@ -7,6 +7,7 @@ pub mod agent;
 pub mod entities;
 pub mod motion;
 pub mod preview;
+pub mod repository_topology;
 pub mod sidebar_pins;
 pub mod view;
 pub mod workspace;
@@ -14,6 +15,7 @@ pub mod workspace;
 pub use agent::*;
 pub use entities::*;
 pub use preview::*;
+pub use repository_topology::*;
 pub use sidebar_pins::*;
 pub use workspace::*;
 

@@ -1,4 +1,4 @@
-//! The new-chat "worktree" chip: `Auto` / `Worktree` / `Main checkout`.
+//! The new-chat "worktree" chip: `Main checkout` / `Worktree` / `Auto`.
 //!
 //! Only shown on the blank new-session canvas, before the first send. On that
 //! send the composer runs a short pre-dispatch step (see `Composer::send`):
@@ -15,34 +15,35 @@ use serde_json::Value;
 
 use crate::theme::Theme;
 
-/// `{message, cwd}` → `{needsWorktree, probability, source}` (IPC-only).
-pub use zeron_rpc::methods::PLAN_CHAT_WORKSPACE;
 /// `{chatId, repoPath, name}` → `{worktreePath, branch}`; on success the
 /// engine has already stamped the chat's cwd (IPC-only).
 pub use zeron_rpc::methods::CREATE_CHAT_WORKTREE;
+/// `{message, cwd}` → `{needsWorktree, probability, source}` (IPC-only).
+pub use zeron_rpc::methods::PLAN_CHAT_WORKSPACE;
 
 /// Classifier budget (the engine caps Jev at ~3s; headroom for IPC).
 pub const PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `git worktree add` is ~1s; generous headroom for a cold repo.
 pub const CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// The draft pick. Always `Auto` for a fresh new-chat canvas — an explicit
-/// pick is one-shot and never persisted.
+/// The draft pick. Fresh chats stay in the project's main checkout unless the
+/// user explicitly chooses `Worktree` or `Auto`; a pick is one-shot and never
+/// persisted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkspaceChoice {
-    #[default]
     Auto,
     Worktree,
+    #[default]
     MainCheckout,
 }
 
 impl WorkspaceChoice {
-    /// Click cycles Auto → Worktree → Main checkout → Auto.
+    /// Click cycles Main checkout → Worktree → Auto → Main checkout.
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::Worktree,
-            Self::Worktree => Self::MainCheckout,
-            Self::MainCheckout => Self::Auto,
+            Self::MainCheckout => Self::Worktree,
+            Self::Worktree => Self::Auto,
+            Self::Auto => Self::MainCheckout,
         }
     }
 
@@ -145,7 +146,13 @@ pub fn decode_worktree(value: &Value) -> Result<WorktreeReply, String> {
 /// A PLAN failure (timeout, old engine without the method) quietly falls
 /// back to the main checkout — Auto never blocks a send on the classifier.
 pub fn should_create_after_plan(plan: &Result<PlanReply, String>) -> bool {
-    matches!(plan, Ok(PlanReply { needs_worktree: true, .. }))
+    matches!(
+        plan,
+        Ok(PlanReply {
+            needs_worktree: true,
+            ..
+        })
+    )
 }
 
 /// What the send does with a `CREATE_CHAT_WORKTREE` result.
@@ -160,10 +167,7 @@ pub struct CreateResolution {
     pub failure: Option<String>,
 }
 
-pub fn resolve_create(
-    result: Result<Value, String>,
-    plan: Option<PlanReply>,
-) -> CreateResolution {
+pub fn resolve_create(result: Result<Value, String>, plan: Option<PlanReply>) -> CreateResolution {
     match result.and_then(|value| decode_worktree(&value)) {
         Ok(reply) => CreateResolution {
             cwd: Some(reply.worktree_path),
@@ -311,7 +315,11 @@ pub fn slug_first_words(text: &str, words: usize) -> String {
         .take(words)
     {
         let word = word.to_ascii_lowercase();
-        let extra = if out.is_empty() { word.len() } else { word.len() + 1 };
+        let extra = if out.is_empty() {
+            word.len()
+        } else {
+            word.len() + 1
+        };
         if !out.is_empty() && out.len() + extra > 40 {
             break;
         }
@@ -360,15 +368,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn choice_cycles_and_defaults_to_auto() {
-        assert_eq!(WorkspaceChoice::default(), WorkspaceChoice::Auto);
-        let c = WorkspaceChoice::Auto;
+    fn choice_cycles_and_defaults_to_main_checkout() {
+        assert_eq!(WorkspaceChoice::default(), WorkspaceChoice::MainCheckout);
+        let c = WorkspaceChoice::MainCheckout;
         assert_eq!(c.next(), WorkspaceChoice::Worktree);
-        assert_eq!(c.next().next(), WorkspaceChoice::MainCheckout);
-        assert_eq!(c.next().next().next(), WorkspaceChoice::Auto);
+        assert_eq!(c.next().next(), WorkspaceChoice::Auto);
+        assert_eq!(c.next().next().next(), WorkspaceChoice::MainCheckout);
         assert_eq!(WorkspaceChoice::Auto.first_step(), PreSendStep::Plan);
         assert_eq!(WorkspaceChoice::Worktree.first_step(), PreSendStep::Create);
-        assert_eq!(WorkspaceChoice::MainCheckout.first_step(), PreSendStep::None);
+        assert_eq!(
+            WorkspaceChoice::MainCheckout.first_step(),
+            PreSendStep::None
+        );
     }
 
     #[test]
@@ -391,7 +402,10 @@ mod tests {
         assert_eq!(slug_first_words("Héllo wörld", 5), "h-llo-w-rld");
         assert!(slug_first_words(&"supercalifragilistic ".repeat(5), 5).len() <= 40);
         assert_eq!(worktree_name("Please do ENG-42 today"), "ENG-42");
-        assert_eq!(worktree_name("Add dark mode toggle"), "add-dark-mode-toggle");
+        assert_eq!(
+            worktree_name("Add dark mode toggle"),
+            "add-dark-mode-toggle"
+        );
     }
 
     #[test]
@@ -406,8 +420,10 @@ mod tests {
                 source: PlanSource::Jev
             }
         );
-        let h = decode_plan(&json!({"needsWorktree": false, "probability": null, "source": "heuristic"}))
-            .unwrap();
+        let h = decode_plan(
+            &json!({"needsWorktree": false, "probability": null, "source": "heuristic"}),
+        )
+        .unwrap();
         assert_eq!(h.source, PlanSource::Heuristic);
         assert_eq!(h.probability, None);
         assert!(decode_plan(&json!({"probability": 0.5})).is_err());

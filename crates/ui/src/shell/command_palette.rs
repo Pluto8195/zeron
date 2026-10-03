@@ -42,6 +42,7 @@ enum Entry {
     NewProject,
     Settings,
     Overview,
+    MyPrs,
     ImportSessionCanvasSessions,
     Theme(AppearanceMode),
     Chat(String),
@@ -54,6 +55,7 @@ impl Entry {
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
             Self::Overview => Some(("Open overview", icons::WIDGET)),
+            Self::MyPrs => Some(("Toggle My PRs", icons::PULL_REQUEST)),
             Self::ImportSessionCanvasSessions => Some((
                 "Import all sessions from session_canvas",
                 icons::FOLDER_WITH_FILES,
@@ -82,6 +84,7 @@ fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
         Entry::NewProject,
         Entry::Settings,
         Entry::Overview,
+        Entry::MyPrs,
         Entry::ImportSessionCanvasSessions,
         Entry::Theme(if is_dark {
             AppearanceMode::Light
@@ -204,9 +207,8 @@ impl Shell {
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
             Entry::Overview => self.open_overview(cx),
-            Entry::ImportSessionCanvasSessions => {
-                self.bulk_import_session_canvas_sessions(cx)
-            }
+            Entry::MyPrs => self.toggle_my_prs(cx),
+            Entry::ImportSessionCanvasSessions => self.bulk_import_session_canvas_sessions(cx),
             Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
@@ -245,11 +247,12 @@ impl Shell {
             }
             let content = if let Some((label, glyph)) = entry.action() {
                 let shortcut = match entry {
-                    Entry::NewChat | Entry::NewProject => {
-                        let id = if *entry == Entry::NewChat {
-                            ShortcutId::NewSession
-                        } else {
-                            ShortcutId::NewProject
+                    Entry::NewChat | Entry::NewProject | Entry::MyPrs => {
+                        let id = match entry {
+                            Entry::NewChat => ShortcutId::NewSession,
+                            Entry::NewProject => ShortcutId::NewProject,
+                            Entry::MyPrs => ShortcutId::OpenMyPrs,
+                            _ => unreachable!(),
                         };
                         let combo = self.settings.keymap.get(id);
                         let valid = Keystroke::parse(&platform_combo(combo)).is_ok();
@@ -556,6 +559,7 @@ mod tests {
                 Entry::NewProject,
                 Entry::Settings,
                 Entry::Overview,
+                Entry::MyPrs,
                 Entry::ImportSessionCanvasSessions,
                 Entry::Theme(AppearanceMode::Light)
             ]
@@ -565,6 +569,7 @@ mod tests {
             vec![Entry::NewChat, Entry::NewProject]
         );
         assert_eq!(actions_for("settings", true), vec![Entry::Settings]);
+        assert_eq!(actions_for("prs", true), vec![Entry::MyPrs]);
         assert_eq!(
             actions_for("theme", true),
             vec![Entry::Theme(AppearanceMode::Light)]

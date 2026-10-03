@@ -4008,7 +4008,9 @@ fn skill_preamble(skills: &[String]) -> Option<String> {
         .map(|name| format!("/{name}"))
         .collect::<Vec<_>>()
         .join(", ");
-    Some(format!("Load and follow these skills for this task: {list}."))
+    Some(format!(
+        "Load and follow these skills for this task: {list}."
+    ))
 }
 
 /// `text` with the attached-skills preamble prepended (unchanged when no
@@ -5705,18 +5707,26 @@ impl Composer {
             self.slash.loading = false;
             return;
         };
-        let target = {
+        let (target, chat_id) = {
             let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
+            match state.selected_chat_row() {
+                Some(chat) => (Some(chat.device_id.clone()), Some(chat.id.clone())),
+                None => (
+                    state
+                        .selected_space_row()
+                        .map(|space| space.device_id.clone()),
+                    None,
+                ),
+            }
         };
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness, "cwd": key.1 });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert("targetDeviceId".into(), target.clone().into());
+            }
+            if let (Some(chat_id), Some(object)) = (&chat_id, params.as_object_mut()) {
+                object.insert("chatId".into(), chat_id.clone().into());
             }
             let result = engine.client().call(methods::LIST_COMMANDS, params).await;
             this.update(cx, |composer, cx| {
@@ -6408,7 +6418,7 @@ impl Composer {
         // the async block needs no picker access.
         let plan = self.pickers.read(cx).checkout_plan();
         // New-chat worktree chip (`crate::workspace_chip`): taken (and reset
-        // to Auto) only for an eligible new chat — existing chats, the
+        // to Main checkout) only for an eligible new chat — existing chats, the
         // overview's panel (always an existing chat), non-git / remote
         // projects and explicit checkout-picker worktrees never see it.
         let workspace_choice = if is_new && self.pickers.read(cx).workspace_chip_eligible(cx) {
@@ -8674,11 +8684,17 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         let text = |cx: &mut gpui::TestAppContext| {
-            window.read_with(cx, |input, _| input.text().to_string()).unwrap()
+            window
+                .read_with(cx, |input, _| input.text().to_string())
+                .unwrap()
         };
         cx.simulate_keystrokes(window.into(), "backspace");
         assert_eq!(text(cx), "hello big worl");
-        let word_left = if cfg!(target_os = "macos") { "alt-backspace" } else { "ctrl-backspace" };
+        let word_left = if cfg!(target_os = "macos") {
+            "alt-backspace"
+        } else {
+            "ctrl-backspace"
+        };
         cx.simulate_keystrokes(window.into(), word_left);
         assert_eq!(text(cx), "hello big ");
         cx.simulate_keystrokes(window.into(), "cmd-backspace");

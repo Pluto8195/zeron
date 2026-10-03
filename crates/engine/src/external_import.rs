@@ -109,7 +109,11 @@ pub struct ExternalSessionCandidate {
 /// candidate, a terminal `Summary`) for the same reason: a blocking operation
 /// over hundreds of files with no visible progress reads as hung.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub enum BulkImportEvent {
     /// Emitted once, before any importing.
     Start { total: usize },
@@ -211,6 +215,37 @@ struct SyncCursor {
     last_synced_mtime: Option<i64>,
     #[serde(default)]
     last_synced_len: Option<u64>,
+    /// The last sync ended with an assistant turn still open at EOF. The
+    /// parser deliberately keeps that turn beyond `lines_consumed` on its
+    /// first observation because the source process may append more chunks.
+    /// A later sync that observes the same file stamp finalizes the stable
+    /// tail; until then, [`ExternalSessionImporter::sync_stale_imports`] must
+    /// not skip this chat merely because its mtime/length match the last
+    /// observation.
+    #[serde(default)]
+    pending_assistant_tail: Option<bool>,
+}
+
+/// Classification bookkeeping for chats that have a Claude transcript but
+/// did not come through the external-import flow (for example, a chat Zeron
+/// launched and later resumed). This deliberately lives apart from
+/// [`SyncCursor`]: creating a fake import cursor would make sync/config/junk
+/// repair code mistake a native chat for an imported one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeClassification {
+    category: String,
+    origin: String,
+    #[serde(default)]
+    classifier_version: Option<u32>,
+    #[serde(default)]
+    classifier_source: ClassifierSource,
+    #[serde(default)]
+    jev_inconclusive_version: Option<u32>,
+    #[serde(default)]
+    tool_counts: HashMap<String, usize>,
+    #[serde(default)]
+    skills_loaded: Vec<String>,
 }
 
 /// Where a chat's `category` came from; the cursor's `classifierSource`.
@@ -275,6 +310,14 @@ pub struct ReclassifyOtherReport {
     /// call failed, or Jev is unavailable. Includes `examined - reclassified -
     /// deferred`.
     pub unchanged: usize,
+    /// Jev conclusively selected the valid catch-all `other` category. Kept
+    /// separate from failures/inconclusive answers so the UI never calls a
+    /// successfully classified chat "still unclassified".
+    pub confirmed_other: usize,
+    /// Jev answered, but no category cleared the confidence floor.
+    pub inconclusive: usize,
+    /// A Jev call failed (HTTP/timeout/response); the chat remains retryable.
+    pub failed: usize,
     /// Jev calls made (never above the budget).
     pub jev_calls: usize,
     /// Chats not offered to Jev because the budget ran out or the circuit
@@ -332,7 +375,10 @@ impl ExternalSessionImporter {
 
     /// Route category classification through `classifier` (Jev first,
     /// [`classify_heuristic`] fallback). Default is heuristic-only.
-    pub fn with_chat_category_classifier(mut self, classifier: Arc<dyn ChatCategoryClassifier>) -> Self {
+    pub fn with_chat_category_classifier(
+        mut self,
+        classifier: Arc<dyn ChatCategoryClassifier>,
+    ) -> Self {
         self.jev = classifier;
         self
     }
@@ -340,11 +386,38 @@ impl ExternalSessionImporter {
     /// One classification: Jev if available and conclusive, else the
     /// heuristic `fallback`. Returns the category, its source, and whether Jev
     /// answered but was inconclusive.
-    fn classify_category(&self, input: &ChatClassificationInput, fallback: String) -> (String, ClassifierSource, bool) {
+    fn classify_category(
+        &self,
+        input: &ChatClassificationInput,
+        fallback: String,
+    ) -> (String, ClassifierSource, bool) {
         if !self.jev.available() {
             return (fallback, ClassifierSource::Heuristic, false);
         }
         match self.jev.classify(input) {
+            // A literal task command or planning opener is stronger evidence
+            // than Jev's generic "quick question" bucket. Keep the explicit
+            // category and park this deterministic disagreement for the
+            // current classifier version, just like the catch-all guard below.
+            JevOutcome::Category(category)
+                if category == "quick_question"
+                    && input
+                        .first_messages
+                        .first()
+                        .and_then(|message| explicit_intent_category(message))
+                        .is_some_and(|explicit| explicit == fallback) =>
+            {
+                (fallback, ClassifierSource::Heuristic, true)
+            }
+            // `other` is a catch-all, not evidence strong enough to erase a
+            // deterministic category (for example an explicit `/code-review`
+            // invocation). Park the Jev result for this classifier version so
+            // the boot pass does not ask the same losing question every time.
+            JevOutcome::Category(category)
+                if is_other_category(&category) && !is_other_category(&fallback) =>
+            {
+                (fallback, ClassifierSource::Heuristic, true)
+            }
             JevOutcome::Category(category) => (category, ClassifierSource::Jev, false),
             JevOutcome::Inconclusive => (fallback, ClassifierSource::Heuristic, true),
             JevOutcome::Failed => (fallback, ClassifierSource::Heuristic, false),
@@ -382,7 +455,8 @@ impl ExternalSessionImporter {
         let (mut source, mut jev_inconclusive) = (ClassifierSource::Heuristic, false);
         if use_jev {
             let heuristic = parsed.category.clone();
-            let (category, s, inconclusive) = self.classify_category(&parsed.classification_input, heuristic);
+            let (category, s, inconclusive) =
+                self.classify_category(&parsed.classification_input, heuristic);
             parsed.category = category;
             source = s;
             jev_inconclusive = inconclusive;
@@ -497,6 +571,7 @@ impl ExternalSessionImporter {
                 skills_loaded: parsed.skills_loaded.clone(),
                 last_synced_mtime: stamp.map(|s| s.0),
                 last_synced_len: stamp.map(|s| s.1),
+                pending_assistant_tail: Some(false),
             },
         )?;
 
@@ -538,16 +613,37 @@ impl ExternalSessionImporter {
     /// common result — not an error — when there's nothing new.
     pub fn sync(&self, chat_id: &str) -> Result<SyncResult, EngineError> {
         let cursor = self.read_cursor(chat_id)?.ok_or_else(|| {
-            EngineError::Other(format!("chat {chat_id} has no external-import record to sync"))
+            EngineError::Other(format!(
+                "chat {chat_id} has no external-import record to sync"
+            ))
         })?;
         let path = Path::new(&cursor.transcript_path);
         let stamp = file_stamp(path);
         let parsed = parse_transcript(path, &self.device_id)?;
+        let has_open_tail = parsed.safe_lines_consumed < parsed.total_lines;
+        // One unchanged observation after deferral is our evidence that the
+        // EOF assistant tail has settled. Without this second phase, storing
+        // the file stamp below makes the boot-time stale scan skip the chat
+        // forever, leaving the final assistant response invisible.
+        let finalize_stable_tail = has_open_tail
+            // `None` is a pre-fix cursor. Its matching persisted stamp is
+            // already the prior unchanged observation that the old code
+            // recorded before accidentally skipping this tail forever.
+            && cursor.pending_assistant_tail != Some(false)
+            && stamp.is_some_and(|(mtime, len)| {
+                cursor.last_synced_mtime == Some(mtime) && cursor.last_synced_len == Some(len)
+            });
+        let settled_lines = if finalize_stable_tail {
+            parsed.total_lines
+        } else {
+            parsed.safe_lines_consumed
+        };
+        let pending_assistant_tail = Some(has_open_tail && !finalize_stable_tail);
 
         let new_entries: Vec<&SessionMessageEntry> = parsed
             .entries
             .iter()
-            .filter(|(line, _)| *line > cursor.lines_consumed && *line <= parsed.safe_lines_consumed)
+            .filter(|(line, _)| *line > cursor.lines_consumed && *line <= settled_lines)
             .map(|(_, entry)| entry)
             .collect();
 
@@ -557,6 +653,7 @@ impl ExternalSessionImporter {
                 &SyncCursor {
                     last_synced_mtime: stamp.map(|s| s.0),
                     last_synced_len: stamp.map(|s| s.1),
+                    pending_assistant_tail,
                     ..cursor
                 },
             )?;
@@ -593,21 +690,23 @@ impl ExternalSessionImporter {
         if let Some(preview) = &last_preview {
             self.workspace.note_message(chat_id, preview);
             if let Some(created_at) = last_created_at {
-                self.workspace.set_chat_activity(chat_id, Some(created_at), None)?;
+                self.workspace
+                    .set_chat_activity(chat_id, Some(created_at), None)?;
             }
         }
 
         // `.max`: defensive only — by construction, `new_entries` being
-        // non-empty already implies `safe_lines_consumed > cursor.lines_consumed`
+        // non-empty already implies `settled_lines > cursor.lines_consumed`
         // (nothing could satisfy the filter above otherwise), so this can
         // never actually move the cursor backward. Kept as a guard against a
         // future edit to the filter loosening that invariant silently.
         self.write_cursor(
             chat_id,
             &SyncCursor {
-                lines_consumed: parsed.safe_lines_consumed.max(cursor.lines_consumed),
+                lines_consumed: settled_lines.max(cursor.lines_consumed),
                 last_synced_mtime: stamp.map(|s| s.0),
                 last_synced_len: stamp.map(|s| s.1),
+                pending_assistant_tail,
                 ..cursor
             },
         )?;
@@ -625,7 +724,9 @@ impl ExternalSessionImporter {
     /// once); only stale chats pay for a real [`Self::sync`] parse. A
     /// missing/unreadable transcript is skipped silently. Returns
     /// `(chats_synced, new_messages)` — chats counted only if they gained
-    /// messages. Reads source files only; `sync` pushes only closed turns.
+    /// messages. Reads source files only; `sync` pushes closed turns plus an
+    /// EOF assistant tail that remained byte-for-byte stable across two
+    /// observations.
     pub fn sync_stale_imports(&self) -> Result<(usize, usize), EngineError> {
         let (mut chats, mut messages) = (0, 0);
         for chat in self.workspace.read_chats()? {
@@ -635,18 +736,47 @@ impl ExternalSessionImporter {
             let Some((mtime, len)) = file_stamp(Path::new(&cursor.transcript_path)) else {
                 continue; // source gone — chat keeps its history
             };
-            if cursor.last_synced_mtime == Some(mtime) && cursor.last_synced_len == Some(len) {
+            // A missing marker is a legacy cursor. Parse it once so already
+            // stranded EOF tails are repaired; `sync` writes `Some(false)`
+            // when there is no pending work, restoring the stat-only fast
+            // path on every subsequent boot.
+            if cursor.pending_assistant_tail == Some(false)
+                && cursor.last_synced_mtime == Some(mtime)
+                && cursor.last_synced_len == Some(len)
+            {
                 continue;
             }
-            match self.sync(&chat.id) {
-                Ok(r) if r.new_message_count > 0 => {
-                    chats += 1;
-                    messages += r.new_message_count;
-                }
-                Ok(_) => {}
+            let mut chat_messages = match self.sync(&chat.id) {
+                Ok(r) => r.new_message_count,
                 Err(err) => {
-                    tracing::warn!(chat_id = %chat.id, error = %err, "stale import sync failed")
+                    tracing::warn!(chat_id = %chat.id, error = %err, "stale import sync failed");
+                    continue;
                 }
+            };
+
+            // A changed transcript whose newest assistant turn ends at EOF
+            // is intentionally deferred once. Give it its settling
+            // observation in this same boot pass, before journal-tail repair
+            // gets a chance to append the same logical response under a
+            // different id. `sync` will finalize only if the file stamp is
+            // unchanged; if the source grew meanwhile it records the new
+            // observation and leaves the tail pending for a later pass.
+            if self
+                .read_cursor(&chat.id)?
+                .is_some_and(|cursor| cursor.pending_assistant_tail == Some(true))
+            {
+                match self.sync(&chat.id) {
+                    Ok(r) => chat_messages += r.new_message_count,
+                    Err(err) => tracing::warn!(
+                        chat_id = %chat.id,
+                        error = %err,
+                        "pending assistant-tail settling sync failed"
+                    ),
+                }
+            }
+            if chat_messages > 0 {
+                chats += 1;
+                messages += chat_messages;
             }
         }
         Ok((chats, messages))
@@ -800,7 +930,9 @@ impl ExternalSessionImporter {
     /// The cursor is re-read right before the write (the tally and the Jev
     /// call can take a while) so a concurrent `sync` advancing
     /// `lines_consumed` in that window is not clobbered by a stale copy.
-    pub fn reclassify_stale_classifier_version_report(&self) -> Result<ReclassifyReport, EngineError> {
+    pub fn reclassify_stale_classifier_version_report(
+        &self,
+    ) -> Result<ReclassifyReport, EngineError> {
         let jev_available = self.jev.available();
         let mut jev_budget = JEV_RECLASSIFY_MAX_PER_PASS;
         let mut report = ReclassifyReport::default();
@@ -833,7 +965,9 @@ impl ExternalSessionImporter {
             } else {
                 (heuristic, ClassifierSource::Heuristic, false)
             };
-            let Some(changed) = self.stamp_classification(&chat.id, category, source, inconclusive)? else {
+            let Some(changed) =
+                self.stamp_classification(&chat.id, category, source, inconclusive)?
+            else {
                 continue;
             };
             if changed {
@@ -901,7 +1035,138 @@ impl ExternalSessionImporter {
         self.reclassify_other_chats_with_budget(JEV_RECLASSIFY_MAX_MANUAL)
     }
 
-    fn reclassify_other_chats_with_budget(&self, budget: usize) -> Result<ReclassifyOtherReport, EngineError> {
+    /// Context-aware sibling used by the RPC. In addition to imported
+    /// cursor-backed chats, this includes native/resumed chats whose
+    /// transcript can be resolved from their harness session. A missing
+    /// native record is first persisted with the offline heuristic, then is
+    /// still offered to Jev during this explicit user-triggered pass.
+    pub fn reclassify_other_chats_with_context(
+        &self,
+        context_usage: &ContextUsageProvider,
+    ) -> Result<ReclassifyOtherReport, EngineError> {
+        self.reclassify_other_chats_with_resolver(JEV_RECLASSIFY_MAX_MANUAL, |chat_id| {
+            context_usage.transcript_path_for_chat(&self.workspace, self, chat_id)
+        })
+    }
+
+    fn reclassify_other_chats_with_resolver<F>(
+        &self,
+        budget: usize,
+        mut resolve_native: F,
+    ) -> Result<ReclassifyOtherReport, EngineError>
+    where
+        F: FnMut(&str) -> Result<Option<PathBuf>, EngineError>,
+    {
+        #[derive(Clone, Copy)]
+        enum Target {
+            Imported,
+            Native,
+        }
+
+        let mut report = ReclassifyOtherReport::default();
+        let mut jev_budget = budget;
+        for chat in self.workspace.read_chats()? {
+            let cursor = self.read_cursor(&chat.id)?;
+            let (target, path, native_needs_refresh) = if let Some(cursor) = cursor {
+                if !is_other_category(&cursor.category) {
+                    continue;
+                }
+                (
+                    Target::Imported,
+                    PathBuf::from(cursor.transcript_path),
+                    false,
+                )
+            } else {
+                let existing = self.read_native_classification(&chat.id)?;
+                let stale = existing.as_ref().is_none_or(|classification| {
+                    classification.classifier_version.unwrap_or(1) < CLASSIFIER_VERSION
+                });
+                if existing
+                    .as_ref()
+                    .is_some_and(|c| !stale && !is_other_category(&c.category))
+                {
+                    continue;
+                }
+                let Some(path) = resolve_native(&chat.id)? else {
+                    continue;
+                };
+                (Target::Native, path, stale)
+            };
+            let Some(tally) = tally_transcript(&path) else {
+                continue;
+            };
+
+            // Make a missing native classification visible immediately even
+            // if Jev is unavailable, deferred, inconclusive, or fails.
+            if matches!(target, Target::Native) && native_needs_refresh {
+                self.write_native_classification(
+                    &chat.id,
+                    &NativeClassification {
+                        category: tally.category(),
+                        origin: tally.origin(),
+                        classifier_version: Some(CLASSIFIER_VERSION),
+                        classifier_source: ClassifierSource::Heuristic,
+                        jev_inconclusive_version: None,
+                        tool_counts: tally.tool_counts.clone(),
+                        skills_loaded: tally.skills_loaded_sorted(),
+                    },
+                )?;
+            }
+
+            report.examined += 1;
+            if !self.jev.available() {
+                report.unchanged += 1;
+                continue;
+            }
+            if jev_budget == 0 || self.jev.circuit_open() {
+                report.deferred += 1;
+                continue;
+            }
+            jev_budget -= 1;
+            report.jev_calls += 1;
+            let heuristic = tally.category();
+            let (category, source, inconclusive) =
+                self.classify_category(&tally.classification_input(), heuristic);
+            let moved = !is_other_category(&category);
+            match target {
+                Target::Imported => {
+                    self.stamp_classification(&chat.id, category, source, inconclusive)?;
+                }
+                Target::Native => {
+                    self.write_native_classification(
+                        &chat.id,
+                        &NativeClassification {
+                            category,
+                            origin: tally.origin(),
+                            classifier_version: Some(CLASSIFIER_VERSION),
+                            classifier_source: source,
+                            jev_inconclusive_version: inconclusive.then_some(CLASSIFIER_VERSION),
+                            tool_counts: tally.tool_counts.clone(),
+                            skills_loaded: tally.skills_loaded_sorted(),
+                        },
+                    )?;
+                }
+            }
+            if moved {
+                report.reclassified += 1;
+            } else {
+                report.unchanged += 1;
+                if source == ClassifierSource::Jev {
+                    report.confirmed_other += 1;
+                } else if inconclusive {
+                    report.inconclusive += 1;
+                } else {
+                    report.failed += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn reclassify_other_chats_with_budget(
+        &self,
+        budget: usize,
+    ) -> Result<ReclassifyOtherReport, EngineError> {
         let mut report = ReclassifyOtherReport::default();
         if !self.jev.available() {
             // Nothing to ask; still report how many chats are eligible.
@@ -937,6 +1202,7 @@ impl ExternalSessionImporter {
                         report.reclassified += 1;
                     } else {
                         report.unchanged += 1;
+                        report.confirmed_other += 1;
                     }
                 }
                 JevOutcome::Inconclusive => {
@@ -945,12 +1211,19 @@ impl ExternalSessionImporter {
                     if let Some(fresh) = self.read_cursor(&chat.id)? {
                         self.write_cursor(
                             &chat.id,
-                            &SyncCursor { jev_inconclusive_version: Some(CLASSIFIER_VERSION), ..fresh },
+                            &SyncCursor {
+                                jev_inconclusive_version: Some(CLASSIFIER_VERSION),
+                                ..fresh
+                            },
                         )?;
                     }
                     report.unchanged += 1;
+                    report.inconclusive += 1;
                 }
-                JevOutcome::Failed => report.unchanged += 1,
+                JevOutcome::Failed => {
+                    report.unchanged += 1;
+                    report.failed += 1;
+                }
             }
         }
         Ok(report)
@@ -958,7 +1231,9 @@ impl ExternalSessionImporter {
 
     /// The cursor of an imported chat whose category is `other` or empty.
     fn is_other_cursor(&self, chat_id: &str) -> Result<Option<SyncCursor>, EngineError> {
-        Ok(self.read_cursor(chat_id)?.filter(|c| is_other_category(&c.category)))
+        Ok(self
+            .read_cursor(chat_id)?
+            .filter(|c| is_other_category(&c.category)))
     }
 
     /// Sibling to [`Self::repair_missing_timestamps`]/
@@ -1097,7 +1372,8 @@ impl ExternalSessionImporter {
                 .map(|c| c.external_session_id.clone())
                 .or_else(|| chat.harness_session_id.clone())
                 .unwrap_or_default();
-            let Some(path) = context_usage.transcript_path_for_chat(&self.workspace, self, &chat.id)?
+            let Some(path) =
+                context_usage.transcript_path_for_chat(&self.workspace, self, &chat.id)?
             else {
                 // No resolvable transcript at all (e.g. a harness session
                 // stamped but the transcript file is gone/unfindable) —
@@ -1220,8 +1496,11 @@ impl ExternalSessionImporter {
             if self.link_scan_marker_path(&chat.id).is_file() {
                 continue;
             }
-            let mined = match context_usage.transcript_path_for_chat(&self.workspace, self, &chat.id)
-            {
+            let mined = match context_usage.transcript_path_for_chat(
+                &self.workspace,
+                self,
+                &chat.id,
+            ) {
                 Ok(Some(path)) => match parse_transcript(&path, &self.device_id) {
                     Ok(parsed) => mine_links_from_entries(&parsed.entries),
                     // Source file moved/deleted since import — nothing to
@@ -1319,33 +1598,100 @@ impl ExternalSessionImporter {
     /// callers (e.g. subagent scanning) treat that as "nothing to scan",
     /// not an error.
     pub fn transcript_path_for(&self, chat_id: &str) -> Result<Option<PathBuf>, EngineError> {
-        Ok(self.read_cursor(chat_id)?.map(|c| PathBuf::from(c.transcript_path)))
+        Ok(self
+            .read_cursor(chat_id)?
+            .map(|c| PathBuf::from(c.transcript_path)))
     }
 
-    /// `(category, origin)` for an already-imported chat, recorded in its
-    /// sync cursor at import time — see [`ImportedSession::category`]/
-    /// [`ImportedSession::origin`]. `None` for a chat with no cursor (never
-    /// went through this import flow) or a cursor written before this field
-    /// existed (empty strings on old cursors, treated the same as absent).
-    pub fn classification_for(&self, chat_id: &str) -> Result<Option<(String, String)>, EngineError> {
-        Ok(self.read_cursor(chat_id)?.and_then(|c| {
+    /// `(category, origin)` recorded for a chat. Imported chats use their
+    /// sync cursor; native/resumed chats use the separate classification
+    /// sidecar populated lazily by [`Self::ensure_native_classification`].
+    pub fn classification_for(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<(String, String)>, EngineError> {
+        if let Some(classification) = self.read_cursor(chat_id)?.and_then(|c| {
+            (!c.category.is_empty() || !c.origin.is_empty()).then_some((c.category, c.origin))
+        }) {
+            return Ok(Some(classification));
+        }
+        Ok(self.read_native_classification(chat_id)?.and_then(|c| {
             (!c.category.is_empty() || !c.origin.is_empty()).then_some((c.category, c.origin))
         }))
     }
 
-    /// Tool-call tally and loaded-skill names for an already-imported chat,
-    /// as of the last import (not refreshed on `sync`, matching
-    /// `classification_for`'s same precedent). `None` for a chat with no
-    /// cursor, or an empty result for one whose cursor predates this field
-    /// (both legitimate "nothing to show", not errors) — the caller can't
-    /// tell those apart from this alone, same as `classification_for`.
+    /// Tool-call tally and loaded-skill names from the same persisted source
+    /// [`Self::classification_for`] uses.
     pub fn tool_usage_for(
         &self,
         chat_id: &str,
     ) -> Result<Option<(HashMap<String, usize>, Vec<String>)>, EngineError> {
+        if let Some(cursor) = self.read_cursor(chat_id)? {
+            return Ok(Some((cursor.tool_counts, cursor.skills_loaded)));
+        }
         Ok(self
-            .read_cursor(chat_id)?
+            .read_native_classification(chat_id)?
             .map(|c| (c.tool_counts, c.skills_loaded)))
+    }
+
+    /// Populate the native-chat sidecar on first overview lookup. This path
+    /// is intentionally heuristic-only: simply rendering the overview must
+    /// not make a network call. The explicit reclassify action can upgrade
+    /// the record through Jev afterward.
+    pub fn ensure_native_classification(
+        &self,
+        context_usage: &ContextUsageProvider,
+        chat_id: &str,
+    ) -> Result<(), EngineError> {
+        if self.read_cursor(chat_id)?.is_some() {
+            return Ok(());
+        }
+        if self
+            .read_native_classification(chat_id)?
+            .is_some_and(|classification| {
+                classification.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION
+            })
+        {
+            return Ok(());
+        }
+        let Some(path) = context_usage.transcript_path_for_chat(&self.workspace, self, chat_id)?
+        else {
+            return Ok(());
+        };
+        self.ensure_native_classification_from_path(chat_id, &path)
+    }
+
+    fn ensure_native_classification_from_path(
+        &self,
+        chat_id: &str,
+        path: &Path,
+    ) -> Result<(), EngineError> {
+        if self.read_cursor(chat_id)?.is_some() {
+            return Ok(());
+        }
+        if self
+            .read_native_classification(chat_id)?
+            .is_some_and(|classification| {
+                classification.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION
+            })
+        {
+            return Ok(());
+        }
+        let Some(tally) = tally_transcript(path) else {
+            return Ok(());
+        };
+        self.write_native_classification(
+            chat_id,
+            &NativeClassification {
+                category: tally.category(),
+                origin: tally.origin(),
+                classifier_version: Some(CLASSIFIER_VERSION),
+                classifier_source: ClassifierSource::Heuristic,
+                jev_inconclusive_version: None,
+                tool_counts: tally.tool_counts.clone(),
+                skills_loaded: tally.skills_loaded_sorted(),
+            },
+        )
     }
 
     fn cursors_dir(&self) -> PathBuf {
@@ -1354,6 +1700,47 @@ impl ExternalSessionImporter {
 
     fn cursor_path(&self, chat_id: &str) -> PathBuf {
         self.cursors_dir().join(format!("{chat_id}.json"))
+    }
+
+    fn native_classifications_dir(&self) -> PathBuf {
+        self.store.root().join("native_chat_classifications")
+    }
+
+    fn native_classification_path(&self, chat_id: &str) -> PathBuf {
+        self.native_classifications_dir()
+            .join(format!("{chat_id}.json"))
+    }
+
+    fn read_native_classification(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<NativeClassification>, EngineError> {
+        let path = self.native_classification_path(chat_id);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(EngineError::Other(format!(
+                    "reading native classification: {err}"
+                )));
+            }
+        };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|err| EngineError::Other(format!("parsing native classification: {err}")))
+    }
+
+    fn write_native_classification(
+        &self,
+        chat_id: &str,
+        classification: &NativeClassification,
+    ) -> Result<(), EngineError> {
+        std::fs::create_dir_all(self.native_classifications_dir())?;
+        let bytes = serde_json::to_vec(classification).map_err(|err| {
+            EngineError::Other(format!("serializing native classification: {err}"))
+        })?;
+        std::fs::write(self.native_classification_path(chat_id), bytes)?;
+        Ok(())
     }
 
     fn read_cursor(&self, chat_id: &str) -> Result<Option<SyncCursor>, EngineError> {
@@ -1762,6 +2149,12 @@ pub(crate) struct RawLine {
     /// Present on every top-level transcript line (`sdk-cli`/`claude-desktop`/
     /// `cli`) — origin classification input, see [`classify_entrypoint`].
     entrypoint: Option<String>,
+    /// Claude marks harness-authored `type: "user"` rows (task notifications,
+    /// peer hand-backs, scheduled continuations) as `promptSource: "system"`.
+    /// Optional for compatibility with older transcripts and genuine legacy
+    /// user rows, which have no source marker.
+    #[serde(rename = "promptSource")]
+    prompt_source: Option<String>,
     /// `system` line subtype — `"stop_hook_summary"` is the one origin
     /// classification cares about (see `hook_infos`).
     subtype: Option<String>,
@@ -1884,13 +2277,13 @@ const REVIEW_SKILLS: &[&str] = &["code-review", "fix-ci", "pr-risk", "gh-stack",
 /// Skills whose use means something is broken and being hunted: error
 /// trackers and log/metric tooling for production. Checked before
 /// [`RESEARCH_SKILLS`], so these no longer land in `research`.
-const DEBUG_SKILLS: &[&str] = &["sentry-api", "datadog-api", "rds-logs-and-metrics", "cc-logs"];
-const RESEARCH_SKILLS: &[&str] = &[
-    "db-query",
-    "segment-api",
-    "metabase-api",
-    "firecrawl",
+const DEBUG_SKILLS: &[&str] = &[
+    "sentry-api",
+    "datadog-api",
+    "rds-logs-and-metrics",
+    "cc-logs",
 ];
+const RESEARCH_SKILLS: &[&str] = &["db-query", "segment-api", "metabase-api", "firecrawl"];
 
 /// Version of [`classify_heuristic`]'s behavior (including the tally inputs it
 /// is fed: `turn_count`, `debug_prompt`). **Bump this whenever the heuristic's
@@ -1898,8 +2291,15 @@ const RESEARCH_SKILLS: &[&str] = &[
 /// chats classified by an older version. Version 1 is the pre-versioning
 /// heuristic; a cursor with no stamp is treated as version 1. Version 3 added
 /// TypeSafe/Jev classification (with the heuristic as fallback) and the
-/// `classifierSource` stamp.
-pub const CLASSIFIER_VERSION: u32 = 3;
+/// `classifierSource` stamp. Version 4 recognizes explicit slash-command
+/// review intent, ignores injected skill documents, and judges a concise
+/// conversational question by real human turns rather than agent tool volume.
+/// Version 5 adds native Codex rollout tallies and plain-text slash skills.
+/// Version 6 excludes Claude's system-authored pseudo-user rows (notably
+/// subagent task notifications) from the human-message evidence. Version 7
+/// recognizes explicit implementation commands and planning openers, and
+/// keeps them from being downgraded by Jev to `quick_question`.
+pub const CLASSIFIER_VERSION: u32 = 7;
 
 /// Ported from `session_canvas_server.py`'s `classify_heuristic`
 /// (lines 469-482) — the real-time classifier (no LLM call) — plus a Zeron
@@ -1909,16 +2309,20 @@ pub const CLASSIFIER_VERSION: u32 = 3;
 /// through the (out-of-scope-here) LLM/TypeSafe classification path, never
 /// by this heuristic — matching upstream behavior exactly, not a gap.
 ///
-/// `debug` sits after `quick_question` (a short Q&A stays one) and
-/// `pr_review` (a review prompt that says "check for bugs" is still a
-/// review), but before `implementing`/`research`: a bug hunt reads and edits
-/// like either, which is exactly why it needs its own bucket. `debug_prompt`
-/// is [`ClassificationTally::debug_prompt`].
+/// Explicit `pr_review` intent wins first. `debug` sits after
+/// `quick_question` (a short Q&A stays one), but before
+/// `implementing`/`research`: a bug hunt reads and edits like either, which is
+/// exactly why it needs its own bucket. `debug_prompt` is
+/// [`ClassificationTally::debug_prompt`].
 fn classify_heuristic(
     tool_counts: &HashMap<String, usize>,
     skills_loaded: &HashSet<String>,
     turn_count: usize,
+    human_turn_count: usize,
+    first_prompt_quick_question: bool,
+    review_prompt: bool,
     debug_prompt: bool,
+    explicit_intent: Option<&str>,
 ) -> String {
     let edit_calls: usize = ["Edit", "Write", "NotebookEdit"]
         .iter()
@@ -1930,19 +2334,38 @@ fn classify_heuristic(
         .sum();
     let total_calls: usize = tool_counts.values().sum();
 
+    if let Some(category) = explicit_intent {
+        return category.to_string();
+    }
+    if review_prompt
+        || skills_loaded
+            .iter()
+            .any(|s| REVIEW_SKILLS.contains(&s.as_str()))
+    {
+        return "pr_review".to_string();
+    }
+    // A concise one-off human question stays quick even when the agent chose
+    // to answer it with a long read-only tool trace. Agent implementation
+    // work is deliberately excluded; imperative exploration remains research.
+    if first_prompt_quick_question && human_turn_count <= 2 && edit_calls == 0 {
+        return "quick_question".to_string();
+    }
     if turn_count <= 3 && total_calls <= 2 {
         return "quick_question".to_string();
     }
-    if skills_loaded.iter().any(|s| REVIEW_SKILLS.contains(&s.as_str())) {
-        return "pr_review".to_string();
-    }
-    if debug_prompt || skills_loaded.iter().any(|s| DEBUG_SKILLS.contains(&s.as_str())) {
+    if debug_prompt
+        || skills_loaded
+            .iter()
+            .any(|s| DEBUG_SKILLS.contains(&s.as_str()))
+    {
         return "debug".to_string();
     }
     if edit_calls >= 3 {
         return "implementing".to_string();
     }
-    if skills_loaded.iter().any(|s| RESEARCH_SKILLS.contains(&s.as_str()))
+    if skills_loaded
+        .iter()
+        .any(|s| RESEARCH_SKILLS.contains(&s.as_str()))
         || (read_calls > 0 && edit_calls == 0)
     {
         return "research".to_string();
@@ -1990,10 +2413,18 @@ const DEBUG_STRONG_PHRASES: &[(&str, &str)] = &[
 ];
 /// Words too common in feature work ("add error handling") to count alone;
 /// they only signal debugging next to a [`DEBUG_FAILURE_WORDS`] hit.
-const DEBUG_WEAK_WORDS: &[&str] = &["error", "errors", "exception", "exceptions", "investigate", "investigating", "why"];
+const DEBUG_WEAK_WORDS: &[&str] = &[
+    "error",
+    "errors",
+    "exception",
+    "exceptions",
+    "investigate",
+    "investigating",
+    "why",
+];
 const DEBUG_FAILURE_WORDS: &[&str] = &[
-    "fail", "fails", "failing", "failed", "failure", "failures", "wrong", "timeout", "timeouts", "hang", "hangs",
-    "stuck", "down", "500", "502", "503", "504",
+    "fail", "fails", "failing", "failed", "failure", "failures", "wrong", "timeout", "timeouts",
+    "hang", "hangs", "stuck", "down", "500", "502", "503", "504",
 ];
 
 /// Whether one human message reads like a bug hunt / firefight: any strong
@@ -2017,6 +2448,107 @@ fn text_suggests_debugging(text: &str) -> bool {
             .windows(2)
             .any(|pair| DEBUG_STRONG_PHRASES.contains(&(pair[0], pair[1])))
         || (has(DEBUG_WEAK_WORDS) && has(DEBUG_FAILURE_WORDS))
+}
+
+/// High-confidence conversational question openers. This is intentionally
+/// narrower than "contains a question mark": pasted plans and multi-part
+/// implementation requests often contain questions without being quick asks.
+fn text_suggests_quick_question(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 240 {
+        return false;
+    }
+    let words: Vec<String> = trimmed
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    let Some(first) = words.first().map(String::as_str) else {
+        return false;
+    };
+    const QUESTION_OPENERS: &[&str] = &[
+        "what", "how", "why", "where", "when", "which", "who", "is", "are", "do", "does", "did",
+        "can", "could", "would", "should",
+    ];
+    if !QUESTION_OPENERS.contains(&first) {
+        return false;
+    }
+    // These are usually requests to do or design work, even when phrased as
+    // "can you ...?". Review intent has its own stronger signal path.
+    const NON_QUESTION_INTENTS: &[&str] = &[
+        "add",
+        "build",
+        "change",
+        "create",
+        "design",
+        "implement",
+        "migrate",
+        "plan",
+        "refactor",
+        "update",
+        "write",
+    ];
+    !words
+        .iter()
+        .any(|word| NON_QUESTION_INTENTS.contains(&word.as_str()))
+}
+
+/// A deliberately small set of first-message forms that directly name the
+/// work category. These beat transcript-size/tool-count guesses, but ordinary
+/// mentions of "plan" or "implement" later in a sentence do not.
+fn explicit_intent_category(text: &str) -> Option<&'static str> {
+    let first_word = text
+        .trim_start()
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| matches!(c, ',' | '.' | ':' | ';'));
+    if first_word.eq_ignore_ascii_case("/implement-ticket") {
+        return Some("implementing");
+    }
+    if first_word.eq_ignore_ascii_case("plan") || first_word.eq_ignore_ascii_case("planning") {
+        return Some("planning");
+    }
+    None
+}
+
+const INJECTED_SKILL_DOCUMENT_PREFIX: &str = "Base directory for this skill:";
+
+/// Claude Code emits a user-shaped entry containing the complete skill file
+/// after a slash command. It is context injected by the harness, not another
+/// thing the human said. Return the skill name while filtering that entry.
+fn injected_skill_document_name(text: &str) -> Option<String> {
+    let first_line = text.trim_start().lines().next()?.trim();
+    let path = first_line
+        .strip_prefix(INJECTED_SKILL_DOCUMENT_PREFIX)?
+        .trim();
+    Path::new(path)
+        .file_name()?
+        .to_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn tagged_value<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim())
+}
+
+fn slash_command_name(text: &str) -> Option<String> {
+    tagged_value(text, "command-name")
+        .or_else(|| tagged_value(text, "command-message"))
+        .map(|name| name.trim().trim_start_matches('/').to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+}
+
+fn contains_code_review_command(text: &str) -> bool {
+    slash_command_name(text).as_deref() == Some("code-review")
+        || text.split_whitespace().any(|word| {
+            word.trim_matches(|c: char| matches!(c, ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']'))
+                .eq_ignore_ascii_case("/code-review")
+        })
 }
 
 /// How many of a chat's leading human messages [`ClassificationTally`]
@@ -2053,6 +2585,9 @@ struct ClassificationTally {
     tool_counts: HashMap<String, usize>,
     skills_loaded: HashSet<String>,
     turn_count: usize,
+    /// Human-authored messages only. Tool-result echoes, slash-command
+    /// wrappers without arguments, and injected skill documents do not count.
+    human_turn_count: usize,
     /// Last non-null `entrypoint` seen wins — matches the reference's
     /// unconditional per-line overwrite (`if d.get("entrypoint"): result["entrypoint"] = ...`).
     entrypoint: Option<String>,
@@ -2065,6 +2600,8 @@ struct ClassificationTally {
     human_messages: usize,
     debug_prompt_hits: usize,
     first_prompt_debug: bool,
+    first_prompt_quick_question: bool,
+    review_prompt: bool,
     /// The same leading human messages, kept (truncated) as Jev's input.
     first_messages: Vec<String>,
 }
@@ -2105,6 +2642,10 @@ fn is_synthetic_prompt(text: &str) -> bool {
     text.starts_with(TITLEGEN_PROMPT_PREFIX)
         || text.starts_with(CLASSIFY_PROMPT_PREFIX)
         || text.starts_with(ZERON_TITLE_PROMPT_PREFIX)
+        // Older Claude transcripts may lack `promptSource: "system"`, so
+        // retain a content-level guard for the task reports the harness
+        // records as `type: "user"` even though no human authored them.
+        || text.trim_start().starts_with("<task-notification>")
 }
 
 impl ClassificationTally {
@@ -2115,9 +2656,11 @@ impl ClassificationTally {
         if raw.kind.as_deref() == Some("system")
             && raw.subtype.as_deref() == Some("stop_hook_summary")
             && raw.hook_infos.as_ref().is_some_and(|hooks| {
-                hooks
-                    .iter()
-                    .any(|h| h.command.as_deref().is_some_and(|c| c.contains("peon_hook.py")))
+                hooks.iter().any(|h| {
+                    h.command
+                        .as_deref()
+                        .is_some_and(|c| c.contains("peon_hook.py"))
+                })
             })
         {
             self.agent_mode_signal = true;
@@ -2136,7 +2679,8 @@ impl ClassificationTally {
                         if !block.name.is_empty() {
                             *self.tool_counts.entry(block.name.clone()).or_insert(0) += 1;
                             if block.name == "Skill"
-                                && let Some(skill) = block.input.get("skill").and_then(Value::as_str)
+                                && let Some(skill) =
+                                    block.input.get("skill").and_then(Value::as_str)
                             {
                                 self.skills_loaded.insert(skill.to_string());
                             }
@@ -2148,20 +2692,136 @@ impl ClassificationTally {
                 }
             }
             Some("user") => {
-                if let Some(text) = human_message_text(&message.content)
-                    && !is_synthetic_prompt(&text)
-                {
-                    self.turn_count += 1;
-                    if self.human_messages < DEBUG_PROMPT_WINDOW {
-                        let debugging = text_suggests_debugging(&text);
-                        if self.human_messages == 0 {
-                            self.first_prompt_debug = debugging;
-                        }
-                        self.debug_prompt_hits += usize::from(debugging);
-                        self.human_messages += 1;
-                        self.first_messages.push(text.chars().take(JEV_MESSAGE_KEEP_CHARS).collect());
+                // Claude persists subagent reports, scheduled continuations,
+                // and other harness-generated context as user-shaped rows.
+                // They are useful transcript context but must not consume the
+                // classifier's human-message window or contribute intent words.
+                if raw.prompt_source.as_deref() == Some("system") {
+                    return;
+                }
+                if let Some(text) = human_message_text(&message.content) {
+                    self.observe_human_text(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_human_text(&mut self, mut text: String) {
+        if let Some(skill) = injected_skill_document_name(&text) {
+            self.skills_loaded.insert(skill);
+            return;
+        }
+        let command = slash_command_name(&text);
+        if let Some(skill) = command.as_ref() {
+            self.skills_loaded.insert(skill.clone());
+        }
+        self.review_prompt |= contains_code_review_command(&text);
+        if command.is_some() {
+            let Some(args) = tagged_value(&text, "command-args").filter(|args| !args.is_empty())
+            else {
+                return;
+            };
+            text = args.to_string();
+        }
+        if is_synthetic_prompt(&text) {
+            return;
+        }
+        // Codex keeps slash commands as ordinary user text rather than the
+        // tagged command wrapper Claude writes. Retain those skill names for
+        // the same classifier signal without treating arbitrary path-like
+        // text as a skill.
+        for word in text.split_whitespace() {
+            let candidate = word
+                .trim_matches(|c: char| matches!(c, ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']'))
+                .strip_prefix('/');
+            if let Some(skill) = candidate.filter(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            }) {
+                self.skills_loaded.insert(skill.to_ascii_lowercase());
+            }
+        }
+        self.turn_count += 1;
+        if self.human_turn_count == 0 {
+            self.first_prompt_quick_question = text_suggests_quick_question(&text);
+        }
+        self.human_turn_count += 1;
+        if self.human_messages < DEBUG_PROMPT_WINDOW {
+            let debugging = text_suggests_debugging(&text);
+            if self.human_messages == 0 {
+                self.first_prompt_debug = debugging;
+            }
+            self.debug_prompt_hits += usize::from(debugging);
+            self.human_messages += 1;
+            self.first_messages
+                .push(text.chars().take(JEV_MESSAGE_KEEP_CHARS).collect());
+        }
+    }
+
+    fn observe_codex_payload(&mut self, payload: &Value) {
+        match payload.get("type").and_then(Value::as_str) {
+            Some("message") => match payload.get("role").and_then(Value::as_str) {
+                Some("user") => {
+                    let is_human = payload
+                        .get("internal_chat_message_metadata_passthrough")
+                        .and_then(|metadata| metadata.get("content_item_kinds"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|kinds| {
+                            kinds.iter().any(|kind| kind.as_str() == Some("user.text"))
+                        });
+                    if !is_human {
+                        return;
+                    }
+                    let text = payload
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("input_text")
+                        })
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.trim().is_empty() {
+                        self.observe_human_text(text);
                     }
                 }
+                Some("assistant") => {
+                    let has_text = payload
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("type").and_then(Value::as_str) == Some("output_text")
+                                    && item
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|text| !text.trim().is_empty())
+                            })
+                        });
+                    if has_text {
+                        self.turn_count += 1;
+                    }
+                }
+                _ => {}
+            },
+            Some("custom_tool_call") | Some("function_call") => {
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let input = payload
+                    .get("input")
+                    .or_else(|| payload.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let normalized = codex_classifier_tool_name(name, input);
+                *self.tool_counts.entry(normalized).or_insert(0) += 1;
+                self.turn_count += 1;
             }
             _ => {}
         }
@@ -2175,7 +2835,20 @@ impl ClassificationTally {
     }
 
     fn category(&self) -> String {
-        classify_heuristic(&self.tool_counts, &self.skills_loaded, self.turn_count, self.debug_prompt())
+        let explicit_intent = self
+            .first_messages
+            .first()
+            .and_then(|message| explicit_intent_category(message));
+        classify_heuristic(
+            &self.tool_counts,
+            &self.skills_loaded,
+            self.turn_count,
+            self.human_turn_count,
+            self.first_prompt_quick_question,
+            self.review_prompt,
+            self.debug_prompt(),
+            explicit_intent,
+        )
     }
 
     /// The tally as Jev's classification input (same data the heuristic ran on).
@@ -2183,7 +2856,11 @@ impl ClassificationTally {
         ChatClassificationInput {
             first_messages: self.first_messages.clone(),
             skills_loaded: self.skills_loaded_sorted(),
-            tool_counts: self.tool_counts.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            tool_counts: self
+                .tool_counts
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             turn_count: self.turn_count,
         }
     }
@@ -2217,11 +2894,41 @@ fn tally_transcript(path: &Path) -> Option<ClassificationTally> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(raw) = serde_json::from_str::<RawLine>(&line) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("response_item") {
+            if let Some(payload) = value.get("payload") {
+                tally.observe_codex_payload(payload);
+            }
+        } else if let Ok(raw) = serde_json::from_value::<RawLine>(value) {
             tally.observe(&raw);
         }
     }
     Some(tally)
+}
+
+fn codex_classifier_tool_name(name: &str, input: &str) -> String {
+    if name == "exec" {
+        if input.contains("tools.apply_patch") {
+            return "Edit".into();
+        }
+        if input.contains("tools.view_image") {
+            return "Read".into();
+        }
+        if input.contains("tools.exec_command") {
+            return "Bash".into();
+        }
+    }
+    match name {
+        "apply_patch" => "Edit",
+        "read_file" => "Read",
+        "write_file" => "Write",
+        "search" | "grep" => "Grep",
+        "glob" => "Glob",
+        other => other,
+    }
+    .to_string()
 }
 
 struct TranscriptSummary {
@@ -2324,7 +3031,9 @@ fn first_raw_user_message(path: &Path) -> Option<String> {
         if raw.is_sidechain || raw.kind.as_deref() != Some("user") {
             continue;
         }
-        let Some(message) = &raw.message else { continue };
+        let Some(message) = &raw.message else {
+            continue;
+        };
         if let Some(text) = human_message_text(&message.content) {
             return Some(text);
         }
@@ -2355,7 +3064,10 @@ fn read_session_canvas_archive_ids() -> HashSet<String> {
 /// `[review-]<task-name>.session-id` file per task. See
 /// [`load_agent_mode_task_names`].
 fn agent_mode_session_ids_dir() -> PathBuf {
-    home_dir().join(".config").join("agent-mode").join("session-ids")
+    home_dir()
+        .join(".config")
+        .join("agent-mode")
+        .join("session-ids")
 }
 
 /// agent-mode.sh's own task-name registry: reads every
@@ -2714,7 +3426,10 @@ fn parse_transcript(path: &Path, device_id: &str) -> Result<ParsedTranscript, En
                     SessionMessageEntry {
                         id,
                         role: MessageRole::User,
-                        parts: vec![MessagePart::Text { id: "t0".into(), text }],
+                        parts: vec![MessagePart::Text {
+                            id: "t0".into(),
+                            text,
+                        }],
                         created_at: parse_ts(raw.timestamp.as_deref()),
                         device_id: device_id.to_string(),
                         status: None,
@@ -2835,7 +3550,10 @@ mod link_mining_tests {
             )],
         )];
         let mined = mine_links_from_entries(&entries);
-        assert_eq!(mined.created_pr.as_deref(), Some("https://github.com/acme/widgets/pull/42"));
+        assert_eq!(
+            mined.created_pr.as_deref(),
+            Some("https://github.com/acme/widgets/pull/42")
+        );
         assert!(mined.mentioned_pr.is_none());
     }
 
@@ -2855,7 +3573,10 @@ mod link_mining_tests {
         )];
         let mined = mine_links_from_entries(&entries);
         assert!(mined.created_pr.is_none());
-        assert_eq!(mined.mentioned_pr.as_deref(), Some("https://github.com/acme/widgets/pull/42"));
+        assert_eq!(
+            mined.mentioned_pr.as_deref(),
+            Some("https://github.com/acme/widgets/pull/42")
+        );
     }
 
     /// A PR URL the agent narrates back in its own reply text — the
@@ -2865,10 +3586,16 @@ mod link_mining_tests {
     fn pr_url_in_message_text_stamps_mentioned_pr() {
         let entries = vec![entry(
             MessageRole::Assistant,
-            vec![text_part("m1", "Opened https://github.com/acme/widgets/pull/7")],
+            vec![text_part(
+                "m1",
+                "Opened https://github.com/acme/widgets/pull/7",
+            )],
         )];
         let mined = mine_links_from_entries(&entries);
-        assert_eq!(mined.mentioned_pr.as_deref(), Some("https://github.com/acme/widgets/pull/7"));
+        assert_eq!(
+            mined.mentioned_pr.as_deref(),
+            Some("https://github.com/acme/widgets/pull/7")
+        );
     }
 
     /// The most RECENT PR mention wins — an earlier mention must not survive
@@ -2878,15 +3605,24 @@ mod link_mining_tests {
         let entries = vec![
             entry(
                 MessageRole::Assistant,
-                vec![text_part("m1", "See https://github.com/acme/widgets/pull/1 for context")],
+                vec![text_part(
+                    "m1",
+                    "See https://github.com/acme/widgets/pull/1 for context",
+                )],
             ),
             entry(
                 MessageRole::User,
-                vec![text_part("m2", "actually use https://github.com/acme/widgets/pull/2 instead")],
+                vec![text_part(
+                    "m2",
+                    "actually use https://github.com/acme/widgets/pull/2 instead",
+                )],
             ),
         ];
         let mined = mine_links_from_entries(&entries);
-        assert_eq!(mined.mentioned_pr.as_deref(), Some("https://github.com/acme/widgets/pull/2"));
+        assert_eq!(
+            mined.mentioned_pr.as_deref(),
+            Some("https://github.com/acme/widgets/pull/2")
+        );
     }
 
     /// Ticket-id mentions follow the same most-recent-wins rule, scanned
@@ -2895,16 +3631,24 @@ mod link_mining_tests {
     #[test]
     fn most_recent_ticket_mention_wins_and_ignores_tool_output() {
         let entries = vec![
-            entry(MessageRole::User, vec![text_part("m1", "picking up ENG-100")]),
+            entry(
+                MessageRole::User,
+                vec![text_part("m1", "picking up ENG-100")],
+            ),
             entry(
                 MessageRole::Assistant,
                 vec![tool_part(
                     "t1",
-                    ToolCall::Exec { command: "echo OPS-999".into() },
+                    ToolCall::Exec {
+                        command: "echo OPS-999".into(),
+                    },
                     Some("OPS-999 printed"),
                 )],
             ),
-            entry(MessageRole::Assistant, vec![text_part("m2", "done with ENG-200")]),
+            entry(
+                MessageRole::Assistant,
+                vec![text_part("m2", "done with ENG-200")],
+            ),
         ];
         let mined = mine_links_from_entries(&entries);
         assert_eq!(mined.mentioned_ticket.as_deref(), Some("ENG-200"));
@@ -2951,8 +3695,11 @@ mod title_registry_tests {
     #[test]
     fn parses_review_prefixed_and_bare_filenames_keyed_by_session_id() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("review-growthbook-wrapper.session-id"), "sess-aaa\n")
-            .expect("write");
+        std::fs::write(
+            dir.path().join("review-growthbook-wrapper.session-id"),
+            "sess-aaa\n",
+        )
+        .expect("write");
         std::fs::write(dir.path().join("cleanup-zeron-port.session-id"), "sess-bbb")
             .expect("write");
         // Not a `.session-id` file — must be ignored.
@@ -2960,8 +3707,14 @@ mod title_registry_tests {
 
         let names = load_task_names_from_dir(dir.path());
         assert_eq!(names.len(), 2);
-        assert_eq!(names.get("sess-aaa").map(String::as_str), Some("growthbook-wrapper"));
-        assert_eq!(names.get("sess-bbb").map(String::as_str), Some("cleanup-zeron-port"));
+        assert_eq!(
+            names.get("sess-aaa").map(String::as_str),
+            Some("growthbook-wrapper")
+        );
+        assert_eq!(
+            names.get("sess-bbb").map(String::as_str),
+            Some("cleanup-zeron-port")
+        );
         assert!(names.get("sess-ccc").is_none());
     }
 
@@ -3007,7 +3760,12 @@ mod title_registry_tests {
     #[test]
     fn falls_back_to_first_message_when_nothing_else_resolves() {
         let registry = HashMap::new();
-        let title = resolve_chat_title("sess-1", None, Some("add a health check endpoint"), &registry);
+        let title = resolve_chat_title(
+            "sess-1",
+            None,
+            Some("add a health check endpoint"),
+            &registry,
+        );
         assert_eq!(title.as_deref(), Some("add a health check endpoint"));
     }
 
@@ -3021,13 +3779,15 @@ mod title_registry_tests {
     #[test]
     fn blank_ai_title_falls_through_to_first_message() {
         let registry = HashMap::new();
-        let title = resolve_chat_title("sess-1", Some("   "), Some("real first message"), &registry);
+        let title =
+            resolve_chat_title("sess-1", Some("   "), Some("real first message"), &registry);
         assert_eq!(title.as_deref(), Some("real first message"));
     }
 
     #[test]
     fn strips_pasted_content_wrapper_before_truncating() {
-        let text = "\n\n<pasted_content id=\"f73f\">\n\nYou're picking up implementation work on a fork";
+        let text =
+            "\n\n<pasted_content id=\"f73f\">\n\nYou're picking up implementation work on a fork";
         let derived = derive_title_from_first_message(text).expect("derives a title");
         assert_eq!(derived, "You're picking up implementation work on a fork");
         assert!(!derived.contains("pasted_content"));
@@ -3044,7 +3804,10 @@ mod title_registry_tests {
     fn first_message_title_is_truncated_to_one_line_around_60_chars() {
         let text = "a very long first message that goes on and on well past the sixty character mark for sure\nsecond line never seen";
         let derived = derive_title_from_first_message(text).expect("derives a title");
-        assert!(derived.chars().count() <= TITLE_MAX_CHARS + 1, "title should be truncated: {derived}");
+        assert!(
+            derived.chars().count() <= TITLE_MAX_CHARS + 1,
+            "title should be truncated: {derived}"
+        );
         assert!(derived.ends_with('\u{2026}'));
         assert!(!derived.contains('\n'));
     }
@@ -3080,7 +3843,10 @@ mod title_registry_tests {
                 MessageRole::Assistant,
                 vec![text_part("m2", "quick_question")],
             ),
-            entry(MessageRole::User, vec![text_part("m3", "the real first message")]),
+            entry(
+                MessageRole::User,
+                vec![text_part("m3", "the real first message")],
+            ),
         ];
         let found = first_real_user_message_text(&entries);
         assert_eq!(found.as_deref(), Some("the real first message"));
@@ -3090,7 +3856,10 @@ mod title_registry_tests {
     fn first_real_user_message_text_none_when_only_synthetic() {
         let entries = vec![entry(
             MessageRole::User,
-            vec![text_part("m1", "Reply with ONLY a concise title for this chat")],
+            vec![text_part(
+                "m1",
+                "Reply with ONLY a concise title for this chat",
+            )],
         )];
         assert!(first_real_user_message_text(&entries).is_none());
     }
@@ -3114,7 +3883,9 @@ mod title_registry_tests {
         assert!(is_synthetic_prompt(&prompt));
         // And the older python-helper prompts still match.
         assert!(is_synthetic_prompt("Reply with ONLY a concise title"));
-        assert!(is_synthetic_prompt("Classify this coding-agent chat into exactly one label"));
+        assert!(is_synthetic_prompt(
+            "Classify this coding-agent chat into exactly one label"
+        ));
     }
 
     #[test]
@@ -3127,7 +3898,10 @@ mod title_registry_tests {
             "Can you reply with only a concise summary?",
             "",
         ] {
-            assert!(!is_synthetic_prompt(real), "wrongly flagged real chat: {real:?}");
+            assert!(
+                !is_synthetic_prompt(real),
+                "wrongly flagged real chat: {real:?}"
+            );
         }
     }
 }
@@ -3153,8 +3927,12 @@ mod debug_prompt_tests {
 
     #[test]
     fn weak_words_need_failure_context() {
-        assert!(text_suggests_debugging("why is the export timing out with a 500"));
-        assert!(text_suggests_debugging("investigate the error, the job keeps failing"));
+        assert!(text_suggests_debugging(
+            "why is the export timing out with a 500"
+        ));
+        assert!(text_suggests_debugging(
+            "investigate the error, the job keeps failing"
+        ));
         for text in [
             "add error handling to the importer",
             "investigate how pricing tiers are modeled",
@@ -3175,5 +3953,378 @@ mod debug_prompt_tests {
         assert!(!tally.debug_prompt());
         tally.debug_prompt_hits = 2;
         assert!(tally.debug_prompt());
+    }
+}
+
+#[cfg(test)]
+mod native_classification_sidecar_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use crate::{EngineCore, EngineProfile, default_registry};
+
+    fn native_transcript() -> String {
+        [
+            r#"{"type":"user","message":{"role":"user","content":"please classify this chat"},"timestamp":"2026-01-01T00:00:00Z","cwd":"/work/project","entrypoint":"cli"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"first reply"}]},"timestamp":"2026-01-01T00:00:01Z","cwd":"/work/project","entrypoint":"cli"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"continue"},"timestamp":"2026-01-01T00:00:02Z","cwd":"/work/project","entrypoint":"cli"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"second reply"}]},"timestamp":"2026-01-01T00:00:03Z","cwd":"/work/project","entrypoint":"cli"}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    fn review_transcript() -> String {
+        [
+            r#"{"type":"user","message":{"role":"user","content":"/code-review https://github.com/acme/widgets/pull/42"},"timestamp":"2026-01-01T00:00:00Z","cwd":"/work/project","entrypoint":"cli"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reviewed"}]},"timestamp":"2026-01-01T00:00:01Z","cwd":"/work/project","entrypoint":"cli"}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    struct FixedJev(&'static str);
+
+    impl ChatCategoryClassifier for FixedJev {
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn classify(&self, _input: &ChatClassificationInput) -> JevOutcome {
+            JevOutcome::Category(self.0.to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingPlanningJev(Mutex<Option<ChatClassificationInput>>);
+
+    impl ChatCategoryClassifier for CapturingPlanningJev {
+        fn available(&self) -> bool {
+            true
+        }
+
+        fn classify(&self, input: &ChatClassificationInput) -> JevOutcome {
+            *self.0.lock().unwrap() = Some(input.clone());
+            JevOutcome::Category("planning".into())
+        }
+    }
+
+    fn codex_planning_transcript() -> String {
+        [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<environment_context>injected, broken bug</environment_context>"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["environments.environment_context"]
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "use /ticket-planner and /warehouse-concepts to plan kit line estimates"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["user.text"]
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I will trace the design."}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "await tools.exec_command({cmd: 'rg estimate'})"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n"
+    }
+
+    #[tokio::test]
+    async fn native_classification_uses_a_separate_sidecar_and_reads_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
+        let store_root = profile.store_root().to_path_buf();
+        let core = EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let transcript = dir.path().join("native.jsonl");
+        std::fs::write(&transcript, native_transcript()).unwrap();
+
+        core.external_import
+            .ensure_native_classification_from_path("native-chat", &transcript)
+            .unwrap();
+
+        let classification = core
+            .external_import
+            .classification_for("native-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(classification.1, "bare_cli");
+        assert!(
+            store_root
+                .join("native_chat_classifications/native-chat.json")
+                .is_file()
+        );
+        assert!(
+            !store_root
+                .join("external_import_cursors/native-chat.json")
+                .exists()
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn manual_pass_includes_a_native_chat_with_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
+        let store_root = profile.store_root().to_path_buf();
+        let core = EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat(
+                "native-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/work/project".into()),
+            )
+            .unwrap();
+        let transcript = dir.path().join("native.jsonl");
+        std::fs::write(&transcript, native_transcript()).unwrap();
+        let importer = core
+            .external_import
+            .clone()
+            .with_chat_category_classifier(Arc::new(FixedJev("planning")));
+
+        let report = importer
+            .reclassify_other_chats_with_resolver(JEV_RECLASSIFY_MAX_MANUAL, |_| {
+                Ok(Some(transcript.clone()))
+            })
+            .unwrap();
+
+        assert_eq!(
+            (report.examined, report.reclassified, report.jev_calls),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            importer
+                .classification_for("native-chat")
+                .unwrap()
+                .unwrap()
+                .0,
+            "planning"
+        );
+        assert!(
+            store_root
+                .join("native_chat_classifications/native-chat.json")
+                .is_file()
+        );
+        assert!(
+            !store_root
+                .join("external_import_cursors/native-chat.json")
+                .exists()
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn manual_pass_classifies_native_codex_planning_chat_from_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
+        let core = EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat(
+                "native-codex-chat",
+                None,
+                Some(&core.device_id),
+                Some(ChatConfig {
+                    harness: HarnessId::Codex,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: SandboxLevel::WorkspaceWrite,
+                    auto_approve: false,
+                }),
+                Some("/work/project".into()),
+            )
+            .unwrap();
+        let transcript = dir.path().join("codex-rollout.jsonl");
+        std::fs::write(&transcript, codex_planning_transcript()).unwrap();
+        let classifier = Arc::new(CapturingPlanningJev::default());
+        let importer = core
+            .external_import
+            .clone()
+            .with_chat_category_classifier(classifier.clone());
+
+        let report = importer
+            .reclassify_other_chats_with_resolver(JEV_RECLASSIFY_MAX_MANUAL, |_| {
+                Ok(Some(transcript.clone()))
+            })
+            .unwrap();
+
+        assert_eq!(
+            (report.examined, report.reclassified, report.jev_calls),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            importer
+                .classification_for("native-codex-chat")
+                .unwrap()
+                .unwrap()
+                .0,
+            "planning"
+        );
+        let input = classifier.0.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            input.first_messages,
+            ["use /ticket-planner and /warehouse-concepts to plan kit line estimates"]
+        );
+        assert_eq!(input.tool_counts.get("Bash"), Some(&1));
+        assert!(input.skills_loaded.contains(&"ticket-planner".into()));
+        assert!(input.skills_loaded.contains(&"warehouse-concepts".into()));
+        assert!(
+            !input
+                .first_messages
+                .iter()
+                .any(|message| message.contains("injected")),
+            "host/environment user-shaped messages must not reach the classifier"
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_native_sidecar_is_recomputed_by_lazy_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
+        let core = EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let transcript = dir.path().join("native.jsonl");
+        std::fs::write(&transcript, native_transcript()).unwrap();
+        core.external_import
+            .write_native_classification(
+                "native-chat",
+                &NativeClassification {
+                    category: "planning".into(),
+                    origin: "unknown".into(),
+                    classifier_version: Some(CLASSIFIER_VERSION - 1),
+                    classifier_source: ClassifierSource::Heuristic,
+                    jev_inconclusive_version: None,
+                    tool_counts: HashMap::new(),
+                    skills_loaded: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        core.external_import
+            .ensure_native_classification_from_path("native-chat", &transcript)
+            .unwrap();
+
+        let refreshed = core
+            .external_import
+            .read_native_classification("native-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.classifier_version, Some(CLASSIFIER_VERSION));
+        assert_ne!(refreshed.category, "planning");
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn jev_other_cannot_override_specific_native_heuristic() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
+        let core = EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat(
+                "native-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/work/project".into()),
+            )
+            .unwrap();
+        core.external_import
+            .write_native_classification(
+                "native-chat",
+                &NativeClassification {
+                    category: "other".into(),
+                    origin: "bare_cli".into(),
+                    classifier_version: Some(CLASSIFIER_VERSION),
+                    classifier_source: ClassifierSource::Jev,
+                    jev_inconclusive_version: None,
+                    tool_counts: HashMap::new(),
+                    skills_loaded: Vec::new(),
+                },
+            )
+            .unwrap();
+        let transcript = dir.path().join("review.jsonl");
+        std::fs::write(&transcript, review_transcript()).unwrap();
+        let importer = core
+            .external_import
+            .clone()
+            .with_chat_category_classifier(Arc::new(FixedJev("other")));
+
+        let report = importer
+            .reclassify_other_chats_with_resolver(JEV_RECLASSIFY_MAX_MANUAL, |_| {
+                Ok(Some(transcript.clone()))
+            })
+            .unwrap();
+
+        assert_eq!(
+            (report.examined, report.reclassified, report.jev_calls),
+            (1, 1, 1)
+        );
+        let refreshed = importer
+            .read_native_classification("native-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.category, "pr_review");
+        assert_eq!(refreshed.classifier_source, ClassifierSource::Heuristic);
+        assert_eq!(refreshed.jev_inconclusive_version, Some(CLASSIFIER_VERSION));
+        core.shutdown().await;
     }
 }

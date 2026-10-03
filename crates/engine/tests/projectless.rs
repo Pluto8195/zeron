@@ -1,8 +1,8 @@
 //! "Don't work in a project" against a real engine: a chat minted through the
 //! UI's exact wire shape (`Mutate createChat` with a `deviceId` and no
-//! `spaceId`) stores cwd `~`, spawns its run from the host's REAL home dir,
-//! and never mints a space row — the two failure modes of pre-#40 engines
-//! (a phantom project at root, and the run dying on the literal `~`).
+//! `spaceId`) stores cwd `~`, spawns its run from a stable Zeron-owned scratch
+//! directory, and never mints a space row. In particular, the agent must not
+//! run from HOME and trigger macOS protected-folder access prompts.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -109,7 +109,7 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn projectless_chat_runs_from_home_and_mints_no_space() {
+async fn projectless_chat_runs_from_owned_scratch_and_mints_no_space() {
     exercise_projectless(false).await;
 }
 
@@ -209,7 +209,8 @@ async fn exercise_projectless(command_first: bool) {
             .unwrap();
     }
 
-    // The harness must see the host's real home dir, not the literal `~`.
+    // The harness must see a stable per-chat Zeron-owned directory, never the
+    // host's real HOME (which contains TCC-protected folders on macOS).
     let cwds: Vec<String> = requests
         .lock()
         .expect("request log")
@@ -217,8 +218,30 @@ async fn exercise_projectless(command_first: bool) {
         .filter(|r| r.prompt == "hello from no project")
         .map(|r| r.cwd.clone())
         .collect();
-    let home = std::env::var("HOME").expect("HOME set in test env");
-    assert_eq!(cwds, vec![home], "run spawns from the expanded home dir");
+    assert_eq!(cwds.len(), 1);
+    let scratch = std::path::Path::new(&cwds[0]);
+    assert!(scratch.is_dir(), "project-less cwd was not created");
+    assert!(scratch.starts_with(tmp.path()));
+    assert!(scratch.ends_with("projectless/chat-projectless"));
+    assert_ne!(
+        scratch,
+        std::path::Path::new(&std::env::var("HOME").expect("HOME set in test env"))
+    );
+    let terminal = client
+        .call(
+            zeron_rpc::methods::OPEN_TERMINAL,
+            serde_json::json!({ "chatId": CHAT, "cols": 80, "rows": 24 }),
+        )
+        .await
+        .expect("open project-less terminal");
+    assert_eq!(terminal["cwd"], cwds[0]);
+    client
+        .call(
+            zeron_rpc::methods::CLOSE_TERMINAL,
+            serde_json::json!({ "terminalId": terminal["id"] }),
+        )
+        .await
+        .expect("close project-less terminal");
 
     // And no phantom project: the flow must not mint any space row.
     let spaces = core.workspace.read_spaces().expect("read spaces");
@@ -250,7 +273,7 @@ async fn exercise_projectless(command_first: bool) {
             .filter(|r| r.prompt == "hello from no project")
             .collect();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].cwd, std::env::var("HOME").unwrap());
+        assert_eq!(requests[1].cwd, cwds[0]);
         assert_eq!(requests[1].resume.as_deref(), Some("sess-np"));
     }
     assert!(core.workspace.read_spaces().unwrap().is_empty());

@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use zeron_engine::external_import::{CLASSIFIER_VERSION, ExternalSessionImporter, JEV_RECLASSIFY_MAX_PER_PASS};
+use zeron_engine::external_import::{
+    CLASSIFIER_VERSION, ExternalSessionImporter, JEV_RECLASSIFY_MAX_PER_PASS,
+};
 use zeron_engine::typesafe::{ChatCategoryClassifier, ChatClassificationInput, JevOutcome};
 use zeron_engine::{EngineCore, EngineProfile, HarnessId, default_registry};
 
@@ -53,13 +55,20 @@ impl Fixture {
         let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
         let cursors_dir = profile.store_root().join("external_import_cursors");
         let core = assemble(profile);
-        Self { _dir: dir, core, cursors_dir }
+        Self {
+            _dir: dir,
+            core,
+            cursors_dir,
+        }
     }
 
     fn import(&self, chat_id: &str, session: &str) {
         let path = self._dir.path().join(format!("{session}.jsonl"));
         std::fs::write(&path, sentry_transcript()).expect("write transcript");
-        self.core.external_import.import(chat_id, session, &path).expect("import");
+        self.core
+            .external_import
+            .import(chat_id, session, &path)
+            .expect("import");
     }
 
     fn cursor(&self, chat_id: &str) -> serde_json::Value {
@@ -74,7 +83,11 @@ impl Fixture {
     fn edit_cursor(&self, chat_id: &str, f: impl FnOnce(&mut serde_json::Value)) {
         let mut json = self.cursor(chat_id);
         f(&mut json);
-        std::fs::write(self.cursor_path(chat_id), serde_json::to_vec(&json).unwrap()).expect("rewrite cursor");
+        std::fs::write(
+            self.cursor_path(chat_id),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .expect("rewrite cursor");
     }
 
     /// Make the cursor look like a pre-versioning one that filed this chat
@@ -112,7 +125,11 @@ async fn stale_stamped_chat_is_reclassified_and_restamped() {
     fx.make_stale("chat-a");
     assert_eq!(fx.category("chat-a"), "research");
 
-    let (recategorized, restamped) = fx.core.external_import.reclassify_stale_classifier_version().expect("pass");
+    let (recategorized, restamped) = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("pass");
     assert_eq!((recategorized, restamped), (1, 0));
     assert_eq!(fx.category("chat-a"), "debug");
     assert_eq!(fx.cursor("chat-a")["classifierVersion"], CLASSIFIER_VERSION);
@@ -130,9 +147,37 @@ async fn older_numeric_stamp_is_also_stale() {
         j["category"] = "research".into();
         j["classifierVersion"] = 1.into();
     });
-    let (recategorized, _) = fx.core.external_import.reclassify_stale_classifier_version().expect("pass");
+    let (recategorized, _) = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("pass");
     assert_eq!(recategorized, 1);
     assert_eq!(fx.category("chat-a"), "debug");
+    fx.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn previous_version_stamp_is_reclassified_after_classifier_change() {
+    assert_eq!(
+        CLASSIFIER_VERSION, 7,
+        "update this fixture for the next bump"
+    );
+    let fx = Fixture::new();
+    fx.import("chat-a", "sess-a");
+    fx.edit_cursor("chat-a", |j| {
+        j["category"] = "research".into();
+        j["classifierVersion"] = 6.into();
+    });
+
+    let (recategorized, restamped) = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("pass");
+    assert_eq!((recategorized, restamped), (1, 0));
+    assert_eq!(fx.category("chat-a"), "debug");
+    assert_eq!(fx.cursor("chat-a")["classifierVersion"], 7);
     fx.core.shutdown().await;
 }
 
@@ -144,7 +189,11 @@ async fn unchanged_category_only_updates_the_stamp() {
     fx.edit_cursor("chat-a", |j| {
         j.as_object_mut().unwrap().remove("classifierVersion");
     });
-    let (recategorized, restamped) = fx.core.external_import.reclassify_stale_classifier_version().expect("pass");
+    let (recategorized, restamped) = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("pass");
     assert_eq!((recategorized, restamped), (0, 1));
     assert_eq!(fx.category("chat-a"), "debug");
     assert_eq!(fx.cursor("chat-a")["classifierVersion"], CLASSIFIER_VERSION);
@@ -157,7 +206,11 @@ async fn same_version_chat_is_untouched() {
     fx.import("chat-a", "sess-a");
     // Deliberately "wrong" category under the current stamp: must not be recomputed.
     fx.edit_cursor("chat-a", |j| j["category"] = "research".into());
-    let (recategorized, restamped) = fx.core.external_import.reclassify_stale_classifier_version().expect("pass");
+    let (recategorized, restamped) = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("pass");
     assert_eq!((recategorized, restamped), (0, 0));
     assert_eq!(fx.category("chat-a"), "research");
     fx.core.shutdown().await;
@@ -168,12 +221,23 @@ async fn pass_is_idempotent() {
     let fx = Fixture::new();
     fx.import("chat-a", "sess-a");
     fx.make_stale("chat-a");
-    let first = fx.core.external_import.reclassify_stale_classifier_version().expect("first");
+    let first = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("first");
     assert_eq!(first, (1, 0));
     let bytes_after_first = std::fs::read(fx.cursor_path("chat-a")).unwrap();
-    let second = fx.core.external_import.reclassify_stale_classifier_version().expect("second");
+    let second = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("second");
     assert_eq!(second, (0, 0));
-    assert_eq!(std::fs::read(fx.cursor_path("chat-a")).unwrap(), bytes_after_first);
+    assert_eq!(
+        std::fs::read(fx.cursor_path("chat-a")).unwrap(),
+        bytes_after_first
+    );
     fx.core.shutdown().await;
 }
 
@@ -182,11 +246,22 @@ async fn missing_transcript_is_skipped_without_stamping() {
     let fx = Fixture::new();
     fx.import("chat-a", "sess-a");
     fx.make_stale("chat-a");
-    std::fs::remove_file(Path::new(fx.cursor("chat-a")["transcriptPath"].as_str().unwrap())).unwrap();
-    let result = fx.core.external_import.reclassify_stale_classifier_version().expect("pass");
+    std::fs::remove_file(Path::new(
+        fx.cursor("chat-a")["transcriptPath"].as_str().unwrap(),
+    ))
+    .unwrap();
+    let result = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .expect("pass");
     assert_eq!(result, (0, 0));
     assert_eq!(fx.category("chat-a"), "research");
-    assert!(fx.cursor("chat-a").get("classifierVersion").is_none_or(|v| v.is_null()));
+    assert!(
+        fx.cursor("chat-a")
+            .get("classifierVersion")
+            .is_none_or(|v| v.is_null())
+    );
     fx.core.shutdown().await;
 }
 
@@ -201,13 +276,37 @@ async fn empty_category_backfill_still_works_and_stamps() {
     });
 
     // The version pass leaves an empty-category chat to the backfill...
-    assert_eq!(fx.core.external_import.reclassify_stale_classifier_version().unwrap(), (0, 0));
+    assert_eq!(
+        fx.core
+            .external_import
+            .reclassify_stale_classifier_version()
+            .unwrap(),
+        (0, 0)
+    );
     // ...which classifies it with the current heuristic and stamps it.
-    assert_eq!(fx.core.external_import.repair_missing_classification().unwrap(), 1);
+    assert_eq!(
+        fx.core
+            .external_import
+            .repair_missing_classification()
+            .unwrap(),
+        1
+    );
     assert_eq!(fx.category("chat-a"), "debug");
     assert_eq!(fx.cursor("chat-a")["classifierVersion"], CLASSIFIER_VERSION);
-    assert_eq!(fx.core.external_import.repair_missing_classification().unwrap(), 0);
-    assert_eq!(fx.core.external_import.reclassify_stale_classifier_version().unwrap(), (0, 0));
+    assert_eq!(
+        fx.core
+            .external_import
+            .repair_missing_classification()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fx.core
+            .external_import
+            .reclassify_stale_classifier_version()
+            .unwrap(),
+        (0, 0)
+    );
     fx.core.shutdown().await;
 }
 
@@ -258,7 +357,10 @@ impl ChatCategoryClassifier for MockJev {
 
 impl Fixture {
     fn importer(&self, jev: &Arc<MockJev>) -> ExternalSessionImporter {
-        self.core.external_import.clone().with_chat_category_classifier(jev.clone())
+        self.core
+            .external_import
+            .clone()
+            .with_chat_category_classifier(jev.clone())
     }
 
     fn import_via(&self, importer: &ExternalSessionImporter, chat_id: &str, session: &str) {
@@ -268,7 +370,10 @@ impl Fixture {
     }
 
     fn source(&self, chat_id: &str) -> String {
-        self.cursor(chat_id)["classifierSource"].as_str().unwrap_or("<absent>").to_string()
+        self.cursor(chat_id)["classifierSource"]
+            .as_str()
+            .unwrap_or("<absent>")
+            .to_string()
     }
 
     /// Import `n` chats heuristically (no Jev), i.e. stamped current-version
@@ -314,7 +419,11 @@ async fn import_falls_back_to_the_heuristic_when_jev_fails() {
     assert_eq!(jev.calls(), 1);
     assert_eq!(fx.category("chat-a"), "debug");
     assert_eq!(fx.source("chat-a"), "heuristic");
-    assert!(fx.cursor("chat-a").get("jevInconclusiveVersion").is_none_or(|v| v.is_null()));
+    assert!(
+        fx.cursor("chat-a")
+            .get("jevInconclusiveVersion")
+            .is_none_or(|v| v.is_null())
+    );
     fx.core.shutdown().await;
 }
 
@@ -325,7 +434,25 @@ async fn import_with_inconclusive_jev_falls_back_and_remembers() {
     fx.import_via(&fx.importer(&jev), "chat-a", "sess-a");
     assert_eq!(fx.category("chat-a"), "debug");
     assert_eq!(fx.source("chat-a"), "heuristic");
-    assert_eq!(fx.cursor("chat-a")["jevInconclusiveVersion"], CLASSIFIER_VERSION);
+    assert_eq!(
+        fx.cursor("chat-a")["jevInconclusiveVersion"],
+        CLASSIFIER_VERSION
+    );
+    fx.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn jev_other_does_not_override_a_specific_heuristic_category() {
+    let fx = Fixture::new();
+    let jev = MockJev::says("other");
+    fx.import_via(&fx.importer(&jev), "chat-a", "sess-a");
+    assert_eq!(jev.calls(), 1);
+    assert_eq!(fx.category("chat-a"), "debug");
+    assert_eq!(fx.source("chat-a"), "heuristic");
+    assert_eq!(
+        fx.cursor("chat-a")["jevInconclusiveVersion"],
+        CLASSIFIER_VERSION
+    );
     fx.core.shutdown().await;
 }
 
@@ -344,25 +471,48 @@ async fn import_without_a_key_never_calls_jev() {
 async fn heuristic_stamped_chat_with_key_present_is_stale_and_upgrades() {
     let fx = Fixture::new();
     fx.import("chat-a", "sess-a");
-    assert_eq!((fx.category("chat-a").as_str(), fx.source("chat-a").as_str()), ("debug", "heuristic"));
+    assert_eq!(
+        (fx.category("chat-a").as_str(), fx.source("chat-a").as_str()),
+        ("debug", "heuristic")
+    );
 
     // No key: same stamp version, heuristic source -> not stale, nothing touched.
     let keyless = MockJev::keyless();
     let before = std::fs::read(fx.cursor_path("chat-a")).unwrap();
-    assert_eq!(fx.importer(&keyless).reclassify_stale_classifier_version().unwrap(), (0, 0));
+    assert_eq!(
+        fx.importer(&keyless)
+            .reclassify_stale_classifier_version()
+            .unwrap(),
+        (0, 0)
+    );
     assert_eq!(std::fs::read(fx.cursor_path("chat-a")).unwrap(), before);
     assert_eq!(keyless.calls(), 0);
 
     // Key present: stale by the source rule, upgraded to Jev's answer.
     let jev = MockJev::says("research");
-    let report = fx.importer(&jev).reclassify_stale_classifier_version_report().unwrap();
-    assert_eq!((report.recategorized, report.restamped, report.jev_classified), (1, 0, 1));
+    let report = fx
+        .importer(&jev)
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
+    assert_eq!(
+        (
+            report.recategorized,
+            report.restamped,
+            report.jev_classified
+        ),
+        (1, 0, 1)
+    );
     assert_eq!(jev.calls(), 1);
     assert_eq!(fx.category("chat-a"), "research");
     assert_eq!(fx.source("chat-a"), "jev");
 
     // Now jev-stamped: a further key-present pass is a no-op.
-    assert_eq!(fx.importer(&jev).reclassify_stale_classifier_version().unwrap(), (0, 0));
+    assert_eq!(
+        fx.importer(&jev)
+            .reclassify_stale_classifier_version()
+            .unwrap(),
+        (0, 0)
+    );
     assert_eq!(jev.calls(), 1);
     fx.core.shutdown().await;
 }
@@ -372,8 +522,18 @@ async fn upgrade_with_the_same_category_only_restamps_the_source() {
     let fx = Fixture::new();
     fx.import("chat-a", "sess-a");
     let jev = MockJev::says("debug");
-    let report = fx.importer(&jev).reclassify_stale_classifier_version_report().unwrap();
-    assert_eq!((report.recategorized, report.restamped, report.jev_classified), (0, 1, 1));
+    let report = fx
+        .importer(&jev)
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
+    assert_eq!(
+        (
+            report.recategorized,
+            report.restamped,
+            report.jev_classified
+        ),
+        (0, 1, 1)
+    );
     assert_eq!(fx.source("chat-a"), "jev");
     fx.core.shutdown().await;
 }
@@ -387,9 +547,20 @@ async fn keyless_boot_does_not_churn_jev_stamped_chats() {
 
     let bytes = std::fs::read(fx.cursor_path("chat-a")).unwrap();
     let keyless = MockJev::keyless();
-    assert!(fx.importer(&keyless).reclassify_stale_classifier_version_report().unwrap().is_empty());
+    assert!(
+        fx.importer(&keyless)
+            .reclassify_stale_classifier_version_report()
+            .unwrap()
+            .is_empty()
+    );
     // The default importer (no classifier configured at all) is equally inert.
-    assert_eq!(fx.core.external_import.reclassify_stale_classifier_version().unwrap(), (0, 0));
+    assert_eq!(
+        fx.core
+            .external_import
+            .reclassify_stale_classifier_version()
+            .unwrap(),
+        (0, 0)
+    );
     assert_eq!(keyless.calls(), 0);
     assert_eq!(std::fs::read(fx.cursor_path("chat-a")).unwrap(), bytes);
     assert_eq!(fx.category("chat-a"), "planning");
@@ -402,7 +573,12 @@ async fn jev_stamped_chat_with_key_present_is_left_alone() {
     let jev = MockJev::says("planning");
     fx.import_via(&fx.importer(&jev), "chat-a", "sess-a");
     let calls_after_import = jev.calls();
-    assert!(fx.importer(&jev).reclassify_stale_classifier_version_report().unwrap().is_empty());
+    assert!(
+        fx.importer(&jev)
+            .reclassify_stale_classifier_version_report()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(jev.calls(), calls_after_import);
     fx.core.shutdown().await;
 }
@@ -415,7 +591,9 @@ async fn cap_limits_jev_reclassifications_per_pass() {
     let jev = MockJev::says("planning");
     let importer = fx.importer(&jev);
 
-    let report = importer.reclassify_stale_classifier_version_report().unwrap();
+    let report = importer
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(jev.calls(), 25);
     assert_eq!(report.jev_classified, 25);
     assert_eq!(report.jev_deferred, 1);
@@ -426,11 +604,18 @@ async fn cap_limits_jev_reclassifications_per_pass() {
     assert_eq!(fx.category(left), "debug");
 
     // Next pass picks up the remainder.
-    let report = importer.reclassify_stale_classifier_version_report().unwrap();
+    let report = importer
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!((report.jev_classified, report.jev_deferred), (1, 0));
     assert_eq!(jev.calls(), 26);
     assert_eq!(fx.count_with_source(&ids, "jev"), 26);
-    assert!(importer.reclassify_stale_classifier_version_report().unwrap().is_empty());
+    assert!(
+        importer
+            .reclassify_stale_classifier_version_report()
+            .unwrap()
+            .is_empty()
+    );
     fx.core.shutdown().await;
 }
 
@@ -442,7 +627,10 @@ async fn version_stale_chats_beyond_the_cap_still_get_a_heuristic_restamp() {
         fx.make_stale(id); // category "research", unstamped
     }
     let jev = MockJev::says("planning");
-    let report = fx.importer(&jev).reclassify_stale_classifier_version_report().unwrap();
+    let report = fx
+        .importer(&jev)
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(jev.calls(), 25);
     assert_eq!(report.jev_classified, 25);
     assert_eq!(report.jev_deferred, 0);
@@ -457,7 +645,10 @@ async fn version_stale_chats_beyond_the_cap_still_get_a_heuristic_restamp() {
     assert_eq!(fx.category(over_cap), "debug"); // the current heuristic's answer
 
     // The heuristic-stamped straggler upgrades on the next keyed pass.
-    let report = fx.importer(&jev).reclassify_stale_classifier_version_report().unwrap();
+    let report = fx
+        .importer(&jev)
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(report.jev_classified, 1);
     assert_eq!(jev.calls(), 26);
     fx.core.shutdown().await;
@@ -471,7 +662,10 @@ async fn keyless_pass_reclassifies_version_stale_chats_uncapped_with_the_heurist
         fx.make_stale(id);
     }
     let keyless = MockJev::keyless();
-    let report = fx.importer(&keyless).reclassify_stale_classifier_version_report().unwrap();
+    let report = fx
+        .importer(&keyless)
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(report.recategorized, 30);
     assert_eq!(report.jev_classified, 0);
     assert_eq!(keyless.calls(), 0);
@@ -487,7 +681,9 @@ async fn failed_jev_in_the_pass_falls_back_counts_against_the_cap_and_retries_la
     let jev = MockJev::new(true, JevOutcome::Failed);
     let importer = fx.importer(&jev);
 
-    let report = importer.reclassify_stale_classifier_version_report().unwrap();
+    let report = importer
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(jev.calls(), 3);
     assert_eq!(report.jev_classified, 0);
     assert_eq!(fx.count_with_source(&ids, "heuristic"), 3);
@@ -495,10 +691,15 @@ async fn failed_jev_in_the_pass_falls_back_counts_against_the_cap_and_retries_la
 
     // Transient failure: still key-present-stale, so the next pass tries again...
     *jev.outcome.lock().unwrap() = JevOutcome::Category("research".into());
-    let report = importer.reclassify_stale_classifier_version_report().unwrap();
+    let report = importer
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(report.jev_classified, 3);
     assert_eq!(jev.calls(), 6);
-    assert!(ids.iter().all(|id| fx.category(id) == "research" && fx.source(id) == "jev"));
+    assert!(
+        ids.iter()
+            .all(|id| fx.category(id) == "research" && fx.source(id) == "jev")
+    );
     fx.core.shutdown().await;
 }
 
@@ -509,15 +710,25 @@ async fn inconclusive_jev_is_not_retried_every_boot() {
     let jev = MockJev::new(true, JevOutcome::Inconclusive);
     let importer = fx.importer(&jev);
 
-    let report = importer.reclassify_stale_classifier_version_report().unwrap();
+    let report = importer
+        .reclassify_stale_classifier_version_report()
+        .unwrap();
     assert_eq!(jev.calls(), 1);
     assert_eq!(report.jev_classified, 0);
     assert_eq!(fx.source("chat-a"), "heuristic");
     assert_eq!(fx.category("chat-a"), "debug");
-    assert_eq!(fx.cursor("chat-a")["jevInconclusiveVersion"], CLASSIFIER_VERSION);
+    assert_eq!(
+        fx.cursor("chat-a")["jevInconclusiveVersion"],
+        CLASSIFIER_VERSION
+    );
 
     // Deterministic outcome: later passes leave it alone (and spend nothing).
-    assert!(importer.reclassify_stale_classifier_version_report().unwrap().is_empty());
+    assert!(
+        importer
+            .reclassify_stale_classifier_version_report()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(jev.calls(), 1);
     fx.core.shutdown().await;
 }
@@ -533,7 +744,11 @@ async fn old_stamp_without_a_source_reads_as_heuristic() {
         j.as_object_mut().unwrap().remove("jevInconclusiveVersion");
     });
     assert_eq!(fx.source("chat-a"), "<absent>");
-    let (recategorized, restamped) = fx.core.external_import.reclassify_stale_classifier_version().unwrap();
+    let (recategorized, restamped) = fx
+        .core
+        .external_import
+        .reclassify_stale_classifier_version()
+        .unwrap();
     assert_eq!(recategorized + restamped, 1);
     assert_eq!(fx.cursor("chat-a")["classifierVersion"], CLASSIFIER_VERSION);
     assert_eq!(fx.source("chat-a"), "heuristic");

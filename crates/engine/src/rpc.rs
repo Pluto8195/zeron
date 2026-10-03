@@ -73,7 +73,7 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
-use crate::repos::{Repos, home_dir};
+use crate::repos::Repos;
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
@@ -101,6 +101,10 @@ struct ListModelsParams {
     /// need one, and for a chat with no cwd yet (a blank new-chat screen).
     #[serde(default)]
     cwd: String,
+    /// `ListCommands` only: identifies the project-less chat whose stable
+    /// scratch directory should be used when cwd is `~` or a legacy HOME.
+    #[serde(default)]
+    chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,8 +192,10 @@ struct ChatLinkStatusParams {
 }
 
 /// `SET_CHAT_LINK` request: `{chatId, kind: "pr" | "ticket", value: string |
-/// null}`. Always writes source `manual` — the only writer allowed to CLEAR
-/// a slot (`value: null` unlinks); mined writes never ride this RPC.
+/// null, operation?: "add" | "remove" | "clear"}`. Missing `operation`
+/// preserves the original contract: a value adds/sets, null clears. PR
+/// removal names the exact URL so one linked PR can be removed without
+/// disturbing its siblings.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetChatLinkParams {
@@ -197,6 +203,8 @@ struct SetChatLinkParams {
     kind: String,
     #[serde(default)]
     value: Option<String>,
+    #[serde(default)]
+    operation: Option<String>,
 }
 
 /// `PLAN_CHAT_WORKSPACE` request: `{message, cwd}`.
@@ -525,7 +533,8 @@ enum MutateParams {
         chat_id: String,
         /// The project the chat is created in — fixes host device + base cwd.
         /// `None` mints a project-less chat: `deviceId` picks the host and the
-        /// cwd defaults to `~` (expanded on the host at run time).
+        /// cwd defaults to the portable `~` marker (resolved on the host to a
+        /// Zeron-owned per-chat scratch directory at run time).
         #[serde(default)]
         space_id: Option<String>,
         /// Host device for a project-less chat; ignored when `spaceId` is set.
@@ -759,7 +768,10 @@ impl EngineRpc {
     /// Attach the context-usage provider (`ChatContextUsage`). Every runtime
     /// has one (unconditional, like `external_import`/`pr_ticket_cache`) —
     /// `EngineCore::rpc_service` always calls this.
-    pub fn with_context_usage(mut self, provider: crate::context_usage::ContextUsageProvider) -> Self {
+    pub fn with_context_usage(
+        mut self,
+        provider: crate::context_usage::ContextUsageProvider,
+    ) -> Self {
         self.context_usage = Some(provider);
         self
     }
@@ -800,12 +812,16 @@ impl EngineRpc {
             .and_then(|c| c.harness_session_id)
             .unwrap_or_default();
         let cwd = cwd.to_string();
-        tokio::task::spawn_blocking(move || crate::liveness::live_process_matches(&session_id, &cwd))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            crate::liveness::live_process_matches(&session_id, &cwd)
+        })
+        .await
+        .unwrap_or(false)
     }
 
-    fn external_importer(&self) -> Result<&crate::external_import::ExternalSessionImporter, RpcError> {
+    fn external_importer(
+        &self,
+    ) -> Result<&crate::external_import::ExternalSessionImporter, RpcError> {
         self.external_import
             .as_ref()
             .ok_or_else(|| RpcError::Failed("external import unavailable".into()))
@@ -1239,6 +1255,7 @@ fn forwardable(method: &str) -> bool {
             | methods::STEER_QUEUED_MESSAGE_NOW
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
+            | methods::GET_REPOSITORY_TOPOLOGY
             | methods::ADD_REPO
             | methods::CLONE_REPO
             | methods::CREATE_REPO
@@ -1616,8 +1633,12 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let cwd = self
+                    .sessions
+                    .resolve_cwd(p.chat_id.as_deref().unwrap_or("command-discovery"), &p.cwd)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
-                    .commands(&p.cwd)
+                    .commands(&cwd)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
@@ -2018,7 +2039,11 @@ impl RpcService for EngineRpc {
                 let p: ImportExternalSessionParams = parse_params(params)?;
                 let importer = self.external_importer()?.clone();
                 let imported = tokio::task::spawn_blocking(move || {
-                    importer.import(&p.chat_id, &p.external_session_id, std::path::Path::new(&p.path))
+                    importer.import(
+                        &p.chat_id,
+                        &p.external_session_id,
+                        std::path::Path::new(&p.path),
+                    )
                 })
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?
@@ -2081,20 +2106,31 @@ impl RpcService for EngineRpc {
             }
             methods::CHAT_LINK_STATUS => {
                 let p: ChatLinkStatusParams = parse_params(params)?;
-                let chat = self.workspace.chat(&p.chat_id).map_err(|e| RpcError::Failed(e.to_string()))?;
-                let mut status = self.pr_ticket_cache()?.status_for(
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let pr_links = self
+                    .workspace
+                    .chat_pr_links(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let mut status = self.pr_ticket_cache()?.status_for_links(
                     chat.as_ref().and_then(|c| c.cwd.as_deref()),
                     chat.as_ref().and_then(|c| c.branch.as_deref()),
-                    chat.as_ref().and_then(|c| c.linked_pr_url.as_deref()),
+                    &pr_links,
                     chat.as_ref().and_then(|c| c.linked_ticket_id.as_deref()),
                 );
                 if let Some(chat) = &chat {
                     // `prSource`/`ticketSource`: the durable link's own
                     // provenance when one is set, else `None` — the shown
                     // value came from branch/title inference instead.
-                    status.pr_source = chat.linked_pr_url.as_ref().and(chat.linked_pr_source);
-                    status.ticket_source =
-                        chat.linked_ticket_id.as_ref().and(chat.linked_ticket_source);
+                    if status.pr_links.is_empty() {
+                        status.pr_source = chat.linked_pr_url.as_ref().and(chat.linked_pr_source);
+                    }
+                    status.ticket_source = chat
+                        .linked_ticket_id
+                        .as_ref()
+                        .and(chat.linked_ticket_source);
 
                     // Ticket-from-PR (design item 5): a chat with PR detail
                     // (linked or inferred) but no ticket link and no regex
@@ -2112,15 +2148,20 @@ impl RpcService for EngineRpc {
                             .and_then(crate::pr_ticket_cache::extract_ticket_id)
                             .is_some();
                     if !has_ticket_signal
-                        && let Some(pr) = &status.pr
-                        && let Some(ticket_id) = pr
-                            .title
-                            .as_deref()
-                            .and_then(crate::pr_ticket_cache::extract_ticket_id)
-                            .or_else(|| {
-                                pr.branch
+                        && let Some(ticket_id) = status
+                            .pr_links
+                            .iter()
+                            .filter_map(|link| link.detail.as_ref())
+                            .chain(status.pr.iter())
+                            .find_map(|pr| {
+                                pr.title
                                     .as_deref()
                                     .and_then(crate::pr_ticket_cache::extract_ticket_id)
+                                    .or_else(|| {
+                                        pr.branch
+                                            .as_deref()
+                                            .and_then(crate::pr_ticket_cache::extract_ticket_id)
+                                    })
                             })
                     {
                         match self.workspace.set_chat_link(
@@ -2151,18 +2192,58 @@ impl RpcService for EngineRpc {
                         return Err(RpcError::BadParams(format!("unknown link kind: {other}")));
                     }
                 };
-                self.workspace
-                    .set_chat_link(
-                        &p.chat_id,
-                        kind,
-                        p.value.as_deref(),
-                        zeron_proto::ChatLinkSource::Manual,
-                    )
+                match (kind, p.operation.as_deref()) {
+                    (crate::workspace_host::ChatLinkKind::Pr, Some("remove")) => {
+                        let url = p.value.as_deref().ok_or_else(|| {
+                            RpcError::BadParams("remove requires a PR URL value".into())
+                        })?;
+                        self.workspace
+                            .remove_chat_pr_link(&p.chat_id, url)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    (crate::workspace_host::ChatLinkKind::Pr, Some("clear")) => {
+                        self.workspace
+                            .clear_chat_pr_links(&p.chat_id)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    (crate::workspace_host::ChatLinkKind::Ticket, Some("remove" | "clear")) => {
+                        self.workspace
+                            .set_chat_link(
+                                &p.chat_id,
+                                kind,
+                                None,
+                                zeron_proto::ChatLinkSource::Manual,
+                            )
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    (_, Some(operation)) if operation != "add" => {
+                        return Err(RpcError::BadParams(format!(
+                            "unknown link operation: {operation}"
+                        )));
+                    }
+                    _ => {
+                        self.workspace
+                            .set_chat_link(
+                                &p.chat_id,
+                                kind,
+                                p.value.as_deref(),
+                                zeron_proto::ChatLinkSource::Manual,
+                            )
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                }
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let chat = self.workspace.chat(&p.chat_id).map_err(|e| RpcError::Failed(e.to_string()))?;
+                let linked_pr_links = self
+                    .workspace
+                    .chat_pr_links(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({
                     "linkedPrUrl": chat.as_ref().and_then(|c| c.linked_pr_url.clone()),
                     "linkedPrSource": chat.as_ref().and_then(|c| c.linked_pr_source),
+                    "linkedPrLinks": linked_pr_links,
                     "linkedTicketId": chat.as_ref().and_then(|c| c.linked_ticket_id.clone()),
                     "linkedTicketSource": chat.as_ref().and_then(|c| c.linked_ticket_source),
                 }))
@@ -2204,17 +2285,20 @@ impl RpcService for EngineRpc {
                     // — then derive the subagent's own file from it. Never
                     // trust a client-supplied path (see
                     // `methods::READ_SUBAGENT_TRANSCRIPT`'s doc comment).
-                    let parent = provider.transcript_path_for_chat(&workspace, &importer, &p.chat_id)?;
-                    let subagent_path = parent
-                        .as_deref()
-                        .and_then(|parent| crate::subagent_scan::subagent_transcript_path(parent, &p.agent_id));
+                    let parent =
+                        provider.transcript_path_for_chat(&workspace, &importer, &p.chat_id)?;
+                    let subagent_path = parent.as_deref().and_then(|parent| {
+                        crate::subagent_scan::subagent_transcript_path(parent, &p.agent_id)
+                    });
                     match subagent_path {
                         // An unknown chat/agent, or one whose transcript
                         // hasn't been written (yet/anymore), resolves to a
                         // path that just doesn't exist — the cache already
                         // treats that as an empty transcript, not an error.
                         Some(path) => cache.get_or_build(&path),
-                        None => Ok(std::sync::Arc::new(crate::subagent_transcript::SubagentTranscript::default())),
+                        None => Ok(std::sync::Arc::new(
+                            crate::subagent_transcript::SubagentTranscript::default(),
+                        )),
                     }
                 })
                 .await
@@ -2225,7 +2309,9 @@ impl RpcService for EngineRpc {
             methods::CHAT_CLASSIFICATION => {
                 let p: ChatLinkStatusParams = parse_params(params)?;
                 let importer = self.external_importer()?.clone();
+                let context_usage = self.context_usage()?.clone();
                 let (classification, tool_usage) = tokio::task::spawn_blocking(move || {
+                    importer.ensure_native_classification(&context_usage, &p.chat_id)?;
                     let classification = importer.classification_for(&p.chat_id)?;
                     let tool_usage = importer.tool_usage_for(&p.chat_id)?;
                     Ok::<_, crate::EngineError>((classification, tool_usage))
@@ -2245,10 +2331,13 @@ impl RpcService for EngineRpc {
             methods::RECLASSIFY_OTHER_CHATS => {
                 // Up to 50 blocking Jev HTTP calls: never on a runtime worker.
                 let importer = self.external_importer()?.clone();
-                let report = tokio::task::spawn_blocking(move || importer.reclassify_other_chats())
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let context_usage = self.context_usage()?.clone();
+                let report = tokio::task::spawn_blocking(move || {
+                    importer.reclassify_other_chats_with_context(&context_usage)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&report)
             }
             methods::CHAT_CONTEXT_USAGE => {
@@ -2280,20 +2369,20 @@ impl RpcService for EngineRpc {
                 // client through `EngineRpc` for it.
                 let http = reqwest::Client::new();
                 let plan =
-                    crate::chat_workspace_plan::plan_chat_workspace(&http, &p.message, &p.cwd).await;
+                    crate::chat_workspace_plan::plan_chat_workspace(&http, &p.message, &p.cwd)
+                        .await;
                 RpcReply::value(&plan)
             }
             methods::CREATE_CHAT_WORKTREE => {
                 let p: CreateChatWorktreeParams = parse_params(params)?;
                 let repo_path = std::path::PathBuf::from(&p.repo_path);
                 let name = p.name.clone();
-                let worktree =
-                    tokio::task::spawn_blocking(move || {
-                        crate::chat_workspace_plan::create_chat_worktree(&repo_path, &name)
-                    })
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let worktree = tokio::task::spawn_blocking(move || {
+                    crate::chat_workspace_plan::create_chat_worktree(&repo_path, &name)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // Stamp the chat's cwd so its next dispatch runs in the new
                 // worktree automatically (same durable field `SetChatCwd`/
                 // `Mutate` writes, and the same one `materialize_worktree`'s
@@ -2302,7 +2391,10 @@ impl RpcService for EngineRpc {
                 // error doesn't fail worktree creation itself — the worktree
                 // is real and usable either way, just not yet wired to this
                 // chat's next send.
-                match self.workspace.set_chat_cwd(&p.chat_id, &worktree.worktree_path) {
+                match self
+                    .workspace
+                    .set_chat_cwd(&p.chat_id, &worktree.worktree_path)
+                {
                     Ok(true) => {}
                     Ok(false) => tracing::warn!(
                         chat = %p.chat_id,
@@ -2654,6 +2746,48 @@ impl RpcService for EngineRpc {
                 .await
             }
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
+            methods::GET_REPOSITORY_TOPOLOGY => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    space_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let chats: Vec<_> = self
+                    .workspace
+                    .read_chats()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .into_iter()
+                    .filter(|chat| {
+                        chat.space_id.as_deref() == Some(space.id.as_str())
+                            && chat.device_id == space.device_id
+                    })
+                    .collect();
+                let mut linked_pr_urls = std::collections::HashMap::new();
+                for chat in &chats {
+                    let urls = self
+                        .workspace
+                        .chat_pr_links(&chat.id)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                        .into_iter()
+                        .map(|link| link.url)
+                        .collect();
+                    linked_pr_urls.insert(chat.id.clone(), urls);
+                }
+                let sessions = self.sessions.watch_sessions().borrow().clone();
+                let topology = crate::repository_topology::build(
+                    &self.repos,
+                    self.doc_host.device_id(),
+                    &space,
+                    chats,
+                    sessions,
+                    linked_pr_urls,
+                )
+                .await
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&topology)
+            }
             methods::ADD_REPO => {
                 #[derive(Deserialize)]
                 struct P {
@@ -3100,15 +3234,19 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
-                let cwd = self
+                // The terminal runs in the chat's checkout. Project-less (`~`)
+                // and not-yet-materialized chats use the same Zeron-owned
+                // per-chat scratch as agent runs, never the person's HOME.
+                let stored_cwd = self
                     .workspace
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                    .and_then(|chat| chat.cwd);
+                let cwd = self
+                    .sessions
+                    .resolve_cwd(&p.chat_id, stored_cwd.as_deref().unwrap_or("~"))
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -3236,6 +3374,9 @@ impl RpcService for EngineRpc {
                     .into_iter()
                     .filter_map(|chat| chat.cwd)
                     .map(std::path::PathBuf::from)
+                    // A historical chat rooted at HOME must not widen the
+                    // attachment-read jail to every personal file on disk.
+                    .filter(|root| !crate::repos::is_automatic_access_blocked(root))
                     .collect();
                 let chunk = self
                     .uploads
@@ -3274,7 +3415,11 @@ mod tests {
         .unwrap();
         assert_eq!(p.chat_id, "c1");
         assert_eq!(p.kind, "pr");
-        assert_eq!(p.value.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+        assert_eq!(
+            p.value.as_deref(),
+            Some("https://github.com/acme/widgets/pull/1")
+        );
+        assert!(p.operation.is_none());
 
         let cleared: SetChatLinkParams = parse_params(serde_json::json!({
             "chatId": "c1",
@@ -3284,6 +3429,16 @@ mod tests {
         .unwrap();
         assert_eq!(cleared.kind, "ticket");
         assert!(cleared.value.is_none());
+        assert!(cleared.operation.is_none());
+
+        let remove: SetChatLinkParams = parse_params(serde_json::json!({
+            "chatId": "c1",
+            "kind": "pr",
+            "value": "https://github.com/acme/widgets/pull/2",
+            "operation": "remove",
+        }))
+        .unwrap();
+        assert_eq!(remove.operation.as_deref(), Some("remove"));
     }
 
     /// `CHAT_LINK_STATUS`/`SET_CHAT_LINK` are both device-local (`gh`/CLI
@@ -3307,6 +3462,9 @@ mod tests {
             examined: 5,
             reclassified: 2,
             unchanged: 2,
+            confirmed_other: 1,
+            inconclusive: 1,
+            failed: 0,
             jev_calls: 4,
             deferred: 1,
         };
@@ -3316,6 +3474,9 @@ mod tests {
                 "examined": 5,
                 "reclassified": 2,
                 "unchanged": 2,
+                "confirmedOther": 1,
+                "inconclusive": 1,
+                "failed": 0,
                 "jevCalls": 4,
                 "deferred": 1,
             })
@@ -3606,9 +3767,22 @@ mod tests {
         let old: ListModelsParams =
             serde_json::from_value(serde_json::json!({"harness":"codex"})).unwrap();
         assert!(!old.force);
+        assert!(old.chat_id.is_none());
         let forced: ListModelsParams =
             serde_json::from_value(serde_json::json!({"harness":"codex","force":true})).unwrap();
         assert!(forced.force);
+    }
+
+    #[test]
+    fn list_commands_accepts_chat_identity_for_safe_cwd_resolution() {
+        let params: ListModelsParams = serde_json::from_value(serde_json::json!({
+            "harness": "claude-code",
+            "cwd": "/Users/person",
+            "chatId": "chat-legacy-home"
+        }))
+        .unwrap();
+        assert_eq!(params.chat_id.as_deref(), Some("chat-legacy-home"));
+        assert_eq!(params.cwd, "/Users/person");
     }
 
     #[test]

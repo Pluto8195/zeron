@@ -614,8 +614,8 @@ pub struct Pickers {
     /// Count of selected candidates that came back liveness-concerning,
     /// awaiting one aggregate confirmation before the batch runs.
     import_bulk_confirm_pending: Option<usize>,
-    /// New-chat worktree chip pick (`Auto` default, one-shot per new chat —
-    /// taken + reset by the composer's first send; never persisted).
+    /// New-chat worktree chip pick (`Main checkout` default, one-shot per new
+    /// chat — taken + reset by the composer's first send; never persisted).
     workspace_choice: WorkspaceChoice,
     /// Per-chat outcome of that pick (pending/decided), shown as a badge in
     /// the session footer. In-memory: it narrates this app session's sends.
@@ -2198,8 +2198,9 @@ impl Pickers {
         git && local_target && matches!(self.checkout_plan(), CheckoutPlan::CurrentCheckout { .. })
     }
 
-    /// The draft pick for the send about to happen; resets to `Auto` so the
-    /// next new chat starts fresh (explicit picks are one-shot).
+    /// The draft pick for the send about to happen; resets to `Main checkout`
+    /// so the next new chat does not create a worktree without an explicit
+    /// choice (explicit picks are one-shot).
     pub fn take_workspace_choice(&mut self) -> WorkspaceChoice {
         std::mem::take(&mut self.workspace_choice)
     }
@@ -2214,7 +2215,7 @@ impl Pickers {
         cx.notify();
     }
 
-    /// The clickable draft chip: cycles Auto → Worktree → Main checkout.
+    /// The clickable draft chip: cycles Main checkout → Worktree → Auto.
     fn render_workspace_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.workspace_chip_eligible(cx) {
             return None;
@@ -2297,7 +2298,11 @@ impl Pickers {
                 .text_color(color)
                 .when(outcome.is_pending(), |el| el.opacity(0.75))
                 .tooltip(move |_, cx| cx.new(|_| WorkspaceChipTooltip(tooltip.clone())).into())
-                .child(crate::icons::icon(icon_path).size(px(12.0)).text_color(color))
+                .child(
+                    crate::icons::icon(icon_path)
+                        .size(px(12.0))
+                        .text_color(color),
+                )
                 .child(div().min_w_0().truncate().child(outcome.label()))
                 .into_any_element(),
         )
@@ -2475,8 +2480,15 @@ impl Pickers {
     /// shows an inline "might still be active" confirm state on the row, and
     /// only a *second* click on that same row (matched below) proceeds with
     /// the actual import, skipping the check the second time.
-    fn pick_import_candidate(&mut self, candidate: ExternalSessionCandidate, cx: &mut Context<Self>) {
-        if self.importing.is_some() || self.import_checking.is_some() || self.import_bulk_task.is_some() {
+    fn pick_import_candidate(
+        &mut self,
+        candidate: ExternalSessionCandidate,
+        cx: &mut Context<Self>,
+    ) {
+        if self.importing.is_some()
+            || self.import_checking.is_some()
+            || self.import_bulk_task.is_some()
+        {
             return; // one operation at a time
         }
         if self.import_confirm_pending.as_deref() == Some(candidate.session_id.as_str()) {
@@ -2557,7 +2569,10 @@ impl Pickers {
     /// anything and shows one aggregate confirmation rather than interrupting
     /// mid-batch per row.
     fn run_bulk_import(&mut self, skip_liveness_check: bool, cx: &mut Context<Self>) {
-        if self.importing.is_some() || self.import_checking.is_some() || self.import_bulk_task.is_some() {
+        if self.importing.is_some()
+            || self.import_checking.is_some()
+            || self.import_bulk_task.is_some()
+        {
             return;
         }
         let Some(engine) = self.engine(cx) else {
@@ -2609,7 +2624,10 @@ impl Pickers {
                 let chat_id = uuid::Uuid::new_v4().to_string();
                 let result = Self::call_import_external_session(&engine, chat_id, candidate).await;
                 if let Err(err) = result {
-                    let label = candidate.cwd.clone().unwrap_or_else(|| candidate.session_id.clone());
+                    let label = candidate
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| candidate.session_id.clone());
                     errors.push(format!("{label}: {err}"));
                 }
                 this.update(cx, |pickers, cx| {

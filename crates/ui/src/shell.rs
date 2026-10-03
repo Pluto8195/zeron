@@ -12,7 +12,7 @@
 //! dock. Double-clicking a handle resets that pane to its default width.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
@@ -23,7 +23,7 @@ use gpui::{
 };
 
 use gpui_tokio::Tokio;
-use zeron_engine::InstanceLock;
+use zeron_engine::{InstanceLock, pr_ticket_cache::ChatLinkStatus};
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 
@@ -68,8 +68,17 @@ mod sidebar_pins;
 mod sidebar_sections;
 pub(crate) mod spaces;
 mod tabs;
+pub(crate) use tabs::chat_identity_for;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
+
+const CHAT_HEADER_LINK_REFRESH: Duration = Duration::from_secs(15);
+const CHAT_HEADER_METADATA_CLEARANCE: f32 = 52.0;
+
+struct ChatHeaderLinkCache {
+    status: Option<ChatLinkStatus>,
+    fetched_at: Instant,
+}
 
 actions!(
     shell,
@@ -78,6 +87,7 @@ actions!(
         ToggleSidebar,
         ToggleChanges,
         ToggleFiles,
+        OpenMyPrs,
         AddSpacePalette,
         ToggleCommandPalette,
         OpenModelPicker,
@@ -360,6 +370,11 @@ pub fn apply_keymap(
             None,
         ),
         KeyBinding::new(
+            &valid_or_default(&keymap.open_my_prs, "mod-p"),
+            OpenMyPrs,
+            None,
+        ),
+        KeyBinding::new(
             &valid_or_default(&keymap.new_session, "mod-n"),
             NewSession,
             None,
@@ -473,6 +488,8 @@ pub enum Route {
     Settings(SettingsSection),
     /// Multi-chat overview (ticket 002): every chat at once, not one at a time.
     Overview,
+    /// Workspace repository/submodule/worktree ownership graph.
+    RepositoryTopology,
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
@@ -579,6 +596,7 @@ pub enum NavEntry {
     Chat(String),
     Settings(SettingsSection),
     Overview,
+    RepositoryTopology,
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
@@ -1448,9 +1466,10 @@ impl Render for SidebarPane {
             let theme = Theme::of(cx).clone();
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
-                // Overview keeps the normal chat sidebar — clicking any other
-                // chat there is still the fastest way out of the overview.
-                Route::Chat | Route::Overview => shell.render_chat_sidebar(&theme, cx),
+                // Overview and repository map keep the normal chat sidebar.
+                Route::Chat | Route::Overview | Route::RepositoryTopology => {
+                    shell.render_chat_sidebar(&theme, cx)
+                }
             }
         });
         div().size_full().child(inner).into_any_element()
@@ -1552,6 +1571,7 @@ pub struct Shell {
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
     overview_page: Option<Entity<crate::overview::Overview>>,
+    repository_topology_page: Option<Entity<crate::repository_topology::RepositoryTopology>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
@@ -1629,6 +1649,11 @@ pub struct Shell {
     /// "copied" check; cleared by `copied_chat_identity_clear` after ~1.2s.
     copied_chat_identity: Option<String>,
     copied_chat_identity_clear: Option<Task<()>>,
+    /// Presentation cache for the full-chat metadata strip. The durable
+    /// values remain owned by the workspace doc and are read through the
+    /// existing multi-PR `CHAT_LINK_STATUS` endpoint.
+    chat_header_links: std::collections::HashMap<String, ChatHeaderLinkCache>,
+    chat_header_links_pending: std::collections::HashSet<String>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -1878,6 +1903,7 @@ impl Shell {
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("topology") | Some("repository-topology") => Route::RepositoryTopology,
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -1907,6 +1933,7 @@ impl Shell {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
             Route::Overview => NavEntry::Overview,
+            Route::RepositoryTopology => NavEntry::RepositoryTopology,
         });
         // Parent notifications carry presentation changes (session status,
         // elapsed labels, menus); sibling animation/caret ticks do not.
@@ -1966,6 +1993,7 @@ impl Shell {
             nav,
             devices_page: None,
             overview_page: None,
+            repository_topology_page: None,
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
@@ -2016,6 +2044,8 @@ impl Shell {
             sidebar_notice: None,
             copied_chat_identity: None,
             copied_chat_identity_clear: None,
+            chat_header_links: Default::default(),
+            chat_header_links_pending: Default::default(),
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -3844,7 +3874,12 @@ impl Shell {
     /// feedback is the sidebar notice (like its sibling copy rows); from the
     /// header button the icon flips to a check for ~1.2s (the code-block
     /// "Copied" idiom).
-    fn copy_chat_identity(&mut self, chat_id: &str, from_menu: bool, cx: &mut Context<Self>) {
+    pub(crate) fn copy_chat_identity(
+        &mut self,
+        chat_id: &str,
+        from_menu: bool,
+        cx: &mut Context<Self>,
+    ) {
         let text = self
             .state
             .read(cx)
@@ -3860,7 +3895,7 @@ impl Shell {
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         if from_menu {
-            self.sidebar_notice = Some("Chat info copied".into());
+            self.sidebar_notice = Some("Chat name + IDs copied".into());
             self.close_chat_menu(cx);
         } else {
             self.copied_chat_identity = Some(chat_id.to_string());
@@ -3877,6 +3912,96 @@ impl Shell {
             }));
         }
         cx.notify();
+    }
+
+    fn ensure_chat_header_links(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self
+            .chat_header_links
+            .get(&chat_id)
+            .is_some_and(|entry| entry.fetched_at.elapsed() < CHAT_HEADER_LINK_REFRESH)
+            || self.chat_header_links_pending.contains(&chat_id)
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.chat_header_links_pending.insert(chat_id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CHAT_LINK_STATUS,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat_header_links_pending.remove(&chat_id);
+                let status = result
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<ChatLinkStatus>(value).ok());
+                this.chat_header_links.insert(
+                    chat_id,
+                    ChatHeaderLinkCache {
+                        status,
+                        fetched_at: Instant::now(),
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn invalidate_chat_header_links(&mut self, chat_id: &str) {
+        self.chat_header_links.remove(chat_id);
+    }
+
+    /// Metadata floating immediately under the overlaid titlebar. This is a
+    /// paint layer over the transcript, but participates in the column's flex
+    /// sizing so wrapping values never collide with the composer below.
+    fn render_chat_header_metadata(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let chat_id = self.state.read(cx).selected_chat.clone()?;
+        self.ensure_chat_header_links(chat_id.clone(), cx);
+        let (chat, space) = {
+            let state = self.state.read(cx);
+            let chat = state.chats.iter().find(|chat| chat.id == chat_id)?.clone();
+            let space = chat
+                .space_id
+                .as_deref()
+                .and_then(|id| state.space_row(id))
+                .cloned();
+            (chat, space)
+        };
+        let links = self
+            .chat_header_links
+            .get(&chat_id)
+            .and_then(|entry| entry.status.as_ref())
+            .map(crate::chat_metadata::HeaderLinks::from_status);
+        let items =
+            crate::chat_metadata::metadata_items(&chat, space.as_ref(), links.as_ref(), None, None);
+        Some(
+            div()
+                .id("full-chat-header-metadata-wrap")
+                .flex_none()
+                .mt(px(Theme::TITLEBAR_HEIGHT))
+                .px(px(12.0))
+                .py(px(4.0))
+                .border_b_1()
+                .border_color(theme.border.opacity(0.7))
+                .bg(theme.surface.opacity(0.94))
+                .child(crate::chat_metadata::metadata_strip(
+                    "full-chat-header",
+                    items,
+                    theme,
+                ))
+                .into_any_element(),
+        )
     }
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
@@ -3898,6 +4023,10 @@ impl Shell {
     /// hidden behind another route.
     pub(crate) fn is_overview_route(&self) -> bool {
         matches!(self.route, Route::Overview)
+    }
+
+    pub(crate) fn is_repository_topology_route(&self) -> bool {
+        matches!(self.route, Route::RepositoryTopology)
     }
 
     /// The overview's "View full chat →": select `chat_id` so the shared
@@ -3934,13 +4063,33 @@ impl Shell {
         cx.notify();
     }
 
+    /// From another route, open the overview with My PRs visible. Once there,
+    /// the same shortcut toggles the sidebar closed/open.
+    fn toggle_my_prs(&mut self, cx: &mut Context<Self>) {
+        let already_on_overview = matches!(self.route, Route::Overview);
+        if !already_on_overview {
+            self.open_overview(cx);
+        }
+        let page = self.ensure_overview_page(cx);
+        page.update(cx, |overview, cx| {
+            if already_on_overview {
+                overview.toggle_pr_sidebar(cx);
+            } else {
+                overview.open_pr_sidebar(cx);
+            }
+        });
+    }
+
     /// Lazily create the overview entity on first visit, same pattern as
     /// `settings_outlet`'s per-section pages.
     fn overview_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_overview_page(cx).into_any_element()
     }
 
-    fn ensure_overview_page(&mut self, cx: &mut Context<Self>) -> Entity<crate::overview::Overview> {
+    fn ensure_overview_page(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::overview::Overview> {
         if let Some(page) = &self.overview_page {
             return page.clone();
         }
@@ -3951,19 +4100,51 @@ impl Shell {
         // `render_main` returns before the chat stack on this route.
         let transcript = self.transcript.clone();
         let composer = self.composer.clone();
-        let page = cx.new(|cx| crate::overview::Overview::new(state, weak, transcript, composer, cx));
+        let page =
+            cx.new(|cx| crate::overview::Overview::new(state, weak, transcript, composer, cx));
         self.overview_page = Some(page.clone());
         page
     }
 
-    /// Chat menu "Link PR / ticket…": the link editor lives in the
+    /// Open the workspace's repository/worktree ownership graph. Kept as its
+    /// own route because it has a different data source and deterministic
+    /// hierarchy from the freeform chat overview canvas.
+    pub(crate) fn open_repository_topology(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::RepositoryTopology;
+        self.nav.push(NavEntry::RepositoryTopology);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn repository_topology_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(page) = &self.repository_topology_page {
+            return page.clone().into_any_element();
+        }
+        let state = self.state.clone();
+        let shell = cx.entity().downgrade();
+        let page =
+            cx.new(|cx| crate::repository_topology::RepositoryTopology::new(state, shell, cx));
+        self.repository_topology_page = Some(page.clone());
+        page.into_any_element()
+    }
+
+    /// Chat menu "Add PR / ticket…": the link editor lives in the
     /// overview's expanded detail, so switch there and open it for this
     /// chat (expanded, focused, scrolled/framed into view).
-    fn link_chat_from_menu(&mut self, chat_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn link_chat_from_menu(
+        &mut self,
+        chat_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.close_chat_menu(cx);
         self.open_overview(cx);
         let page = self.ensure_overview_page(cx);
-        page.update(cx, |overview, cx| overview.open_link_editor(chat_id, true, window, cx));
+        page.update(cx, |overview, cx| {
+            overview.open_link_editor(chat_id, true, window, cx)
+        });
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -4006,6 +4187,9 @@ impl Shell {
             }
             NavEntry::Overview => {
                 self.route = Route::Overview;
+            }
+            NavEntry::RepositoryTopology => {
+                self.route = Route::RepositoryTopology;
             }
         }
         self.close_user_menu(cx);
@@ -4408,8 +4592,8 @@ impl Shell {
                     .ok();
                     return;
                 };
-                let is_summary = item.get("kind").and_then(serde_json::Value::as_str)
-                    == Some("summary");
+                let is_summary =
+                    item.get("kind").and_then(serde_json::Value::as_str) == Some("summary");
                 let ended = this
                     .update(cx, |shell, cx| {
                         match item.get("kind").and_then(serde_json::Value::as_str) {
@@ -5488,6 +5672,25 @@ impl Shell {
                 self.titlebar_drag_region("overview-header-titlebar", bar, cx)
                     .into_any_element()
             }
+            Route::RepositoryTopology => {
+                let theme = Theme::of(cx).clone();
+                let inner = div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pl(px(self.title_bar_content_start()))
+                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Repository map")),
+                    );
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+                self.titlebar_drag_region("repository-topology-header-titlebar", bar, cx)
+                    .into_any_element()
+            }
         }
     }
 
@@ -5693,15 +5896,23 @@ impl Shell {
     /// Falls back to the shortcut's default combo the same way
     /// `apply_keymap`'s own `valid_or_default` does, so a stale/invalid
     /// persisted combo never surfaces as a broken-looking tooltip.
-    pub(crate) fn new_session_shortcut_label(&self) -> String {
-        let combo = &self.settings.keymap.new_session;
-        let default = ShortcutId::NewSession.default_combo();
+    fn shortcut_badge(&self, id: ShortcutId) -> String {
+        let combo = self.settings.keymap.get(id);
+        let default = id.default_combo();
         let resolved = if Keystroke::parse(&platform_combo(combo)).is_ok() {
-            combo.as_str()
+            combo
         } else {
             default
         };
         badge_combo(resolved)
+    }
+
+    pub(crate) fn new_session_shortcut_label(&self) -> String {
+        self.shortcut_badge(ShortcutId::NewSession)
+    }
+
+    pub(crate) fn my_prs_shortcut_label(&self) -> String {
+        self.shortcut_badge(ShortcutId::OpenMyPrs)
     }
 
     /// Native Windows caption controls integrated into Zeron's unified
@@ -8280,21 +8491,25 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Link PR / ticket…")),
+                            .child(SharedString::from("Add PR / ticket…")),
                     )
                     .when(closeable, |menu| {
                         menu.child(
-                            popover::menu_row(&theme, false, format!("chat-menu-closeout-{chat_id}"))
-                                .id("chat-menu-closeout")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_chat_closeout(closeout_id.clone(), cx)
-                                }))
-                                .child(
-                                    icon(icons::GIT_BRANCH)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Close out worktree…")),
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-menu-closeout-{chat_id}"),
+                            )
+                            .id("chat-menu-closeout")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_chat_closeout(closeout_id.clone(), cx)
+                            }))
+                            .child(
+                                icon(icons::GIT_BRANCH)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Close out worktree…")),
                         )
                     })
                     .child(
@@ -8308,7 +8523,7 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Copy chat info")),
+                            .child(SharedString::from("Copy name + IDs")),
                     )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
@@ -8694,8 +8909,24 @@ impl Shell {
                 .into_any_element();
         }
 
+        if let Route::RepositoryTopology = self.route {
+            let outlet = self.repository_topology_outlet(cx);
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
+        let chat_header_metadata = has_selection
+            .then(|| self.render_chat_header_metadata(theme, cx))
+            .flatten();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
         let has_appshots = !self.composer.read(cx).staged_appshots().is_empty();
         let no_project = self.state.read(cx).no_project;
@@ -8916,15 +9147,16 @@ impl Shell {
                             true,
                             div().size_full().child(outlet),
                         )
-                        // Fully faded BY the titlebar's bottom edge (the
-                        // title text is opaque — overlap read as collision),
-                        // ramping in the band just below it.
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
+                        // Fully faded by the metadata strip's bottom edge;
+                        // title and chip text are opaque, so transcript text
+                        // underneath either reads as a collision.
+                        .inset_top(Theme::TITLEBAR_HEIGHT + CHAT_HEADER_METADATA_CLEARANCE)
                         .band_top(Theme::TRANSCRIPT_FADE_BAND)
                         .band_bottom(bottom_band),
                     )
                 },
             )
+            .children(chat_header_metadata)
             // The glass chrome stack, floating over the transcript's bottom:
             // reserved status strip (h-6, the WorkingIndicator — the composer
             // below never shifts), composer, terminal dock. A paint-time
@@ -11138,6 +11370,11 @@ impl Render for Shell {
                     this.open_overview(cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &OpenMyPrs, _, cx| {
+                if !this.overlay_owns_keyboard(cx) {
+                    this.toggle_my_prs(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
                 if matches!(this.route, Route::Chat) && !this.overlay_owns_keyboard(cx) {
                     let pickers = this.composer.read(cx).pickers().clone();
@@ -11254,7 +11491,11 @@ impl Render for Shell {
                         t.set_bottom_clearance(0.0, cx);
                         t.set_top_inset(crate::overview::CHAT_PANEL_TRANSCRIPT_TOP_INSET, cx);
                     } else {
-                        t.set_top_inset(crate::transcript::OWN_SEND_TOP_INSET_PX, cx);
+                        t.set_top_inset(
+                            crate::transcript::OWN_SEND_TOP_INSET_PX
+                                + CHAT_HEADER_METADATA_CLEARANCE,
+                            cx,
+                        );
                         t.set_rail_enabled(rail::rail_visible(main_width), cx);
                         if bottom_stack_ready && expected_has_composer {
                             t.set_bottom_clearance(stack_h, cx);
@@ -12469,6 +12710,14 @@ mod tests {
     }
 
     #[test]
+    fn repository_topology_is_a_first_class_history_entry() {
+        let mut nav = NavHistory::new(NavEntry::Overview);
+        nav.push(NavEntry::RepositoryTopology);
+        assert_eq!(nav.back(), Some(NavEntry::Overview));
+        assert_eq!(nav.forward(), Some(NavEntry::RepositoryTopology));
+    }
+
+    #[test]
     fn nav_push_dedups_the_current_route() {
         let mut nav = NavHistory::new(chat("a"));
         nav.push(chat("a"));
@@ -13031,7 +13280,9 @@ mod exit_regressions {
                 // Header button: clipboard + transient check, no sidebar notice.
                 shell.copy_chat_identity("c1", false, cx);
                 assert_eq!(
-                    cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
                     Some("Fix login \u{2014} chat c1 \u{2014} session sess-9")
                 );
                 assert_eq!(shell.copied_chat_identity.as_deref(), Some("c1"));
@@ -13039,10 +13290,15 @@ mod exit_regressions {
                 // Menu item: no session id -> the session part is omitted.
                 shell.copy_chat_identity("c2", true, cx);
                 assert_eq!(
-                    cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
                     Some("New session \u{2014} chat c2")
                 );
-                assert_eq!(shell.sidebar_notice.as_deref(), Some("Chat info copied"));
+                assert_eq!(
+                    shell.sidebar_notice.as_deref(),
+                    Some("Chat name + IDs copied")
+                );
             })
             .unwrap();
         // The header check clears itself after the flash.
@@ -13117,6 +13373,52 @@ mod exit_regressions {
                 );
                 shell.navigate_back(cx);
                 assert!(matches!(shell.route, Route::Overview));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn repository_topology_route_round_trips_through_history(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.open_overview(cx);
+                shell.open_repository_topology(cx);
+                assert!(matches!(shell.route, Route::RepositoryTopology));
+                assert_eq!(*shell.nav.current(), NavEntry::RepositoryTopology);
+                shell.navigate_back(cx);
+                assert!(matches!(shell.route, Route::Overview));
+                shell.navigate_forward(cx);
+                assert!(matches!(shell.route, Route::RepositoryTopology));
             })
             .unwrap();
     }

@@ -24,6 +24,9 @@ pub(super) const ICON_PATHS: &[&str] = &[
 ];
 
 fn load_local_icon(root: &std::path::Path) -> Option<MediaImage> {
+    if !project_icon_access_allowed(root) {
+        return None;
+    }
     // A project can point at a subdirectory; match the remote workspace RPC's
     // checkout-root resolution, including linked worktrees with a .git file.
     let canonical = root.canonicalize().ok()?;
@@ -52,6 +55,10 @@ fn load_local_icon(root: &std::path::Path) -> Option<MediaImage> {
         return decode_project_icon(mime, bytes).ok();
     }
     None
+}
+
+fn project_icon_access_allowed(root: &std::path::Path) -> bool {
+    !zeron_engine::repos::is_automatic_access_blocked(root)
 }
 
 // Curated badge tones: (dark appearance, light appearance). Keep the ordering
@@ -300,17 +307,19 @@ impl Shell {
         let seed = space
             .map(|space| space.path.clone())
             .unwrap_or_else(|| "home".into());
-        let context = space.map(|space| FilesRequestContext {
-            target: zeron_proto::WorkspaceTarget {
-                chat_id: None,
-                space_id: Some(space.id.clone()),
-                checkout_path: None,
-            },
-            target_device_id: (state.local_device_id.as_deref() != Some(&space.device_id))
-                .then(|| space.device_id.clone()),
-            cwd: space.path.clone(),
-            checkout_id: space.checkout_id.clone(),
-        });
+        let context = space
+            .filter(|space| project_icon_access_allowed(std::path::Path::new(&space.path)))
+            .map(|space| FilesRequestContext {
+                target: zeron_proto::WorkspaceTarget {
+                    chat_id: None,
+                    space_id: Some(space.id.clone()),
+                    checkout_path: None,
+                },
+                target_device_id: (state.local_device_id.as_deref() != Some(&space.device_id))
+                    .then(|| space.device_id.clone()),
+                cwd: space.path.clone(),
+                checkout_id: space.checkout_id.clone(),
+            });
         let Some(context) = context else {
             return project_icon_frame(
                 chat_id,
@@ -370,9 +379,20 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn png(path: &std::path::Path, width: u32) {
         image::RgbaImage::new(width, 2).save(path).unwrap();
     }
+
+    #[test]
+    fn sidebar_artwork_skips_home_and_privacy_managed_spaces() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        assert!(!project_icon_access_allowed(&home));
+        assert!(!project_icon_access_allowed(&home.join("Music")));
+        assert!(!project_icon_access_allowed(&home.join("Pictures/library")));
+        assert!(project_icon_access_allowed(&home.join("Projects/example")));
+    }
+
     #[test]
     fn sidebar_project_icon_priority_and_missing_fallback() {
         let temp = tempfile::tempdir().unwrap();

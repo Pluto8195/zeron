@@ -537,6 +537,46 @@ async fn models_are_discovered_from_the_acp_session() {
 }
 
 #[tokio::test]
+async fn model_discovery_process_and_session_use_configured_private_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let discovery = dir.path().join("profile-model-discovery");
+    let observed_process = dir.path().join("observed-process-cwd");
+    let observed_session = dir.path().join("observed-session-new");
+    let fixture = dir.path().join("fake-acp");
+    let original = include_str!("fixtures/fake-acp.sh");
+    let needle = "# ---- session new / load ----------------------------------------------------\nread -r line || exit 1";
+    let replacement = format!(
+        "# ---- session new / load ----------------------------------------------------\nread -r line || exit 1\npwd > \"{}\"\nprintf '%s' \"$line\" > \"{}\"",
+        observed_process.display(),
+        observed_session.display()
+    );
+    let instrumented = original.replacen(needle, &replacement, 1);
+    assert_ne!(instrumented, original, "fixture instrumentation matched");
+    std::fs::write(&fixture, instrumented).unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    AcpHarness::hermes()
+        .with_executable(fixture)
+        .with_model_discovery_cwd(&discovery)
+        .models()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(observed_process).unwrap().trim(),
+        discovery.canonicalize().unwrap().to_string_lossy()
+    );
+    let request: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(observed_session).unwrap()).unwrap();
+    assert_eq!(
+        request["params"]["cwd"],
+        serde_json::Value::String(discovery.to_string_lossy().into_owned())
+    );
+}
+
+#[tokio::test]
 async fn models_enrich_from_the_static_catalog_on_id_match() {
     // grok's static catalog knows "grok-4.5" — the discovered entry keeps the
     // wire label but inherits the curated description and ladder.

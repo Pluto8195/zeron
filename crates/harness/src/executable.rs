@@ -32,6 +32,23 @@ pub(crate) fn home_or_current_dir() -> PathBuf {
     )
 }
 
+/// A private, non-HOME working directory for automatic discovery processes.
+///
+/// Harnesses are also useful outside the engine, so they cannot assume an
+/// engine profile is available. The engine normally supplies a profile-local
+/// directory through each harness's `with_model_discovery_cwd` builder; this
+/// fallback keeps direct harness use from inheriting a broad process cwd (or
+/// choosing HOME) when no such directory was configured.
+pub(crate) fn model_discovery_cwd(
+    configured: Option<&Path>,
+) -> Result<PathBuf, crate::HarnessError> {
+    let cwd = configured.map(Path::to_path_buf).unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("zeron-model-discovery-{}", std::process::id()))
+    });
+    std::fs::create_dir_all(&cwd).map_err(crate::HarnessError::Io)?;
+    Ok(cwd)
+}
+
 fn home_or_current_dir_with(
     env: &impl Fn(&str) -> Option<OsString>,
     current_dir: &impl Fn() -> std::io::Result<PathBuf>,

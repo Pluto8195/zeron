@@ -320,6 +320,38 @@ async fn model_discovery_maps_the_live_catalog() {
 }
 
 #[tokio::test]
+async fn model_discovery_process_uses_configured_private_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let discovery = dir.path().join("profile-model-discovery");
+    let observed = dir.path().join("observed-cwd");
+    let wrapper = dir.path().join("cursor-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\npwd > \"{}\"\nexec \"{}\" \"$@\"\n",
+            observed.display(),
+            fixture_path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    CursorHarness::new()
+        .with_executable(wrapper)
+        .with_model_discovery_cwd(&discovery)
+        .models()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(observed).unwrap().trim(),
+        discovery.canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[tokio::test]
 async fn followup_crash_is_not_hidden_by_a_previous_completed_turn() {
     let (controls, steer, _token) = controls();
     let mut stream = harness()

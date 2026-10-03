@@ -26,7 +26,10 @@ async fn resolves_and_scans_subagents_for_a_harness_session_chat_never_imported(
     let real_transcript = std::path::Path::new(
         "/Users/mikey/.claude/projects/-Users-mikey-Projects-agent-mode-tools/8de11ea8-2a2a-42a2-9784-81b4142b404d.jsonl",
     );
-    assert!(real_transcript.is_file(), "expected real transcript at {real_transcript:?}");
+    assert!(
+        real_transcript.is_file(),
+        "expected real transcript at {real_transcript:?}"
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let core = EngineCore::assemble_with_profile(
@@ -39,14 +42,21 @@ async fn resolves_and_scans_subagents_for_a_harness_session_chat_never_imported(
 
     let chat_id = "harness-session-subagent-smoke-chat";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some(real_cwd.to_string()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some(real_cwd.to_string()),
+        )
         .expect("create chat");
     // The live run loop's own path (`sessions.rs`) for stamping a chat with
     // its harness session id — deliberately NOT going through
     // `ExternalSessionImporter::import`, so no sync-cursor file exists for
     // this chat. This is exactly the shape of every chat Zeron itself
     // launches or resumes.
-    core.workspace.set_chat_harness_session(chat_id, real_session_id, real_cwd);
+    core.workspace
+        .set_chat_harness_session(chat_id, real_session_id, real_cwd);
 
     // Sanity: confirm there really is no import cursor for this chat, so the
     // test actually exercises the fallback path and isn't accidentally
@@ -70,7 +80,8 @@ async fn resolves_and_scans_subagents_for_a_harness_session_chat_never_imported(
         "must resolve via the harness-session fallback, not just the import cursor"
     );
 
-    let subagents = zeron_engine::subagent_scan::scan_subagents(&resolved.unwrap()).expect("scan_subagents");
+    let subagents =
+        zeron_engine::subagent_scan::scan_subagents(&resolved.unwrap()).expect("scan_subagents");
     eprintln!("found {} subagents", subagents.len());
     for s in &subagents {
         eprintln!("{s:?}");

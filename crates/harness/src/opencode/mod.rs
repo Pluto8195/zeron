@@ -218,6 +218,8 @@ fn free_localhost_port() -> Option<u16> {
 
 pub struct OpencodeHarness {
     executable: Option<PathBuf>,
+    /// Zeron-owned cwd for automatic catalog probes. Never a user project or HOME.
+    model_discovery_cwd: Option<PathBuf>,
     /// Test seam: an already-running server (no spawn, no auth unless given).
     base_url: Option<String>,
     interrupt_grace: Duration,
@@ -234,6 +236,7 @@ impl Default for OpencodeHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            model_discovery_cwd: None,
             base_url: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
@@ -253,6 +256,12 @@ impl OpencodeHarness {
     /// Use a fixed binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Run automatic model probes in this Zeron-owned directory.
+    pub fn with_model_discovery_cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_discovery_cwd = Some(path.into());
         self
     }
 
@@ -289,7 +298,10 @@ impl OpencodeHarness {
     /// commands cache so concurrent picker/composer fetches share one boot.
     async fn probe_models(&self) -> Result<Vec<Model>, HarnessError> {
         let _guard = self.probe_lock.lock().await;
-        let mut server = self.server(None).await?;
+        let discovery_cwd =
+            crate::executable::model_discovery_cwd(self.model_discovery_cwd.as_deref())?;
+        let discovery_cwd = discovery_cwd.to_string_lossy().into_owned();
+        let mut server = self.server(Some(&discovery_cwd)).await?;
         let result = async {
             let providers = server.provider_catalog(None).await?;
             let mut models = models_from_providers(&providers);

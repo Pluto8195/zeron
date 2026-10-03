@@ -28,7 +28,11 @@ async fn resolves_and_scans_subagents_for_a_harness_session_only_chat() {
     }
 
     let session_id = "sess-live-launched";
-    let project_dir = fake_home.path().join(".claude").join("projects").join("proj-1");
+    let project_dir = fake_home
+        .path()
+        .join(".claude")
+        .join("projects")
+        .join("proj-1");
     std::fs::create_dir_all(&project_dir).expect("project dir");
     let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
     std::fs::write(
@@ -44,18 +48,30 @@ async fn resolves_and_scans_subagents_for_a_harness_session_only_chat() {
         r#"{"agentType":"fork","description":"Do a subtask"}"#,
     )
     .expect("write meta");
-    std::fs::write(subagents_dir.join("agent-sub1.jsonl"), "{}\n").expect("write subagent transcript");
+    std::fs::write(subagents_dir.join("agent-sub1.jsonl"), "{}\n")
+        .expect("write subagent transcript");
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(EngineProfile::development(data_dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        data_dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let chat_id = "live-launched-chat";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/project".into()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/project".into()),
+        )
         .expect("create chat");
     // The live run loop's own path — deliberately NOT `external_import::import`,
     // so this chat has no sync cursor at all.
-    core.workspace.set_chat_harness_session(chat_id, session_id, "/work/project");
+    core.workspace
+        .set_chat_harness_session(chat_id, session_id, "/work/project");
 
     assert!(
         core.external_import

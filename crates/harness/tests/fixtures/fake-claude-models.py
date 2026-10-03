@@ -8,6 +8,7 @@ if "--version" in sys.argv:
     print("2.1.228 (Claude Code)")
     sys.exit(0)
 root = pathlib.Path(__file__).parent
+(root / "cwd").write_text(str(pathlib.Path.cwd()))
 request = json.loads(sys.stdin.readline())
 assert request["type"] == "control_request"
 assert request["request"]["subtype"] == "initialize"

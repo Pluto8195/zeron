@@ -75,6 +75,24 @@ async fn initialize_is_shared_and_curated_metadata_survives_the_live_union() {
 }
 
 #[tokio::test]
+async fn model_discovery_process_uses_configured_private_cwd() {
+    let (dir, harness) = fixture(json!({"subtype":"success", "response":{
+        "models":[{"value":"default", "resolvedModel":"claude-opus-5"}]
+    }}));
+    let discovery = dir.path().join("profile-model-discovery");
+    harness
+        .with_model_discovery_cwd(&discovery)
+        .model_catalog(true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("cwd")).unwrap(),
+        discovery.canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[tokio::test]
 async fn failed_or_logged_out_initialize_falls_back_to_curated_catalog() {
     for error in ["transport failed", "not logged in: authentication required"] {
         let (_dir, harness) = fixture(json!({"subtype":"error","error":error}));

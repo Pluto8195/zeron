@@ -21,13 +21,16 @@
 //! serves the full sidebar before any server contact; the old `ws4` rooms are
 //! simply never joined again. The legacy snapshot is kept for rollback.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
 use tokio::sync::watch;
 
 use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
-use zeron_proto::{Chat, ChatConfig, Device, Session, SidebarPreferencesState, Space};
+use zeron_proto::{
+    Chat, ChatConfig, ChatLinkSource, ChatPrLink, Device, Session, SidebarPreferencesState, Space,
+};
 use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
@@ -653,6 +656,13 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.read_chats())?)
     }
 
+    /// Every durable PR linked to this chat. Independent link rows are
+    /// authoritative; the legacy single-value slot is folded in as a fallback
+    /// so pre-migration chats immediately read as a one-element collection.
+    pub fn chat_pr_links(&self, chat_id: &str) -> Result<Vec<ChatPrLink>, EngineError> {
+        Ok(self.read(|doc| effective_chat_pr_links(doc, chat_id))?)
+    }
+
     pub fn read_devices(&self) -> Result<Vec<Device>, EngineError> {
         Ok(self.read(|doc| doc.read_devices())?)
     }
@@ -891,7 +901,8 @@ impl WorkspaceHost {
     /// Create a chat, usually *in a project*: the project fixes the host device
     /// and base cwd (`cwd` override = an isolated-worktree path). With no
     /// `space_id` the chat is project-less: `device_id` picks the host and the
-    /// cwd defaults to `~` (expanded host-side when the run spawns).
+    /// cwd defaults to the portable `~` marker (resolved host-side to a
+    /// Zeron-owned per-chat scratch directory when the run spawns).
     pub fn create_chat(
         &self,
         chat_id: &str,
@@ -1164,22 +1175,106 @@ impl WorkspaceHost {
         if value.is_none() && source != zeron_proto::ChatLinkSource::Manual {
             return Ok(false);
         }
+        if kind == ChatLinkKind::Pr {
+            return match value {
+                Some(url) => self.add_chat_pr_link(chat_id, url, source),
+                None => self.clear_chat_pr_links(chat_id),
+            };
+        }
         let Some(chat) = self.chat(chat_id)? else {
             return Ok(false);
         };
-        let current_source = match kind {
-            ChatLinkKind::Pr => chat.linked_pr_source,
-            ChatLinkKind::Ticket => chat.linked_ticket_source,
-        };
+        let current_source = chat.linked_ticket_source;
         if !source.can_overwrite(current_source) {
             return Ok(false);
         }
         // Clearing (value: None) stores no source either — "absent = fall
         // back to inference" per the schema's own contract.
         let stamped_source = value.map(|_| source);
-        Ok(self.mutate(|doc| match kind {
-            ChatLinkKind::Pr => doc.set_chat_pr_link(chat_id, value, stamped_source),
-            ChatLinkKind::Ticket => doc.set_chat_ticket_link(chat_id, value, stamped_source),
+        Ok(self.mutate(|doc| doc.set_chat_ticket_link(chat_id, value, stamped_source))?)
+    }
+
+    /// Add one PR without replacing unrelated links. Source precedence is
+    /// enforced per canonical URL, not across the chat's whole collection.
+    pub fn add_chat_pr_link(
+        &self,
+        chat_id: &str,
+        url: &str,
+        source: ChatLinkSource,
+    ) -> Result<bool, EngineError> {
+        let url = crate::chat_links::canonicalize_pr_url(url);
+        if url.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.mutate(|doc| -> Result<bool, zeron_doc::DocError> {
+            let Some(chat) = doc.chat(chat_id)? else {
+                return Ok(false);
+            };
+            let links = effective_chat_pr_links(doc, chat_id)?;
+            let current_source = links
+                .iter()
+                .find(|link| link.url == url)
+                .map(|link| link.source);
+            if !source.can_overwrite(current_source) {
+                return Ok(false);
+            }
+
+            // Materialize a legacy-only link before changing the primary
+            // mirror, otherwise adding a second PR would strand the first in
+            // a field that can only hold one value.
+            if let (Some(legacy_url), Some(legacy_source)) =
+                (chat.linked_pr_url.as_deref(), chat.linked_pr_source)
+            {
+                let legacy_url = crate::chat_links::canonicalize_pr_url(legacy_url);
+                doc.upsert_chat_pr_link(
+                    chat_id,
+                    &ChatPrLink {
+                        url: legacy_url,
+                        source: legacy_source,
+                    },
+                )?;
+            }
+            doc.upsert_chat_pr_link(chat_id, &ChatPrLink { url, source })?;
+            mirror_primary_pr_link(doc, chat_id)?;
+            Ok(true)
+        })?)
+    }
+
+    /// Remove exactly one canonical PR URL. Manual RPC callers use this for
+    /// per-row unlink; mined writers never call it.
+    pub fn remove_chat_pr_link(&self, chat_id: &str, url: &str) -> Result<bool, EngineError> {
+        let url = crate::chat_links::canonicalize_pr_url(url);
+        Ok(self.mutate(|doc| -> Result<bool, zeron_doc::DocError> {
+            let Some(chat) = doc.chat(chat_id)? else {
+                return Ok(false);
+            };
+            let legacy_matches = chat
+                .linked_pr_url
+                .as_deref()
+                .map(crate::chat_links::canonicalize_pr_url)
+                .as_deref()
+                == Some(url.as_str());
+            let removed = doc.remove_chat_pr_link(chat_id, &url);
+            if legacy_matches {
+                doc.set_chat_pr_link(chat_id, None, None)?;
+            }
+            if removed || legacy_matches {
+                mirror_primary_pr_link(doc, chat_id)?;
+            }
+            Ok(removed || legacy_matches)
+        })?)
+    }
+
+    /// Remove all durable PR links and clear the legacy primary mirror.
+    pub fn clear_chat_pr_links(&self, chat_id: &str) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| -> Result<bool, zeron_doc::DocError> {
+            let Some(chat) = doc.chat(chat_id)? else {
+                return Ok(false);
+            };
+            let removed = doc.clear_chat_pr_links(chat_id);
+            let had_legacy = chat.linked_pr_url.is_some();
+            doc.set_chat_pr_link(chat_id, None, None)?;
+            Ok(removed > 0 || had_legacy)
         })?)
     }
 
@@ -1235,6 +1330,57 @@ impl WorkspaceHost {
             tracing::warn!(error = %err, "device lastSeenAt stamp failed");
         }
         self.inner.save_snapshot();
+    }
+}
+
+fn effective_chat_pr_links(
+    doc: &RegistryDoc,
+    chat_id: &str,
+) -> Result<Vec<ChatPrLink>, zeron_doc::DocError> {
+    let mut by_url: BTreeMap<String, ChatLinkSource> = BTreeMap::new();
+    for link in doc.chat_pr_links(chat_id) {
+        let url = crate::chat_links::canonicalize_pr_url(&link.url);
+        let current = by_url.get(&url).copied();
+        if link.source.can_overwrite(current) {
+            by_url.insert(url, link.source);
+        }
+    }
+    if let Some(chat) = doc.chat(chat_id)?
+        && let (Some(url), Some(source)) = (chat.linked_pr_url, chat.linked_pr_source)
+    {
+        let url = crate::chat_links::canonicalize_pr_url(&url);
+        let current = by_url.get(&url).copied();
+        if source.can_overwrite(current) {
+            by_url.insert(url, source);
+        }
+    }
+    let mut links: Vec<ChatPrLink> = by_url
+        .into_iter()
+        .map(|(url, source)| ChatPrLink { url, source })
+        .collect();
+    links.sort_by(|a, b| {
+        pr_link_source_rank(b.source)
+            .cmp(&pr_link_source_rank(a.source))
+            .then_with(|| a.url.cmp(&b.url))
+    });
+    Ok(links)
+}
+
+fn mirror_primary_pr_link(doc: &mut RegistryDoc, chat_id: &str) -> Result<(), zeron_doc::DocError> {
+    let primary = effective_chat_pr_links(doc, chat_id)?.into_iter().next();
+    doc.set_chat_pr_link(
+        chat_id,
+        primary.as_ref().map(|link| link.url.as_str()),
+        primary.as_ref().map(|link| link.source),
+    )?;
+    Ok(())
+}
+
+fn pr_link_source_rank(source: ChatLinkSource) -> u8 {
+    match source {
+        ChatLinkSource::Mentioned => 0,
+        ChatLinkSource::CreatedInChat => 1,
+        ChatLinkSource::Manual => 2,
     }
 }
 
@@ -1942,39 +2088,47 @@ mod tests {
         use zeron_proto::ChatLinkSource;
         let (_dir, host) = linkable_test_host();
 
-        assert!(host
-            .set_chat_link(
+        assert!(
+            host.set_chat_link(
                 "c1",
                 ChatLinkKind::Pr,
                 Some("https://github.com/acme/widgets/pull/1"),
                 ChatLinkSource::Manual,
             )
-            .unwrap());
+            .unwrap()
+        );
 
-        // A mined `created_in_chat` write must NOT overwrite the manual link.
-        assert!(!host
-            .set_chat_link(
+        // A different mined URL is an additional link, not an attempted
+        // overwrite of the manual one.
+        assert!(
+            host.set_chat_link(
                 "c1",
                 ChatLinkKind::Pr,
                 Some("https://github.com/acme/widgets/pull/2"),
                 ChatLinkSource::CreatedInChat,
             )
-            .unwrap());
+            .unwrap()
+        );
+        // Per-URL precedence still protects the manual link itself, including
+        // canonical spellings of the same GitHub URL.
+        assert!(
+            !host
+                .set_chat_link(
+                    "c1",
+                    ChatLinkKind::Pr,
+                    Some("http://github.com/ACME/WIDGETS/pull/1/files"),
+                    ChatLinkSource::Mentioned,
+                )
+                .unwrap()
+        );
+        let links = host.chat_pr_links("c1").unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].source, ChatLinkSource::Manual);
         let chat = host.chat("c1").unwrap().unwrap();
-        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
-        assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
-
-        // Nor a mined `mentioned` write.
-        assert!(!host
-            .set_chat_link(
-                "c1",
-                ChatLinkKind::Pr,
-                Some("https://github.com/acme/widgets/pull/3"),
-                ChatLinkSource::Mentioned,
-            )
-            .unwrap());
-        let chat = host.chat("c1").unwrap().unwrap();
-        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+        assert_eq!(
+            chat.linked_pr_url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/1")
+        );
         assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
     }
 
@@ -1983,53 +2137,65 @@ mod tests {
         use zeron_proto::ChatLinkSource;
         let (_dir, host) = linkable_test_host();
 
-        assert!(host
-            .set_chat_link(
+        assert!(
+            host.set_chat_link(
                 "c1",
                 ChatLinkKind::Pr,
                 Some("https://github.com/acme/widgets/pull/1"),
                 ChatLinkSource::CreatedInChat,
             )
-            .unwrap());
+            .unwrap()
+        );
 
-        // A later `mentioned` write must not overwrite it.
-        assert!(!host
-            .set_chat_link(
-                "c1",
-                ChatLinkKind::Pr,
-                Some("https://github.com/acme/widgets/pull/2"),
-                ChatLinkSource::Mentioned,
-            )
-            .unwrap());
+        // A later `mentioned` write for the same canonical URL cannot
+        // downgrade the created-in-chat source.
+        assert!(
+            !host
+                .set_chat_link(
+                    "c1",
+                    ChatLinkKind::Pr,
+                    Some("github.com/acme/widgets/pull/1"),
+                    ChatLinkSource::Mentioned,
+                )
+                .unwrap()
+        );
         let chat = host.chat("c1").unwrap().unwrap();
-        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/1"));
+        assert_eq!(
+            chat.linked_pr_url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/1")
+        );
         assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::CreatedInChat));
 
-        // Another `created_in_chat` write (equal source) DOES overwrite —
-        // most-recent-wins among same-rank writers.
-        assert!(host
-            .set_chat_link(
+        // Another created PR is retained alongside it.
+        assert!(
+            host.set_chat_link(
                 "c1",
                 ChatLinkKind::Pr,
                 Some("https://github.com/acme/widgets/pull/3"),
                 ChatLinkSource::CreatedInChat,
             )
-            .unwrap());
-        let chat = host.chat("c1").unwrap().unwrap();
-        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/3"));
+            .unwrap()
+        );
+        assert_eq!(host.chat_pr_links("c1").unwrap().len(), 2);
 
-        // But `manual` still overwrites it outright.
-        assert!(host
-            .set_chat_link(
+        // Manual adds a third link and becomes the deterministic legacy
+        // primary without removing either created PR.
+        assert!(
+            host.set_chat_link(
                 "c1",
                 ChatLinkKind::Pr,
                 Some("https://github.com/acme/widgets/pull/4"),
                 ChatLinkSource::Manual,
             )
-            .unwrap());
+            .unwrap()
+        );
         let chat = host.chat("c1").unwrap().unwrap();
-        assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/4"));
+        assert_eq!(
+            chat.linked_pr_url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/4")
+        );
         assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
+        assert_eq!(host.chat_pr_links("c1").unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -2037,28 +2203,73 @@ mod tests {
         use zeron_proto::ChatLinkSource;
         let (_dir, host) = linkable_test_host();
 
-        host.set_chat_link("c1", ChatLinkKind::Pr, Some("url-1"), ChatLinkSource::Mentioned)
-            .unwrap();
+        host.set_chat_link(
+            "c1",
+            ChatLinkKind::Pr,
+            Some("url-1"),
+            ChatLinkSource::Mentioned,
+        )
+        .unwrap();
 
         // A mined "clear" attempt (value: None, non-manual source) is
         // refused outright — mining never removes a link.
-        assert!(!host
-            .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Mentioned)
-            .unwrap());
-        assert!(!host
-            .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::CreatedInChat)
-            .unwrap());
+        assert!(
+            !host
+                .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Mentioned)
+                .unwrap()
+        );
+        assert!(
+            !host
+                .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::CreatedInChat)
+                .unwrap()
+        );
         let chat = host.chat("c1").unwrap().unwrap();
         assert_eq!(chat.linked_pr_url.as_deref(), Some("url-1"));
 
         // A manual clear works and drops the source too — "absent = fall
         // back to inference", not "absent with a stale source".
-        assert!(host
-            .set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Manual)
-            .unwrap());
+        assert!(
+            host.set_chat_link("c1", ChatLinkKind::Pr, None, ChatLinkSource::Manual)
+                .unwrap()
+        );
         let chat = host.chat("c1").unwrap().unwrap();
         assert!(chat.linked_pr_url.is_none());
         assert!(chat.linked_pr_source.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_chat_pr_link_is_targeted_and_legacy_rows_fall_back() {
+        use zeron_proto::ChatLinkSource;
+        let (_dir, host) = linkable_test_host();
+
+        // Simulate a pre-collection registry row.
+        host.mutate(|doc| {
+            doc.set_chat_pr_link(
+                "c1",
+                Some("github.com/acme/widgets/pull/1"),
+                Some(ChatLinkSource::Mentioned),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            host.chat_pr_links("c1").unwrap()[0].url,
+            "https://github.com/acme/widgets/pull/1"
+        );
+
+        host.add_chat_pr_link(
+            "c1",
+            "https://github.com/acme/widgets/pull/2",
+            ChatLinkSource::Manual,
+        )
+        .unwrap();
+        assert_eq!(host.chat_pr_links("c1").unwrap().len(), 2);
+        assert!(
+            host.remove_chat_pr_link("c1", "http://github.com/ACME/WIDGETS/pull/1/files")
+                .unwrap()
+        );
+        let links = host.chat_pr_links("c1").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://github.com/acme/widgets/pull/2");
     }
 
     #[tokio::test]
@@ -2066,10 +2277,20 @@ mod tests {
         use zeron_proto::ChatLinkSource;
         let (_dir, host) = linkable_test_host();
 
-        host.set_chat_link("c1", ChatLinkKind::Pr, Some("pr-url"), ChatLinkSource::Manual)
-            .unwrap();
-        host.set_chat_link("c1", ChatLinkKind::Ticket, Some("ENG-1"), ChatLinkSource::Mentioned)
-            .unwrap();
+        host.set_chat_link(
+            "c1",
+            ChatLinkKind::Pr,
+            Some("pr-url"),
+            ChatLinkSource::Manual,
+        )
+        .unwrap();
+        host.set_chat_link(
+            "c1",
+            ChatLinkKind::Ticket,
+            Some("ENG-1"),
+            ChatLinkSource::Mentioned,
+        )
+        .unwrap();
         let chat = host.chat("c1").unwrap().unwrap();
         assert_eq!(chat.linked_pr_url.as_deref(), Some("pr-url"));
         assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
@@ -2088,9 +2309,16 @@ mod tests {
     async fn set_chat_link_on_a_missing_chat_row_is_a_quiet_no_op() {
         use zeron_proto::ChatLinkSource;
         let (_dir, host) = linkable_test_host();
-        assert!(!host
-            .set_chat_link("no-such-chat", ChatLinkKind::Pr, Some("url"), ChatLinkSource::Manual)
-            .unwrap());
+        assert!(
+            !host
+                .set_chat_link(
+                    "no-such-chat",
+                    ChatLinkKind::Pr,
+                    Some("url"),
+                    ChatLinkSource::Manual
+                )
+                .unwrap()
+        );
     }
 
     #[test]

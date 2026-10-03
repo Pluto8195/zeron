@@ -369,6 +369,19 @@ impl HarnessRegistry {
 /// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
 pub fn default_registry() -> HarnessRegistry {
+    default_registry_with_model_discovery_cwd(None)
+}
+
+/// Production registry whose automatic catalog probes are rooted inside the
+/// active engine profile. Bare registries retain the harness crate's private
+/// temp-directory fallback.
+pub(crate) fn profile_registry(model_discovery_cwd: PathBuf) -> HarnessRegistry {
+    default_registry_with_model_discovery_cwd(Some(model_discovery_cwd))
+}
+
+fn default_registry_with_model_discovery_cwd(
+    model_discovery_cwd: Option<PathBuf>,
+) -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
     zeron_harness::shell_env::prewarm();
@@ -417,6 +430,7 @@ pub fn default_registry() -> HarnessRegistry {
             },
         ],
     }));
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::ClaudeCode,
@@ -437,7 +451,13 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::ClaudeHarness::new();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
     // exactly (`describe()` after the first resolve must not change the
@@ -445,6 +465,7 @@ pub fn default_registry() -> HarnessRegistry {
     // steering via native `turn/steer`, and the unified reasoning ladder from
     // zeron_harness::codex::catalog. CLI discovery only happens when a
     // run/model call actually resolves the slot.
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Codex,
@@ -465,11 +486,18 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::CodexHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::CodexHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::CodexHarness::new();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
     // subagent transcripts), same lazy pattern: the static descriptor mirrors
     // CursorHarness exactly. Turn-boundary steering; no effort ladder.
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Cursor,
@@ -482,12 +510,19 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::CursorHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::CursorHarness::new();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // Devin over ACP (`devin acp`), same lazy pattern: the static descriptor
     // mirrors AcpHarness::devin() exactly. No steering extension (turn
     // boundaries) and no effort ladder — Devin bakes effort into the
     // advertised model ids instead of a `thought_level` option.
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Devin,
@@ -500,12 +535,19 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::devin().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::AcpHarness::devin();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
     // steers deliver at turn boundaries; the effort ladder applies per
     // session via the `thought_level` config option.
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Grok,
@@ -522,12 +564,19 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::grok().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::AcpHarness::grok();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // Hermes Agent over ACP (`hermes acp`), same lazy pattern: the static
     // descriptor mirrors AcpHarness::hermes() exactly. No steering extension
     // (turn boundaries) and no effort ladder — Hermes exposes no effort
     // config over ACP today (hybrid reasoning is model-internal).
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Hermes,
@@ -540,11 +589,18 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::AcpHarness::hermes();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
     // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
     // pi's thinking ladder minus its "off" tier.
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
@@ -564,13 +620,20 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::AcpHarness::pi();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
     // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
     // Turn-boundary steering; the effort ladder rides model VARIANTS (the
     // run sends the first advertised variant id for the picked level).
+    let discovery_cwd = model_discovery_cwd.clone();
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Opencode,
@@ -589,12 +652,19 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::OpencodeHarness::new();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     // antigravity over acp (google's agy_acp_server), same lazy pattern: the
     // static descriptor mirrors AcpHarness::antigravity() exactly. No steering
     // extension (turn boundaries), and effort is baked into the model ids, so
     // the ladder lives on each model rather than the harness.
+    let discovery_cwd = model_discovery_cwd;
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Antigravity,
@@ -607,7 +677,13 @@ pub fn default_registry() -> HarnessRegistry {
             enabled: None,
         },
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
+        Box::new(move || {
+            let mut harness = zeron_harness::AcpHarness::antigravity();
+            if let Some(cwd) = &discovery_cwd {
+                harness = harness.with_model_discovery_cwd(cwd);
+            }
+            Ok(Arc::new(harness) as Arc<dyn Harness>)
+        }),
     );
     registry
 }

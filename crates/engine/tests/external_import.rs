@@ -77,7 +77,10 @@ async fn imports_a_transcript_into_a_new_chat_with_full_history() {
         .expect("read space")
         .expect("space exists");
     assert_eq!(space.path, "/work/project");
-    assert!(space.git_detected, "environment attachment's isGitRepo=true should carry over");
+    assert!(
+        space.git_detected,
+        "environment attachment's isGitRepo=true should carry over"
+    );
 
     // Resume seeding: `resume_for`'s primary lookup path reads exactly this.
     let (session_id, session_cwd) = core
@@ -144,18 +147,27 @@ async fn transcript_content_lands_in_the_doc_with_live_equivalent_shape() {
         .iter()
         .find_map(|p| match p {
             MessagePart::Tool {
-                call, resolved, is_error, ..
+                call,
+                resolved,
+                is_error,
+                ..
             } => Some((call.clone(), *resolved, *is_error)),
             _ => None,
         })
         .expect("assistant turn has a tool part");
     let (call, resolved, is_error) = tool_part;
-    assert!(resolved, "tool_result line must resolve the matching Tool part");
+    assert!(
+        resolved,
+        "tool_result line must resolve the matching Tool part"
+    );
     assert!(!is_error);
     match call {
         zeron_proto::ToolCall::WriteFile { path, content } => {
             assert_eq!(path, "/work/project/health.rs");
-            assert_eq!(content, None, "file content must be stripped before entering the doc");
+            assert_eq!(
+                content, None,
+                "file content must be stripped before entering the doc"
+            );
         }
         other => panic!("unexpected tool call: {other:?}"),
     }

@@ -72,6 +72,70 @@ impl RunJournal {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
     }
 
+    fn graceful_restart_path(&self, chat_id: &str) -> PathBuf {
+        self.dir.join(format!("{}.restart", sanitize_id(chat_id)))
+    }
+
+    /// Stable Zeron-owned working directory for a project-less chat. Keeping
+    /// this beside (rather than inside) `journals/` lets journal scans remain
+    /// file-only and gives every chat its own sandbox root.
+    pub(crate) fn projectless_cwd(&self, chat_id: &str) -> Result<PathBuf, JournalError> {
+        let profile_root = self.dir.parent().unwrap_or(&self.dir);
+        let cwd = profile_root.join("projectless").join(sanitize_id(chat_id));
+        std::fs::create_dir_all(&cwd)?;
+        Ok(cwd)
+    }
+
+    /// Mark a turn that the application interrupted only because it is
+    /// shutting down. Unlike an explicit user Stop, this turn should be
+    /// picked back up on the next boot even though graceful interruption
+    /// leaves a terminal `Done { interrupted }` in the journal.
+    pub fn mark_graceful_restart(&self, chat_id: &str) {
+        let marked_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
+        if let Err(err) = std::fs::write(self.graceful_restart_path(chat_id), marked_at) {
+            tracing::warn!(chat = %chat_id, error = %err, "restart-resume marker write failed");
+        }
+    }
+
+    pub fn clear_graceful_restart(&self, chat_id: &str) {
+        let _ = std::fs::remove_file(self.graceful_restart_path(chat_id));
+    }
+
+    pub fn graceful_restart_marked(&self, chat_id: &str) -> bool {
+        self.graceful_restart_path(chat_id).is_file()
+    }
+
+    pub fn graceful_restart_marked_at(&self, chat_id: &str) -> Option<i64> {
+        std::fs::read_to_string(self.graceful_restart_path(chat_id))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Chats whose in-flight turn was interrupted by graceful application
+    /// shutdown. Marker names use the same conservative chat-id encoding as
+    /// journals; production chat ids are UUIDs, so the stem is the id.
+    pub fn graceful_restart_sessions(&self) -> Result<Vec<String>, JournalError> {
+        let mut marked = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("restart") {
+                continue;
+            }
+            if let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) {
+                marked.push(chat_id.to_string());
+            }
+        }
+        marked.sort();
+        Ok(marked)
+    }
+
     /// Auto-resume revival budget (zeron `resumeAttempt`/`MAX_AUTO_RESUME`):
     /// persisted beside the journal so a run that CRASHES THE ENGINE cannot
     /// revive itself in an infinite boot loop.
@@ -168,6 +232,20 @@ impl RunJournal {
             return Ok(None);
         }
         Ok(read_lines(&path)?.into_iter().next_back())
+    }
+
+    /// Last filesystem modification time for a chat journal, in epoch millis.
+    /// Recovery uses this to distinguish a response lost before persistence
+    /// from a newer user message that was intentionally queued after the last
+    /// completed journaled turn.
+    pub fn modified_at_ms(&self, chat_id: &str) -> Option<i64> {
+        let modified = std::fs::metadata(self.path_for(chat_id))
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(modified.as_millis().min(i64::MAX as u128) as i64)
     }
 
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
@@ -325,6 +403,26 @@ mod tests {
         // Closing the stale journal with a Done clears the flag.
         journal.append("dead", &done()).unwrap();
         assert!(journal.stale_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn graceful_restart_markers_round_trip_and_enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.mark_graceful_restart("chat-b");
+        journal.mark_graceful_restart("chat-a");
+        assert!(journal.graceful_restart_marked("chat-a"));
+        assert!(journal.graceful_restart_marked_at("chat-a").is_some());
+        assert_eq!(
+            journal.graceful_restart_sessions().unwrap(),
+            vec!["chat-a".to_string(), "chat-b".to_string()]
+        );
+        journal.clear_graceful_restart("chat-a");
+        assert!(!journal.graceful_restart_marked("chat-a"));
+        assert_eq!(
+            journal.graceful_restart_sessions().unwrap(),
+            vec!["chat-b".to_string()]
+        );
     }
 
     #[test]

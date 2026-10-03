@@ -149,8 +149,10 @@ pub mod methods {
     /// IPC-only, same reason as the other external-import methods.
     pub const SYNC_EXTERNAL_SESSION: &str = "SyncExternalSession";
     /// Cached PR/ticket/worktree status for one chat's branch+cwd (ticket 002
-    /// phases 2 and 4). `{chatId}` → `ChatLinkStatus { pr, ticket,
-    /// isWorktree, diffStat, prSource, ticketSource }`. `isWorktree` is a
+    /// phases 2 and 4). `{chatId}` → `ChatLinkStatus { pr, prLinks,
+    /// ticket, isWorktree, diffStat, prSource, ticketSource }`. `prLinks`
+    /// contains every attached PR as `{url, source, detail}`; the singular
+    /// `pr`/`prSource` fields remain as a compatibility mirror. `isWorktree` is a
     /// pure inline check (no cache); `pr`/`ticket`/`diffStat` are pure cache
     /// reads — never block on a live `gh`/`linear`/`git` call; a miss is
     /// registered for the background sweep and reads back populated on a
@@ -164,10 +166,12 @@ pub mod methods {
     pub const CHAT_LINK_STATUS: &str = "ChatLinkStatus";
     /// Durable PR/ticket link write (ticket 0xx) — layered over
     /// `CHAT_LINK_STATUS`'s branch/title inference: `{chatId, kind: "pr" |
-    /// "ticket", value: string | null}` → the chat's updated link fields
-    /// (`{linkedPrUrl, linkedPrSource, linkedTicketId, linkedTicketSource}`).
-    /// Always writes source `"manual"` (the only writer allowed to CLEAR a
-    /// slot — `value: null` unlinks); a mined write (`created_in_chat`/
+    /// "ticket", value: string | null, operation?: "add" | "remove" |
+    /// "clear"}` → the chat's updated link fields (including
+    /// `linkedPrLinks`). `remove` names one PR URL; `clear` removes all PRs.
+    /// Missing `operation` preserves the original add/set/null-clear behavior.
+    /// Always writes source `"manual"` (the only writer allowed to clear a
+    /// link); a mined write (`created_in_chat`/
     /// `mentioned`, from the live per-event tap or the transcript backfill
     /// repair) never rides this RPC, it calls `WorkspaceHost::set_chat_link`
     /// directly. IPC-only, same reason as `CHAT_LINK_STATUS`.
@@ -247,6 +251,11 @@ pub mod methods {
     pub const CHAT_CONTEXT_USAGE: &str = "ChatContextUsage";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
+    /// Point-in-time repository graph for one Space. `{spaceId}` →
+    /// `RepositoryTopology`: the workspace repository (when git), recursive
+    /// submodules/nested repositories, every registered worktree, and chats /
+    /// primary agents attached by checkout identity. Read-only; never fetches.
+    pub const GET_REPOSITORY_TOPOLOGY: &str = "GetRepositoryTopology";
     pub const ADD_REPO: &str = "AddRepo";
     pub const CLONE_REPO: &str = "CloneRepo";
     pub const CREATE_REPO: &str = "CreateRepo";

@@ -62,8 +62,16 @@ async fn repairs_a_chat_left_over_by_the_old_pre_classification_import_path() {
     // (covered by the assertions below) rather than fighting the lack of a
     // public "clear branch" setter for this synthetic-only scenario.
 
-    let before = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
-    assert_eq!(before.branch.as_deref(), Some("fix/health-endpoint"), "import() already sets it");
+    let before = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
+    assert_eq!(
+        before.branch.as_deref(),
+        Some("fix/health-endpoint"),
+        "import() already sets it"
+    );
 
     let repaired = core
         .external_import
@@ -76,7 +84,10 @@ async fn repairs_a_chat_left_over_by_the_old_pre_classification_import_path() {
         .classification_for(chat_id)
         .expect("read classification")
         .expect("classification present after repair");
-    assert_eq!(category, "quick_question", "matches what a fresh import() of the same transcript would compute");
+    assert_eq!(
+        category, "quick_question",
+        "matches what a fresh import() of the same transcript would compute"
+    );
     assert_eq!(origin, "bare_cli", "entrypoint \"cli\" maps to bare_cli");
 
     let (tool_counts, _skills) = core

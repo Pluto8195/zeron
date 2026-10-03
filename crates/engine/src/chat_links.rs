@@ -23,6 +23,7 @@
 //! transcript source ever does too.
 
 use crate::workspace_host::{ChatLinkKind, WorkspaceHost};
+use std::collections::BTreeSet;
 use zeron_proto::{ChatLinkSource, ToolCall};
 
 /// A `github.com/<org>/<repo>/pull/<n>` URL appearing anywhere in `text` —
@@ -32,37 +33,74 @@ use zeron_proto::{ChatLinkSource, ToolCall};
 /// (`https://github.com/...`); a bare `github.com/...` mention is returned
 /// exactly as it appeared, unprefixed. `None` when no PR URL appears at all.
 pub(crate) fn extract_pr_url(text: &str) -> Option<String> {
+    extract_pr_urls(text).into_iter().next()
+}
+
+/// Every distinct GitHub pull-request URL appearing in `text`, in encounter
+/// order. Extraction preserves the spelling used by the text for compatibility
+/// with the original single-result helper; durable storage canonicalizes it.
+pub(crate) fn extract_pr_urls(text: &str) -> Vec<String> {
     const HOST: &str = "github.com/";
+    let lowercase = text.to_ascii_lowercase();
     let mut search_from = 0usize;
-    while let Some(rel) = text[search_from..].find(HOST) {
+    let mut urls = Vec::new();
+    let mut seen = BTreeSet::new();
+    while let Some(rel) = lowercase[search_from..].find(HOST) {
         let host_start = search_from + rel;
-        let rest = &text[host_start + HOST.len()..];
+        let rest = &lowercase[host_start + HOST.len()..];
         if let Some(len) = pull_path_len(rest) {
             let scheme_len = ["https://", "http://"]
                 .iter()
-                .find(|s| text[..host_start].ends_with(**s))
+                .find(|s| lowercase[..host_start].ends_with(**s))
                 .map_or(0, |s| s.len());
             let start = host_start - scheme_len;
             let end = host_start + HOST.len() + len;
-            return Some(text[start..end].to_string());
+            let url = text[start..end].to_string();
+            let canonical = canonicalize_pr_url(&url);
+            if seen.insert(canonical) {
+                urls.push(url);
+            }
+            search_from = end;
+        } else {
+            search_from = host_start + HOST.len();
         }
-        search_from = host_start + HOST.len();
     }
-    None
+    urls
+}
+
+/// Stable identity for a GitHub pull-request URL. Recognized URLs are reduced
+/// to lowercase `https://github.com/<owner>/<repo>/pull/<n>`; legacy opaque
+/// values are trimmed but otherwise retained so older data remains readable.
+pub(crate) fn canonicalize_pr_url(url: &str) -> String {
+    const HOST: &str = "github.com/";
+    let trimmed = url.trim();
+    let lowercase = trimmed.to_ascii_lowercase();
+    let Some(host_start) = lowercase.find(HOST) else {
+        return trimmed.to_string();
+    };
+    let rest = &lowercase[host_start + HOST.len()..];
+    let Some(len) = pull_path_len(rest) else {
+        return trimmed.to_string();
+    };
+    format!("https://{HOST}{}", &rest[..len])
 }
 
 /// `<owner>/<repo>/pull/<digits>` immediately at the start of `rest` — the
 /// byte length consumed, or `None` if `rest` doesn't continue that shape.
 fn pull_path_len(rest: &str) -> Option<usize> {
     let is_seg = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
-    let owner_end = rest.find('/').filter(|&i| i > 0 && rest[..i].chars().all(is_seg))?;
+    let owner_end = rest
+        .find('/')
+        .filter(|&i| i > 0 && rest[..i].chars().all(is_seg))?;
     let after_owner = &rest[owner_end + 1..];
     let repo_end = after_owner
         .find('/')
         .filter(|&i| i > 0 && after_owner[..i].chars().all(is_seg))?;
     let after_repo = &after_owner[repo_end + 1..];
     let digits = after_repo.strip_prefix("pull/")?;
-    let digit_len = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    let digit_len = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
     (digit_len > 0).then_some(owner_end + 1 + repo_end + 1 + "pull/".len() + digit_len)
 }
 
@@ -83,7 +121,10 @@ pub(crate) fn looks_like_pr_create(command_or_input: &str) -> bool {
 pub(crate) fn tool_call_invocation_text(call: &ToolCall) -> String {
     match call {
         ToolCall::Exec { command } => command.clone(),
-        ToolCall::Unknown { name, input } | ToolCall::Mcp { tool: name, input, .. } => {
+        ToolCall::Unknown { name, input }
+        | ToolCall::Mcp {
+            tool: name, input, ..
+        } => {
             let mut text = name.clone();
             if let Some(input) = input {
                 text.push(' ');
@@ -110,11 +151,15 @@ pub(crate) fn extract_ticket_mention(text: &str) -> Option<String> {
 /// precedence loss both no-op silently, matching every other workspace write
 /// this engine makes off the hot path.
 pub(crate) fn mine_pr_mention(workspace: &WorkspaceHost, chat_id: &str, text: &str) {
-    if let Some(url) = extract_pr_url(text)
-        && let Err(err) =
-            workspace.set_chat_link(chat_id, ChatLinkKind::Pr, Some(&url), ChatLinkSource::Mentioned)
-    {
-        tracing::warn!(chat = %chat_id, error = %err, "PR mention link write failed");
+    for url in extract_pr_urls(text) {
+        if let Err(err) = workspace.set_chat_link(
+            chat_id,
+            ChatLinkKind::Pr,
+            Some(&url),
+            ChatLinkSource::Mentioned,
+        ) {
+            tracing::warn!(chat = %chat_id, error = %err, "PR mention link write failed");
+        }
     }
 }
 
@@ -169,7 +214,10 @@ mod tests {
 
     #[test]
     fn extract_pr_url_ignores_non_pull_github_urls() {
-        assert_eq!(extract_pr_url("https://github.com/acme/widgets/issues/7"), None);
+        assert_eq!(
+            extract_pr_url("https://github.com/acme/widgets/issues/7"),
+            None
+        );
         assert_eq!(extract_pr_url("https://github.com/acme/widgets"), None);
         assert_eq!(extract_pr_url("no url here"), None);
     }
@@ -189,8 +237,39 @@ mod tests {
     }
 
     #[test]
+    fn extract_pr_urls_finds_and_deduplicates_every_pull_request() {
+        let text = "Compare https://github.com/Acme/Widgets/pull/42/files with \
+                    github.com/acme/widgets/pull/43 and \
+                    http://github.com/acme/widgets/pull/42.";
+        assert_eq!(
+            extract_pr_urls(text),
+            vec![
+                "https://github.com/Acme/Widgets/pull/42".to_string(),
+                "github.com/acme/widgets/pull/43".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_pr_urls_share_one_storage_identity() {
+        for raw in [
+            "https://github.com/Acme/Widgets/pull/42",
+            "http://github.com/acme/widgets/pull/42/files",
+            "github.com/ACME/WIDGETS/pull/42?tab=checks",
+        ] {
+            assert_eq!(
+                canonicalize_pr_url(raw),
+                "https://github.com/acme/widgets/pull/42"
+            );
+        }
+        assert_eq!(canonicalize_pr_url("legacy-pr-url"), "legacy-pr-url");
+    }
+
+    #[test]
     fn looks_like_pr_create_matches_the_gh_invocation() {
-        assert!(looks_like_pr_create("gh pr create --title 'Fix thing' --body '…'"));
+        assert!(looks_like_pr_create(
+            "gh pr create --title 'Fix thing' --body '…'"
+        ));
         assert!(!looks_like_pr_create("gh pr view 42"));
         assert!(!looks_like_pr_create("gh pr merge 42"));
     }
@@ -209,12 +288,20 @@ mod tests {
             input: Some(serde_json::json!({"args": ["pr", "create"]})),
         };
         assert!(tool_call_invocation_text(&mcp).contains("pr"));
-        assert_eq!(tool_call_invocation_text(&ToolCall::Glob { pattern: "*.rs".into() }), "");
+        assert_eq!(
+            tool_call_invocation_text(&ToolCall::Glob {
+                pattern: "*.rs".into()
+            }),
+            ""
+        );
     }
 
     #[test]
     fn extract_ticket_mention_delegates_to_the_shared_regex() {
-        assert_eq!(extract_ticket_mention("see ENG-2715 for context"), Some("ENG-2715".into()));
+        assert_eq!(
+            extract_ticket_mention("see ENG-2715 for context"),
+            Some("ENG-2715".into())
+        );
         assert_eq!(extract_ticket_mention("nothing here"), None);
     }
 }

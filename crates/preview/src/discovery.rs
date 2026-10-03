@@ -1,8 +1,10 @@
 //! Observe only this user's listeners. HTTP probes run only after project
 //! ownership has been established from the process's actual working directory.
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -381,7 +383,12 @@ pub fn listeners() -> Vec<Listener> {
     }
     let mut result = Vec::new();
     for (pid, socket) in fields(&["-nP", "-a", "-u", &uid, "-iTCP", "-sTCP:LISTEN", "-F0pn"]) {
-        let Some(cwd) = cwds.get(&pid).and_then(|s| std::fs::canonicalize(s).ok()) else {
+        // Keep lsof's path lexical here. The preview service first checks it
+        // against its already-authorized project roots and only canonicalizes
+        // a matching candidate. Canonicalizing every user's listener cwd here
+        // can otherwise touch Music, Pictures, or another privacy-managed
+        // folder that has nothing to do with Zeron.
+        let Some(cwd) = cwds.get(&pid).map(PathBuf::from) else {
             continue;
         };
         let Some((parent, started_at, args)) = processes.get(&pid) else {

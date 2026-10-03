@@ -19,8 +19,11 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-use zeron_proto::{Chat, ChatConfig, Device, MAX_SIDEBAR_PINS, Session, SidebarPreferences, Space};
+use zeron_proto::{
+    Chat, ChatConfig, ChatPrLink, Device, MAX_SIDEBAR_PINS, Session, SidebarPreferences, Space,
+};
 
 use crate::schema::DocError;
 use crate::workspace::{DeletedSpace, WorkspaceState};
@@ -29,6 +32,7 @@ use crate::workspace::{DeletedSpace, WorkspaceState};
 pub const KIND_DEVICES: &str = "devices";
 pub const KIND_SPACES: &str = "spaces";
 pub const KIND_CHATS: &str = "chats";
+pub const KIND_CHAT_PR_LINKS: &str = "chatPrLinks";
 pub const KIND_SESSIONS: &str = "sessions";
 pub const KIND_PREFERENCES: &str = "preferences";
 
@@ -860,10 +864,25 @@ impl RegistryDoc {
             .filter(|c| c.space_id.as_deref() == Some(space_id))
             .map(|c| c.id)
             .collect();
-        let mut keys: Vec<(&str, &str)> = Vec::with_capacity(chat_ids.len() * 2 + 1);
+        let pr_link_ids: Vec<String> = self
+            .overlay_rows(KIND_CHAT_PR_LINKS)
+            .into_iter()
+            .filter(|row| {
+                row.fields
+                    .get("chatId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| chat_ids.iter().any(|chat_id| chat_id == id))
+            })
+            .map(|row| row.id)
+            .collect();
+        let mut keys: Vec<(&str, &str)> =
+            Vec::with_capacity(chat_ids.len() * 2 + pr_link_ids.len() + 1);
         for chat_id in &chat_ids {
             keys.push((KIND_CHATS, chat_id));
             keys.push((KIND_SESSIONS, chat_id));
+        }
+        for link_id in &pr_link_ids {
+            keys.push((KIND_CHAT_PR_LINKS, link_id));
         }
         keys.push((KIND_SPACES, space_id));
         self.delete_row_ops(&keys);
@@ -1165,6 +1184,73 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// All independently stored PR links for one chat. The legacy
+    /// `chats.linkedPrUrl` slot is intentionally not folded in here; the
+    /// engine owns that fallback and the deterministic legacy-primary mirror.
+    pub fn chat_pr_links(&self, chat_id: &str) -> Vec<ChatPrLink> {
+        let mut links: Vec<ChatPrLink> = self
+            .overlay_rows(KIND_CHAT_PR_LINKS)
+            .into_iter()
+            .filter_map(|row| {
+                (row.fields.get("chatId").and_then(Value::as_str) == Some(chat_id))
+                    .then(|| row_to::<RawChatPrLink>(&row))
+                    .flatten()
+                    .map(ChatPrLink::from)
+            })
+            .collect();
+        links.sort_by(|a, b| a.url.cmp(&b.url));
+        links
+    }
+
+    /// Add or update one independently mergeable PR link row.
+    pub fn upsert_chat_pr_link(
+        &mut self,
+        chat_id: &str,
+        link: &ChatPrLink,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        let id = chat_pr_link_row_id(chat_id, &link.url);
+        self.write(
+            KIND_CHAT_PR_LINKS,
+            &id,
+            OpKind::Upsert,
+            fields([
+                ("chatId", json!(chat_id)),
+                ("url", json!(link.url)),
+                ("source", serde_json::to_value(link.source)?),
+            ]),
+        );
+        Ok(true)
+    }
+
+    /// Remove exactly one PR link, leaving every other link untouched.
+    pub fn remove_chat_pr_link(&mut self, chat_id: &str, url: &str) -> bool {
+        let id = chat_pr_link_row_id(chat_id, url);
+        let existed = self.row_exists(KIND_CHAT_PR_LINKS, &id);
+        if existed {
+            self.delete_row_ops(&[(KIND_CHAT_PR_LINKS, &id)]);
+        }
+        existed
+    }
+
+    /// Remove every independently stored PR link for one chat.
+    pub fn clear_chat_pr_links(&mut self, chat_id: &str) -> usize {
+        let ids: Vec<String> = self
+            .overlay_rows(KIND_CHAT_PR_LINKS)
+            .into_iter()
+            .filter(|row| row.fields.get("chatId").and_then(Value::as_str) == Some(chat_id))
+            .map(|row| row.id)
+            .collect();
+        let keys: Vec<(&str, &str)> = ids
+            .iter()
+            .map(|id| (KIND_CHAT_PR_LINKS, id.as_str()))
+            .collect();
+        self.delete_row_ops(&keys);
+        ids.len()
+    }
+
     /// Sibling to [`Self::set_chat_pr_link`] for the ticket-id slot
     /// (`linkedTicketId`/`linkedTicketSource`).
     pub fn set_chat_ticket_link(
@@ -1214,7 +1300,15 @@ impl RegistryDoc {
     /// per-chat session doc remains — this removes the index entry only.
     pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, DocError> {
         let existed = self.row_exists(KIND_CHATS, chat_id);
-        self.delete_row_ops(&[(KIND_CHATS, chat_id), (KIND_SESSIONS, chat_id)]);
+        let link_ids: Vec<String> = self
+            .overlay_rows(KIND_CHAT_PR_LINKS)
+            .into_iter()
+            .filter(|row| row.fields.get("chatId").and_then(Value::as_str) == Some(chat_id))
+            .map(|row| row.id)
+            .collect();
+        let mut keys = vec![(KIND_CHATS, chat_id), (KIND_SESSIONS, chat_id)];
+        keys.extend(link_ids.iter().map(|id| (KIND_CHAT_PR_LINKS, id.as_str())));
+        self.delete_row_ops(&keys);
         Ok(existed)
     }
 
@@ -1424,6 +1518,30 @@ fn fields<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawChatPrLink {
+    url: String,
+    source: zeron_proto::ChatLinkSource,
+}
+
+impl From<RawChatPrLink> for ChatPrLink {
+    fn from(raw: RawChatPrLink) -> Self {
+        Self {
+            url: raw.url,
+            source: raw.source,
+        }
+    }
+}
+
+fn chat_pr_link_row_id(chat_id: &str, url: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(chat_id.as_bytes());
+    digest.update([0]);
+    digest.update(url.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn opt_str(value: Option<&str>) -> Value {

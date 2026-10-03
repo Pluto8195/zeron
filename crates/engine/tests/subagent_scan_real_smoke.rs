@@ -12,5 +12,8 @@ fn scans_a_real_session_with_known_subagents() {
     for s in result.iter().take(5) {
         eprintln!("{s:?}");
     }
-    assert!(!result.is_empty(), "this session has real subagent directories on disk");
+    assert!(
+        !result.is_empty(),
+        "this session has real subagent directories on disk"
+    );
 }

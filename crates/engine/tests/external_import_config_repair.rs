@@ -33,7 +33,11 @@ fn synthetic_transcript() -> String {
 #[tokio::test]
 async fn import_stamps_a_claude_code_config() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let transcript_path = dir.path().join("external-session.jsonl");
     std::fs::write(&transcript_path, synthetic_transcript()).expect("write transcript");
@@ -48,7 +52,9 @@ async fn import_stamps_a_claude_code_config() {
         .chat(chat_id)
         .expect("read chat")
         .expect("chat row exists");
-    let config = chat.config.expect("import must stamp a ChatConfig, not leave it None");
+    let config = chat
+        .config
+        .expect("import must stamp a ChatConfig, not leave it None");
     assert_eq!(config.harness, HarnessId::ClaudeCode);
     // Model/reasoning must stay unset so the user's own picks/sticky
     // defaults still apply — only the harness is forced.
@@ -72,7 +78,13 @@ async fn repair_backfills_a_config_less_imported_chat() {
     // `harness_session_id` alone isn't safe to use here).
     let chat_id = "pre-fix-imported-chat";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/project".into()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/project".into()),
+        )
         .expect("create chat row");
     core.workspace
         .set_chat_harness_session(chat_id, "some-external-session-id", "/work/project");
@@ -89,8 +101,15 @@ async fn repair_backfills_a_config_less_imported_chat() {
     )
     .expect("write cursor file");
 
-    let before = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
-    assert!(before.config.is_none(), "precondition: simulating the pre-fix broken state");
+    let before = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
+    assert!(
+        before.config.is_none(),
+        "precondition: simulating the pre-fix broken state"
+    );
 
     let repaired = core
         .external_import
@@ -98,7 +117,11 @@ async fn repair_backfills_a_config_less_imported_chat() {
         .expect("repair pass");
     assert_eq!(repaired, 1);
 
-    let after = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
+    let after = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
     let config = after.config.expect("repair must backfill a config");
     assert_eq!(config.harness, HarnessId::ClaudeCode);
     assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
@@ -118,7 +141,11 @@ async fn repair_backfills_a_config_less_imported_chat() {
 #[tokio::test]
 async fn repair_never_touches_a_chat_with_no_harness_session() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     // An ordinary Zeron-native chat (no harness_session_id at all) must be
     // left alone by this repair — it's scoped to external-session imports
@@ -134,7 +161,11 @@ async fn repair_never_touches_a_chat_with_no_harness_session() {
         .expect("repair pass");
     assert_eq!(repaired, 0);
 
-    let chat = core.workspace.chat("native-chat").expect("read chat").expect("chat exists");
+    let chat = core
+        .workspace
+        .chat("native-chat")
+        .expect("read chat")
+        .expect("chat exists");
     assert!(chat.config.is_none());
 
     core.shutdown().await;
@@ -153,11 +184,21 @@ async fn repair_never_touches_a_live_chat_with_a_stamped_resume_session_but_no_i
     // The one reliable signal is the import sync-cursor file, which only
     // `ExternalSessionImporter::import`/`sync` ever write.
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let chat_id = "live-chat-with-resume-session";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/project".into()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/project".into()),
+        )
         .expect("create chat row");
     core.workspace
         .set_chat_harness_session(chat_id, "some-live-session-id", "/work/project");
@@ -166,10 +207,20 @@ async fn repair_never_touches_a_live_chat_with_a_stamped_resume_session_but_no_i
         .external_import
         .repair_missing_config()
         .expect("repair pass");
-    assert_eq!(repaired, 0, "no import cursor exists for this chat — must be left alone");
+    assert_eq!(
+        repaired, 0,
+        "no import cursor exists for this chat — must be left alone"
+    );
 
-    let chat = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
-    assert!(chat.config.is_none(), "config must stay None, not be forced to Claude Code");
+    let chat = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
+    assert!(
+        chat.config.is_none(),
+        "config must stay None, not be forced to Claude Code"
+    );
 
     core.shutdown().await;
 }
@@ -177,11 +228,21 @@ async fn repair_never_touches_a_live_chat_with_a_stamped_resume_session_but_no_i
 #[tokio::test]
 async fn repair_never_overwrites_an_existing_config() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let chat_id = "already-configured-chat";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/project".into()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/project".into()),
+        )
         .expect("create chat row");
     core.workspace
         .set_chat_harness_session(chat_id, "some-external-session-id", "/work/project");
@@ -201,9 +262,16 @@ async fn repair_never_overwrites_an_existing_config() {
         .external_import
         .repair_missing_config()
         .expect("repair pass");
-    assert_eq!(repaired, 0, "a chat that already has a config must be left untouched");
+    assert_eq!(
+        repaired, 0,
+        "a chat that already has a config must be left untouched"
+    );
 
-    let after = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
+    let after = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
     assert_eq!(after.config, Some(custom_config));
 
     core.shutdown().await;

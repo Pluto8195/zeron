@@ -53,13 +53,20 @@ impl Fixture {
         let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
         let cursors_dir = profile.store_root().join("external_import_cursors");
         let core = assemble(profile);
-        Self { _dir: dir, core, cursors_dir }
+        Self {
+            _dir: dir,
+            core,
+            cursors_dir,
+        }
     }
 
     fn import(&self, chat_id: &str, session: &str) {
         let path = self._dir.path().join(format!("{session}.jsonl"));
         std::fs::write(&path, sentry_transcript()).expect("write transcript");
-        self.core.external_import.import(chat_id, session, &path).expect("import");
+        self.core
+            .external_import
+            .import(chat_id, session, &path)
+            .expect("import");
     }
 
     fn cursor(&self, chat_id: &str) -> serde_json::Value {
@@ -74,7 +81,11 @@ impl Fixture {
     fn edit_cursor(&self, chat_id: &str, f: impl FnOnce(&mut serde_json::Value)) {
         let mut json = self.cursor(chat_id);
         f(&mut json);
-        std::fs::write(self.cursor_path(chat_id), serde_json::to_vec(&json).unwrap()).expect("rewrite cursor");
+        std::fs::write(
+            self.cursor_path(chat_id),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .expect("rewrite cursor");
     }
 
     fn category(&self, chat_id: &str) -> String {
@@ -138,15 +149,19 @@ impl ChatCategoryClassifier for MockJev {
 
 impl Fixture {
     fn importer(&self, jev: &Arc<MockJev>) -> ExternalSessionImporter {
-        self.core.external_import.clone().with_chat_category_classifier(jev.clone())
+        self.core
+            .external_import
+            .clone()
+            .with_chat_category_classifier(jev.clone())
     }
 
     fn source(&self, chat_id: &str) -> String {
-        self.cursor(chat_id)["classifierSource"].as_str().unwrap_or("<absent>").to_string()
+        self.cursor(chat_id)["classifierSource"]
+            .as_str()
+            .unwrap_or("<absent>")
+            .to_string()
     }
-
 }
-
 
 impl Fixture {
     /// `n` imported chats, all filed under `other` with a current heuristic stamp.
@@ -162,16 +177,33 @@ impl Fixture {
     }
 
     fn reclassify(&self, jev: &Arc<MockJev>) -> ReclassifyOtherReport {
-        self.importer(jev).reclassify_other_chats().expect("reclassify")
+        self.importer(jev)
+            .reclassify_other_chats()
+            .expect("reclassify")
     }
 
     fn parked(&self, chat_id: &str) -> bool {
-        self.cursor(chat_id).get("jevInconclusiveVersion").is_some_and(|v| !v.is_null())
+        self.cursor(chat_id)
+            .get("jevInconclusiveVersion")
+            .is_some_and(|v| !v.is_null())
     }
 }
 
-fn report(examined: usize, reclassified: usize, unchanged: usize, jev_calls: usize, deferred: usize) -> ReclassifyOtherReport {
-    ReclassifyOtherReport { examined, reclassified, unchanged, jev_calls, deferred }
+fn report(
+    examined: usize,
+    reclassified: usize,
+    unchanged: usize,
+    jev_calls: usize,
+    deferred: usize,
+) -> ReclassifyOtherReport {
+    ReclassifyOtherReport {
+        examined,
+        reclassified,
+        unchanged,
+        jev_calls,
+        deferred,
+        ..Default::default()
+    }
 }
 
 #[tokio::test]
@@ -225,7 +257,13 @@ async fn jev_keeping_other_is_unchanged_but_restamped() {
     let fx = Fixture::new();
     let ids = fx.other_chats(1);
     let jev = MockJev::says("other");
-    assert_eq!(fx.reclassify(&jev), report(1, 0, 1, 1, 0));
+    assert_eq!(
+        fx.reclassify(&jev),
+        ReclassifyOtherReport {
+            confirmed_other: 1,
+            ..report(1, 0, 1, 1, 0)
+        }
+    );
     assert_eq!(fx.category(&ids[0]), "other");
     assert_eq!(fx.source(&ids[0]), "jev");
     fx.core.shutdown().await;
@@ -236,12 +274,21 @@ async fn inconclusive_leaves_other_and_does_not_block_the_next_manual_run() {
     let fx = Fixture::new();
     let ids = fx.other_chats(1);
     let jev = MockJev::new(true, JevOutcome::Inconclusive);
-    assert_eq!(fx.reclassify(&jev), report(1, 0, 1, 1, 0));
+    assert_eq!(
+        fx.reclassify(&jev),
+        ReclassifyOtherReport {
+            inconclusive: 1,
+            ..report(1, 0, 1, 1, 0)
+        }
+    );
     assert_eq!(fx.category(&ids[0]), "other");
     // Parked for the BOOT pass (it must not spend budget on it)...
     assert!(fx.parked(&ids[0]));
     assert!(
-        fx.importer(&jev).reclassify_stale_classifier_version_report().unwrap().is_empty(),
+        fx.importer(&jev)
+            .reclassify_stale_classifier_version_report()
+            .unwrap()
+            .is_empty(),
         "boot pass skips the parked chat"
     );
     assert_eq!(jev.calls(), 1);
@@ -258,7 +305,9 @@ async fn inconclusive_leaves_other_and_does_not_block_the_next_manual_run() {
 async fn a_chat_parked_by_the_boot_pass_is_retried_by_a_manual_run() {
     let fx = Fixture::new();
     let ids = fx.other_chats(1);
-    fx.edit_cursor(&ids[0], |j| j["jevInconclusiveVersion"] = CLASSIFIER_VERSION.into());
+    fx.edit_cursor(&ids[0], |j| {
+        j["jevInconclusiveVersion"] = CLASSIFIER_VERSION.into()
+    });
     let jev = MockJev::says("planning");
     assert_eq!(fx.reclassify(&jev), report(1, 1, 0, 1, 0));
     assert_eq!(fx.category(&ids[0]), "planning");
@@ -272,8 +321,18 @@ async fn failed_jev_leaves_the_chat_untouched_and_retryable() {
     let ids = fx.other_chats(2);
     let before = std::fs::read(fx.cursor_path(&ids[0])).unwrap();
     let jev = MockJev::new(true, JevOutcome::Failed);
-    assert_eq!(fx.reclassify(&jev), report(2, 0, 2, 2, 0));
-    assert_eq!(std::fs::read(fx.cursor_path(&ids[0])).unwrap(), before, "no write on a failed call");
+    assert_eq!(
+        fx.reclassify(&jev),
+        ReclassifyOtherReport {
+            failed: 2,
+            ..report(2, 0, 2, 2, 0)
+        }
+    );
+    assert_eq!(
+        std::fs::read(fx.cursor_path(&ids[0])).unwrap(),
+        before,
+        "no write on a failed call"
+    );
     assert!(!fx.parked(&ids[0]));
 
     *jev.outcome.lock().unwrap() = JevOutcome::Category("research".into());
@@ -289,7 +348,10 @@ async fn unavailable_jev_makes_no_calls_and_changes_nothing() {
     assert_eq!(fx.reclassify(&jev), report(3, 0, 3, 0, 0));
     assert_eq!(jev.calls(), 0);
     // The default importer (no classifier configured) is equally inert.
-    assert_eq!(fx.core.external_import.reclassify_other_chats().unwrap(), report(3, 0, 3, 0, 0));
+    assert_eq!(
+        fx.core.external_import.reclassify_other_chats().unwrap(),
+        report(3, 0, 3, 0, 0)
+    );
     fx.core.shutdown().await;
 }
 
@@ -338,10 +400,26 @@ async fn counts_add_up_across_mixed_outcomes() {
         ]),
         AtomicUsize::new(0),
     ));
-    let got = fx.core.external_import.clone().with_chat_category_classifier(seq.clone()).reclassify_other_chats().unwrap();
+    let got = fx
+        .core
+        .external_import
+        .clone()
+        .with_chat_category_classifier(seq.clone())
+        .reclassify_other_chats()
+        .unwrap();
     assert_eq!(got.examined, 4);
-    assert_eq!(got.reclassified + got.unchanged + got.deferred, got.examined);
-    assert_eq!((got.reclassified, got.unchanged, got.jev_calls, got.deferred), (2, 2, 4, 0));
+    assert_eq!(
+        got.reclassified + got.unchanged + got.deferred,
+        got.examined
+    );
+    assert_eq!(
+        (got.reclassified, got.unchanged, got.jev_calls, got.deferred),
+        (2, 2, 4, 0)
+    );
+    assert_eq!(
+        (got.confirmed_other, got.inconclusive, got.failed),
+        (1, 0, 1)
+    );
     fx.core.shutdown().await;
 }
 
@@ -351,7 +429,13 @@ async fn an_open_circuit_breaker_stops_the_run_and_defers_the_rest() {
     fx.other_chats(5);
     let jev = MockJev::new(true, JevOutcome::Failed);
     jev.trip_after.store(2, Ordering::SeqCst); // breaker opens after two failed calls
-    assert_eq!(fx.reclassify(&jev), report(5, 0, 2, 2, 3));
+    assert_eq!(
+        fx.reclassify(&jev),
+        ReclassifyOtherReport {
+            failed: 2,
+            ..report(5, 0, 2, 2, 3)
+        }
+    );
     assert_eq!(jev.calls(), 2);
     fx.core.shutdown().await;
 }

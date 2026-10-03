@@ -858,6 +858,8 @@ enum Launch {
 pub struct AcpHarness {
     spec: AcpAgentSpec,
     executable: Option<PathBuf>,
+    /// Zeron-owned cwd for automatic catalog probes. Never a user project or HOME.
+    model_discovery_cwd: Option<PathBuf>,
     /// Override of the agent's on-disk sessions root (grok's
     /// `~/.grok/sessions`), where subagent transcripts are tailed from.
     sessions_root: Option<PathBuf>,
@@ -884,6 +886,7 @@ impl AcpHarness {
         Self {
             spec,
             executable: None,
+            model_discovery_cwd: None,
             sessions_root: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
@@ -1071,6 +1074,12 @@ impl AcpHarness {
     /// Use a fixed agent binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Run automatic model probes and their `session/new` in this directory.
+    pub fn with_model_discovery_cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_discovery_cwd = Some(path.into());
         self
     }
 
@@ -1379,7 +1388,12 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
+        let discovery_cwd =
+            crate::executable::model_discovery_cwd(self.model_discovery_cwd.as_deref())?;
+        let discovery_cwd_string = discovery_cwd.to_string_lossy().into_owned();
+        let (_scratch, mut child, stderr_tail) = self
+            .spawn_agent(Some(&discovery_cwd_string), false, &[])
+            .await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1391,9 +1405,11 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            let cwd = crate::executable::home_or_current_dir();
             let session = client
-                .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+                .request(
+                    "session/new",
+                    json!({ "cwd": discovery_cwd, "mcpServers": [] }),
+                )
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             // Prompt-convention modes (Claude Ultrathink) extend any real
@@ -1771,8 +1787,11 @@ impl Harness for AcpHarness {
                 || async {
                     if self.id() == HarnessId::Devin {
                         let (exe, _) = self.resolve_program(false).await?;
+                        let discovery_cwd = crate::executable::model_discovery_cwd(
+                            self.model_discovery_cwd.as_deref(),
+                        )?;
                         self.devin_models
-                            .refresh(&exe, self.model_discovery_timeout)
+                            .refresh(&exe, &discovery_cwd, self.model_discovery_timeout)
                             .await
                     } else {
                         self.discover_models().await

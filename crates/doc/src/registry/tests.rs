@@ -554,6 +554,75 @@ fn delete_chat_tombstones_row_and_session() {
 }
 
 #[test]
+fn pr_links_are_independent_rows_and_delete_with_the_chat() {
+    let mut ws = RegistryDoc::new("dev-a");
+    ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    for (url, source) in [
+        (
+            "https://github.com/acme/widgets/pull/1",
+            zeron_proto::ChatLinkSource::Manual,
+        ),
+        (
+            "https://github.com/acme/widgets/pull/2",
+            zeron_proto::ChatLinkSource::CreatedInChat,
+        ),
+    ] {
+        assert!(
+            ws.upsert_chat_pr_link(
+                "chat-1",
+                &ChatPrLink {
+                    url: url.into(),
+                    source
+                }
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(ws.chat_pr_links("chat-1").len(), 2);
+    assert!(ws.remove_chat_pr_link("chat-1", "https://github.com/acme/widgets/pull/1"));
+    assert_eq!(
+        ws.chat_pr_links("chat-1")
+            .into_iter()
+            .map(|link| link.url)
+            .collect::<Vec<_>>(),
+        ["https://github.com/acme/widgets/pull/2"]
+    );
+    assert!(ws.delete_chat("chat-1").unwrap());
+    assert!(ws.chat_pr_links("chat-1").is_empty());
+}
+
+#[test]
+fn concurrent_pr_link_rows_converge_without_losing_either_url() {
+    let mut a = RegistryDoc::new("dev-a");
+    a.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    let mut b = RegistryDoc::new("dev-b");
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+
+    a.upsert_chat_pr_link(
+        "chat-1",
+        &ChatPrLink {
+            url: "https://github.com/acme/widgets/pull/1".into(),
+            source: zeron_proto::ChatLinkSource::Mentioned,
+        },
+    )
+    .unwrap();
+    b.upsert_chat_pr_link(
+        "chat-1",
+        &ChatPrLink {
+            url: "https://github.com/acme/widgets/pull/2".into(),
+            source: zeron_proto::ChatLinkSource::Manual,
+        },
+    )
+    .unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+
+    assert_eq!(a.chat_pr_links("chat-1"), b.chat_pr_links("chat-1"));
+    assert_eq!(a.chat_pr_links("chat-1").len(), 2);
+}
+
+#[test]
 fn spaces_round_trip_and_mutate() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project"))
@@ -690,6 +759,14 @@ fn delete_space_cascades_and_converges() {
     other.space_id = Some("sp-2".into());
     a.upsert_chat(&in_space).unwrap();
     a.upsert_chat(&other).unwrap();
+    a.upsert_chat_pr_link(
+        "chat-1",
+        &ChatPrLink {
+            url: "https://github.com/acme/widgets/pull/1".into(),
+            source: zeron_proto::ChatLinkSource::Manual,
+        },
+    )
+    .unwrap();
     a.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
         .unwrap();
     let mut b = RegistryDoc::new("dev-b");
@@ -724,6 +801,7 @@ fn delete_space_cascades_and_converges() {
             vec!["chat-2"]
         );
         assert!(state.sessions.is_empty());
+        assert!(ws.chat_pr_links("chat-1").is_empty());
     }
     let again = b.delete_space("sp-1").unwrap();
     assert!(!again.existed);

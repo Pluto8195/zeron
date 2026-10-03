@@ -106,6 +106,66 @@ fn message_text(content: &Value) -> String {
     }
 }
 
+/// Text carried by a Codex `response_item.message`. Codex uses
+/// `input_text` for user/developer messages and `output_text` for assistant
+/// messages; accepting `text` as well keeps this tolerant of older rollout
+/// files without making developer/system messages displayable (their role is
+/// filtered by the caller).
+fn codex_message_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("input_text" | "output_text" | "text")
+                )
+            })
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Codex persists host-provided context as user-role `response_item.message`
+/// rows. Those are not a human turn and would swamp a subagent peek with
+/// plugin/environment boilerplate. Developer and system roles are rejected
+/// separately; these are the known user-role host envelopes.
+fn is_codex_synthetic_user_text(text: &str) -> bool {
+    matches!(
+        text.trim_start(),
+        text if text.starts_with("<recommended_plugins>")
+            || text.starts_with("<environment_context>")
+            || text.starts_with("<skills_instructions>")
+            || text.starts_with("<permissions instructions>")
+            || text.starts_with("<apps_instructions>")
+            || text.starts_with("<plugins_instructions>")
+    )
+}
+
+fn codex_tool_input(payload: &serde_json::Map<String, Value>) -> Value {
+    let Some(raw) = payload.get("arguments").or_else(|| payload.get("input")) else {
+        return serde_json::json!({});
+    };
+    match raw {
+        Value::String(text) => {
+            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
+        }
+        other => other.clone(),
+    }
+}
+
+fn preview_value(value: &Value, limit: usize) -> String {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    truncate(&text, limit)
+}
+
 /// `truncate` (server.py:129-131): collapse all whitespace runs to single
 /// spaces, then hard-truncate to `limit` codepoints with a trailing `…`.
 /// `str.split()`/`len()` in Python operate on codepoints, matching Rust
@@ -127,29 +187,138 @@ fn build_transcript(path: &Path) -> Result<SubagentTranscript, EngineError> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Ok(SubagentTranscript::default());
     };
-    let lines: Vec<&str> = content.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = content
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
 
     // Pass 1 (server.py:362-373): tool_result content by tool_use_id. A
     // result can be an empty/whitespace-only string — stored as such (like
     // the reference's raw dict assignment) and treated as "no preview" only
     // when actually resolved below, not filtered out here.
     let mut results_by_id: HashMap<String, String> = HashMap::new();
+    let mut codex_results_by_id: HashMap<String, String> = HashMap::new();
     for line in &lines {
-        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
-            continue;
-        };
-        let Some(message) = raw.message else { continue };
-        for block in parse_blocks(&message.content) {
-            if block.kind == "tool_result" && !block.tool_use_id.is_empty() {
-                results_by_id.insert(block.tool_use_id, message_text(&block.content));
+        if let Ok(raw) = serde_json::from_str::<RawLine>(line)
+            && let Some(message) = raw.message
+        {
+            for block in parse_blocks(&message.content) {
+                if block.kind == "tool_result" && !block.tool_use_id.is_empty() {
+                    results_by_id.insert(block.tool_use_id, message_text(&block.content));
+                }
             }
         }
+
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        if !matches!(
+            payload.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) {
+            continue;
+        }
+        let Some(call_id) = payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let output = payload
+            .get("output")
+            .map(codex_message_text)
+            .unwrap_or_default();
+        codex_results_by_id.insert(call_id.to_string(), output);
     }
 
     // Pass 2 (server.py:377-413): one turn per user/assistant line.
     let mut turns = Vec::new();
     let mut model: Option<String> = None;
     for line in &lines {
+        let value = serde_json::from_str::<Value>(line).ok();
+        if let Some(value) = value.as_ref() {
+            if matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("turn_context" | "session_meta")
+            ) && let Some(found) = value
+                .get("payload")
+                .and_then(|payload| payload.get("model"))
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+            {
+                model = Some(found.to_string());
+            }
+
+            if value.get("type").and_then(Value::as_str) == Some("response_item")
+                && let Some(payload) = value.get("payload").and_then(Value::as_object)
+            {
+                let timestamp = value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        let role = match payload.get("role").and_then(Value::as_str) {
+                            Some("user") => "user",
+                            Some("assistant") => "assistant",
+                            // Host instructions are persisted as developer or
+                            // system messages. They are context, not turns.
+                            _ => continue,
+                        };
+                        let text = payload
+                            .get("content")
+                            .map(codex_message_text)
+                            .unwrap_or_default();
+                        if text.is_empty()
+                            || (role == "user"
+                                && (text.starts_with(TITLEGEN_PROMPT_PREFIX)
+                                    || is_codex_synthetic_user_text(&text)))
+                        {
+                            continue;
+                        }
+                        turns.push(SubagentTurn {
+                            role: role.to_string(),
+                            text,
+                            timestamp,
+                            tools: Vec::new(),
+                        });
+                    }
+                    Some("function_call" | "custom_tool_call") => {
+                        let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Tool");
+                        let input = codex_tool_input(payload);
+                        let result_preview = codex_results_by_id
+                            .get(call_id)
+                            .filter(|text| !text.is_empty())
+                            .map(|text| truncate(text, TOOL_RESULT_PREVIEW_CHARS));
+                        turns.push(SubagentTurn {
+                            role: "assistant".to_string(),
+                            text: String::new(),
+                            timestamp,
+                            tools: vec![SubagentToolCall {
+                                name: name.to_string(),
+                                input_preview: preview_value(&input, TOOL_INPUT_PREVIEW_CHARS),
+                                result_preview,
+                            }],
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+
         let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
             continue;
         };
@@ -232,7 +401,10 @@ impl TranscriptCache {
             return Ok(Arc::new(SubagentTranscript::default()));
         };
         {
-            let cache = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((cached_mtime, transcript)) = cache.get(path)
                 && *cached_mtime == mtime
             {
@@ -299,6 +471,69 @@ mod tests {
         assert_eq!(out.turns[2].role, "assistant");
         assert_eq!(out.turns[2].text, "Done reading it.");
         assert!(out.turns[2].tools.is_empty());
+    }
+
+    #[test]
+    fn builds_codex_response_items_without_host_instruction_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-child.jsonl");
+        write(
+            &path,
+            &[
+                r#"{"timestamp":"2026-10-01T12:00:00Z","type":"turn_context","payload":{"model":"gpt-codex-test"}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:01Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"internal instructions"}]}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:02Z","type":"response_item","payload":{"type":"message","role":"system","content":[{"type":"input_text","text":"system instructions"}]}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>host data</recommended_plugins>"},{"type":"input_text","text":"<environment_context>cwd</environment_context>"}]}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect the rollout code"}]}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I found the relevant file."}]}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:06Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"/tmp/a\"}","call_id":"call-1"}}"#,
+                r#"{"timestamp":"2026-10-01T12:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"file contents"}}"#,
+            ]
+            .join("\n"),
+        );
+
+        let out = build_transcript(&path).expect("build");
+        assert_eq!(out.model.as_deref(), Some("gpt-codex-test"));
+        assert_eq!(out.turns.len(), 3);
+        assert_eq!(out.turns[0].role, "user");
+        assert_eq!(out.turns[0].text, "Inspect the rollout code");
+        assert_eq!(out.turns[1].role, "assistant");
+        assert_eq!(out.turns[1].text, "I found the relevant file.");
+        assert_eq!(
+            out.turns[2].timestamp.as_deref(),
+            Some("2026-10-01T12:00:06Z")
+        );
+        assert_eq!(out.turns[2].tools.len(), 1);
+        assert_eq!(out.turns[2].tools[0].name, "read_file");
+        assert_eq!(out.turns[2].tools[0].input_preview, r#"{"path":"/tmp/a"}"#);
+        assert_eq!(
+            out.turns[2].tools[0].result_preview.as_deref(),
+            Some("file contents")
+        );
+    }
+
+    #[test]
+    fn builds_codex_custom_tool_previews_used_by_exec_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-custom-tool.jsonl");
+        write(
+            &path,
+            &[
+                r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"run the focused test","call_id":"call-exec"}}"#,
+                r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-exec","output":[{"type":"input_text","text":"Script completed\n"},{"type":"input_text","text":"1 passed"}]}}"#,
+            ]
+            .join("\n"),
+        );
+
+        let out = build_transcript(&path).expect("build");
+        assert_eq!(out.turns.len(), 1);
+        let tool = &out.turns[0].tools[0];
+        assert_eq!(tool.name, "exec");
+        assert_eq!(tool.input_preview, "run the focused test");
+        assert_eq!(
+            tool.result_preview.as_deref(),
+            Some("Script completed 1 passed")
+        );
     }
 
     #[test]
@@ -383,7 +618,10 @@ mod tests {
         assert_eq!(out.turns.len(), MAX_TURNS);
         // Kept the tail, not the head.
         assert_eq!(out.turns[0].text, format!("turn {}", 20));
-        assert_eq!(out.turns.last().unwrap().text, format!("turn {}", MAX_TURNS + 19));
+        assert_eq!(
+            out.turns.last().unwrap().text,
+            format!("turn {}", MAX_TURNS + 19)
+        );
     }
 
     #[test]
@@ -400,14 +638,24 @@ mod tests {
         // Poison the cache directly (same technique as
         // `context_usage.rs`'s own cache test) to prove a same-mtime lookup
         // serves the cached value rather than re-reading the file.
-        cache.inner.lock().unwrap().get_mut(&path).unwrap().1 = Arc::new(SubagentTranscript::default());
+        cache.inner.lock().unwrap().get_mut(&path).unwrap().1 =
+            Arc::new(SubagentTranscript::default());
         let second = cache.get_or_build(&path).expect("second build");
-        assert!(second.turns.is_empty(), "must serve the (poisoned) cached value, not re-read");
+        assert!(
+            second.turns.is_empty(),
+            "must serve the (poisoned) cached value, not re-read"
+        );
 
         // Bump mtime forward and change content: must re-read.
-        write(&path, r#"{"type":"assistant","message":{"content":[{"type":"text","text":"new content"}]}}"#);
+        write(
+            &path,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"new content"}]}}"#,
+        );
         let future = SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::open(&path).unwrap().set_modified(future).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
         let third = cache.get_or_build(&path).expect("third build");
         assert_eq!(third.turns.len(), 1);
         assert_eq!(third.turns[0].text, "new content");
@@ -449,7 +697,10 @@ mod tests {
         let turn = &value["turns"][0];
         assert_eq!(turn["role"], serde_json::json!("assistant"));
         assert_eq!(turn["text"], serde_json::json!("hello"));
-        assert_eq!(turn["timestamp"], serde_json::json!("2026-01-01T00:00:00.000Z"));
+        assert_eq!(
+            turn["timestamp"],
+            serde_json::json!("2026-01-01T00:00:00.000Z")
+        );
         let tool = &turn["tools"][0];
         assert_eq!(tool["name"], serde_json::json!("Read"));
         assert_eq!(tool["inputPreview"], serde_json::json!("{\"path\":\"/a\"}"));

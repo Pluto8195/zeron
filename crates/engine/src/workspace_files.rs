@@ -194,6 +194,16 @@ fn bad_path(message: &str) -> WorkspaceFilesError {
     WorkspaceFilesError::BadParams(message.to_string())
 }
 
+fn reject_broad_root(root: &Path) -> Result<(), WorkspaceFilesError> {
+    if crate::repos::is_broad_workspace_root_resolved(root) {
+        return Err(WorkspaceFilesError::Authorization(
+            "Files access is disabled for broad roots such as your home directory; choose a specific project folder"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn plain_folder_identity(device_id: &str, root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(device_id.as_bytes());
@@ -264,6 +274,12 @@ impl WorkspaceFiles {
                         "chat space belongs to another device".into(),
                     ));
                 }
+                // Preflight both persisted paths before `workspace_checkout`
+                // runs Git/canonicalization probes. A project-less chat uses
+                // the portable `~` marker and old imported chats may name HOME
+                // directly; neither authorizes touching protected descendants.
+                reject_broad_root(&cwd)?;
+                reject_broad_root(Path::new(&space.path))?;
                 self.inner
                     .repos
                     .workspace_checkout(Path::new(&space.path), &cwd)
@@ -291,6 +307,10 @@ impl WorkspaceFiles {
                     .checkout_path
                     .as_deref()
                     .map_or_else(|| space_path.clone(), PathBuf::from);
+                // This must precede `workspace_checkout`: that helper asks Git
+                // for refs and canonicalizes candidates as part of auth.
+                reject_broad_root(&space_path)?;
+                reject_broad_root(&requested)?;
                 self.inner
                     .repos
                     .workspace_checkout(&space_path, &requested)
@@ -302,6 +322,10 @@ impl WorkspaceFiles {
                     })?
             }
         };
+
+        // The preflight checks above protect the probes themselves; retain a
+        // post-resolution check for aliases that canonicalize to HOME.
+        reject_broad_root(&root)?;
 
         // Spaces also support plain folders. Git checkouts use their canonical
         // git-dir identity; plain roots get a device-scoped stable key so the
@@ -1977,6 +2001,15 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broad_targets_are_rejected_before_checkout_resolution() {
+        let home = crate::repos::home_dir();
+        assert!(reject_broad_root(&home).is_err());
+        assert!(reject_broad_root(&home.join(".")).is_err());
+        assert!(reject_broad_root(Path::new("~")).is_err());
+        assert!(reject_broad_root(&home.join("Projects")).is_ok());
+    }
 
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)

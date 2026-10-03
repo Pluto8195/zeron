@@ -177,13 +177,7 @@ impl PreviewService {
                                 l.address.port() != zeron_proto::PREVIEW_PROXY_PORT
                                     && l.pid != std::process::id()
                             })
-                            .filter_map(|listener| {
-                                roots
-                                    .iter()
-                                    .find(|root| listener.belongs_to(root))
-                                    .cloned()
-                                    .map(|root| (root, listener))
-                            })
+                            .filter_map(|listener| match_listener_to_roots(listener, &roots))
                             .collect::<Vec<_>>()
                     })
                     .await
@@ -235,6 +229,27 @@ impl PreviewService {
             let _ = task.await;
         }
     }
+}
+
+fn match_listener_to_roots(
+    listener: discovery::Listener,
+    roots: &[PathBuf],
+) -> Option<(PathBuf, discovery::Listener)> {
+    match_listener_to_roots_with(listener, roots, |path| path.canonicalize().ok())
+}
+
+fn match_listener_to_roots_with(
+    mut listener: discovery::Listener,
+    roots: &[PathBuf],
+    canonicalize: impl FnOnce(&std::path::Path) -> Option<PathBuf>,
+) -> Option<(PathBuf, discovery::Listener)> {
+    // The cheap lexical gate is deliberately first. A process outside every
+    // preview project must not cause even a metadata/canonicalization probe of
+    // its cwd. Recheck containment after canonicalization so `..` or symlinks
+    // cannot make an unrelated listener eligible.
+    let root = roots.iter().find(|root| listener.belongs_to(root))?.clone();
+    listener.cwd = canonicalize(&listener.cwd)?;
+    listener.belongs_to(&root).then_some((root, listener))
 }
 struct LocalConnector(Catalog);
 #[async_trait::async_trait]
@@ -321,5 +336,34 @@ mod tests {
         }
         let (_, probe) = memory.plan(vec![((), listener(7, 8081))], now);
         assert_eq!(probe.len(), 1, "still retried once per max backoff");
+    }
+
+    #[test]
+    fn listener_outside_project_roots_is_rejected_without_canonicalization() {
+        let listener = discovery::Listener {
+            cwd: "/Users/person/Music/private-server".into(),
+            ..listener(7, 8081)
+        };
+        let roots = vec![PathBuf::from("/Users/person/Projects/app")];
+        let matched = match_listener_to_roots_with(listener, &roots, |_| {
+            panic!("an unrelated cwd must not be canonicalized")
+        });
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn listener_is_rechecked_after_candidate_canonicalization() {
+        let listener = discovery::Listener {
+            cwd: "/Users/person/Projects/app/link/server".into(),
+            ..listener(7, 8081)
+        };
+        let roots = vec![PathBuf::from("/Users/person/Projects/app")];
+        let matched = match_listener_to_roots_with(listener, &roots, |_| {
+            Some(PathBuf::from("/Users/person/Music/private-server"))
+        });
+        assert!(
+            matched.is_none(),
+            "a symlink escape must fail the second gate"
+        );
     }
 }

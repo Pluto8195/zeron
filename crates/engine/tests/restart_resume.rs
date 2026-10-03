@@ -63,6 +63,69 @@ struct RecordingHarness {
     fail_starts: Arc<Mutex<u32>>,
 }
 
+/// Keeps one turn active until engine shutdown cancels it, then emits the
+/// same terminal interrupted event a graceful application quit produces.
+struct RestartInterruptedHarness;
+
+#[async_trait]
+impl Harness for RestartInterruptedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Restart interrupted"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: request.cwd,
+                    session_id: "hs-before-graceful-restart".into(),
+                    assistant_message_id: "assistant-before-restart".into(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: "partial before quit".into(),
+                }))
+                .await;
+            controls.interrupt.cancelled().await;
+            let _ = tx
+                .send(Ok(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }))
+                .await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
 #[async_trait]
 impl Harness for RecordingHarness {
     fn id(&self) -> HarnessId {
@@ -318,6 +381,109 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
 }
 
 #[tokio::test]
+async fn completed_journal_tail_repairs_user_only_transcript_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+
+    // Persist the exact on-disk shape seen after the regression: the user row
+    // made the doc, while the provider's full completed assistant response
+    // made only the append-only run journal.
+    {
+        let core = assemble(
+            &dir,
+            RecordingHarness {
+                requests: Default::default(),
+                session_id: "unused".into(),
+                fail_starts: Default::default(),
+            },
+        );
+        pre_title(&core);
+        core.doc_host
+            .open(CHAT)
+            .unwrap()
+            .write_user_message("lost-tail-user", "answer this", 1)
+            .unwrap();
+        core.shutdown().await;
+    }
+    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    for event in [
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-lost-tail".into(),
+            assistant_message_id: "provider-start".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "the durable ".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "answer".into(),
+        },
+        AgentEvent::AssistantMessageCompleted {
+            assistant_message_id: "provider-final".into(),
+        },
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("hs-lost-tail".into()),
+        },
+    ] {
+        journal.append(CHAT, &event).unwrap();
+    }
+    drop(journal);
+
+    // A normal boot runs stale-import sync first and then the journal-tail
+    // repair. The answer must return without a prompt, resume, or user action.
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: Default::default(),
+            session_id: "unused".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "completed journal tail recovery",
+    )
+    .await;
+    let entries = entries_now(&core);
+    assert_eq!(entries.len(), 2, "one user and one recovered assistant");
+    assert_eq!(entries[1].id, "provider-final");
+    assert_eq!(entries[1].status, Some(MessageStatus::Complete));
+    assert!(matches!(
+        &entries[1].parts[..],
+        [MessagePart::Text { text, .. }] if text == "the durable answer"
+    ));
+    assert_eq!(
+        core.sessions.recover_completed_tails().unwrap(),
+        0,
+        "a second sweep must not duplicate the repaired assistant"
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: Default::default(),
+            session_id: "unused".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    assert_eq!(complete_assistant_count(&core), 1);
+    assert_eq!(
+        entries_now(&core).len(),
+        2,
+        "repair survives another restart"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("data");
@@ -456,7 +622,7 @@ impl Harness for PersistentHarness {
     }
     async fn run(
         &self,
-        request: RunRequest,
+        _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         *self.runs_started.lock().unwrap() += 1;
@@ -685,6 +851,75 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         Some("hs-crash"),
         "auto-resume must reattach the crashed harness session"
     );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn graceful_shutdown_mid_turn_marks_and_resumes_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    let journals = dir.join("orgs/dev-org/dev-user/journals");
+
+    {
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(RestartInterruptedHarness));
+        let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
+            .expect("engine core assembles");
+        pre_title(&core);
+        queue_run(
+            &core,
+            "finish this after the app restarts",
+            "/tmp",
+            "msg-user-graceful-live",
+        );
+        wait_for(
+            || {
+                entries_now(&core).iter().any(|entry| {
+                    entry.role == MessageRole::Assistant
+                        && entry.status == Some(MessageStatus::Streaming)
+                })
+            },
+            "the turn to be in flight before shutdown",
+        )
+        .await;
+        core.shutdown().await;
+    }
+
+    let journal = RunJournal::open(&journals).unwrap();
+    assert!(
+        journal.graceful_restart_marked(CHAT),
+        "shutdown records that its interruption should resume"
+    );
+    assert!(
+        journal.stale_sessions().unwrap().is_empty(),
+        "graceful shutdown leaves a terminal interrupted Done"
+    );
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-after-graceful-live".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the gracefully interrupted live turn to resume",
+    )
+    .await;
+
+    let recorded = requests.lock().unwrap().clone();
+    let resumed = recorded
+        .iter()
+        .find(|request| request.prompt == "finish this after the app restarts")
+        .expect("boot recovery re-dispatched the interrupted prompt");
+    assert_eq!(
+        resumed.resume.as_deref(),
+        Some("hs-before-graceful-restart")
+    );
+    assert!(!journal.graceful_restart_marked(CHAT));
     core.shutdown().await;
 }
 

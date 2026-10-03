@@ -3663,11 +3663,7 @@ impl Transcript {
     }
 
     fn own_send_inset_for(anchor_ix: usize, top_inset: f32) -> f32 {
-        if anchor_ix == 0 {
-            0.0
-        } else {
-            top_inset
-        }
+        if anchor_ix == 0 { 0.0 } else { top_inset }
     }
 
     /// Row 0's top gap. An override instance (right pane) already pads for
@@ -8246,7 +8242,10 @@ mod tests {
             Theme::TITLEBAR_HEIGHT + 10.0
         );
         // Row 0 carries the inset in its own gap; the hold adds nothing.
-        assert_eq!(Transcript::own_send_inset_for(0, OWN_SEND_TOP_INSET_PX), 0.0);
+        assert_eq!(
+            Transcript::own_send_inset_for(0, OWN_SEND_TOP_INSET_PX),
+            0.0
+        );
         assert_eq!(Transcript::own_send_inset_for(0, 8.0), 0.0);
         // Override instances ignore the inset for row 0.
         assert_eq!(Transcript::first_row_top_gap(true, 8.0), Theme::SPACE_LG);
@@ -8256,7 +8255,10 @@ mod tests {
         );
         // A small panel inset drops the titlebar from BOTH, by the same amount.
         let panel = crate::overview::CHAT_PANEL_TRANSCRIPT_TOP_INSET;
-        assert_eq!(Transcript::first_row_top_gap(false, panel), panel + Theme::SPACE_LG);
+        assert_eq!(
+            Transcript::first_row_top_gap(false, panel),
+            panel + Theme::SPACE_LG
+        );
         assert_eq!(Transcript::own_send_inset_for(3, panel), panel);
         assert_eq!(
             Transcript::first_row_top_gap(false, OWN_SEND_TOP_INSET_PX)
@@ -11378,7 +11380,13 @@ mod tests {
                         .bounds_for_item(anchor)
                         .unwrap()
                         .top();
-                    assert!(previous > px(Transcript::own_send_inset_for(anchor, OWN_SEND_TOP_INSET_PX) + 40.0));
+                    assert!(
+                        previous
+                            > px(
+                                Transcript::own_send_inset_for(anchor, OWN_SEND_TOP_INSET_PX)
+                                    + 40.0
+                            )
+                    );
                     for _ in 0..80 {
                         tick(&transcript, window, cx);
                         let top = transcript
@@ -11389,7 +11397,10 @@ mod tests {
                             .top();
                         assert!(top <= previous + px(0.5), "repeat send reversed");
                         assert!(
-                            top >= px(Transcript::own_send_inset_for(anchor, OWN_SEND_TOP_INSET_PX) - 2.5),
+                            top >= px(Transcript::own_send_inset_for(
+                                anchor,
+                                OWN_SEND_TOP_INSET_PX
+                            ) - 2.5),
                             "repeat send overshot"
                         );
                         assert!(previous - top < px(150.0), "repeat send jumped");
@@ -11762,7 +11773,8 @@ mod tests {
                 draw(window, cx);
                 let start_top = transcript.read(cx).list.bounds_for_item(11).unwrap().top();
                 assert!(
-                    start_top > px(Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX) + 100.0),
+                    start_top
+                        > px(Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX) + 100.0),
                     "installing the runway must preserve the start of the glide"
                 );
                 let mut previous_top = start_top;
@@ -11783,8 +11795,8 @@ mod tests {
                         "the glide must not reverse"
                     );
                     previous_top = bounds.top();
-                    let target =
-                        this.list.viewport_bounds().top() + px(Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX));
+                    let target = this.list.viewport_bounds().top()
+                        + px(Transcript::own_send_inset_for(11, OWN_SEND_TOP_INSET_PX));
                     assert!(
                         bounds.top() >= target - px(0.5),
                         "send overshot: {:?} < {:?}",

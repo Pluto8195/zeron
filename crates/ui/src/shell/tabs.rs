@@ -48,7 +48,7 @@ pub(super) fn chat_identity_string(
 
 /// [`chat_identity_string`] for a chat row (title collapsed to one line, the
 /// same fallback the titlebar uses).
-pub(super) fn chat_identity_for(chat: &zeron_proto::Chat) -> String {
+pub(crate) fn chat_identity_for(chat: &zeron_proto::Chat) -> String {
     let title = transcript::single_line(chat.title.as_deref().unwrap_or("New session"));
     chat_identity_string(&title, &chat.id, chat.harness_session_id.as_deref())
 }
@@ -436,6 +436,7 @@ impl Shell {
                 el.child(
                     div()
                         .min_w_0()
+                        .flex_shrink(1.0)
                         .overflow_hidden()
                         .flex()
                         .flex_row()
@@ -464,29 +465,33 @@ impl Shell {
                                     theme.text.opacity(0.85)
                                 })
                                 .child(title),
-                        )
-                        .when_some(chat_id, |el, chat_id| {
-                            let copied =
-                                self.copied_chat_identity.as_deref() == Some(chat_id.as_str());
-                            el.child(chat_identity_button(
-                                copied,
-                                &theme,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.copy_chat_identity(&chat_id, false, cx)
-                                }),
-                            ))
-                        })
-                        .when_some(target, |el, target| {
-                            el.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(12.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
-                                    .child(target),
-                            )
-                        }),
+                        ),
                 )
+                // Keep the action OUTSIDE the clipped title/target text.
+                // Putting a 20px icon inside that overflow-hidden flex group
+                // made the only copy affordance disappear first when a long
+                // chat name or narrow window squeezed the titlebar.
+                .when_some(chat_id, |el, chat_id| {
+                    let copied = self.copied_chat_identity.as_deref() == Some(chat_id.as_str());
+                    el.child(chat_identity_button(
+                        copied,
+                        &theme,
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_chat_identity(&chat_id, false, cx)
+                        }),
+                    ))
+                })
+                .when_some(target, |el, target| {
+                    el.child(
+                        div()
+                            .min_w_0()
+                            .flex_shrink(1.0)
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted.opacity(0.5))
+                            .child(target),
+                    )
+                })
             })
             .child(div().flex_1())
             .children(actions)
@@ -501,36 +506,47 @@ impl Shell {
     }
 }
 
-/// Small copy-identity button beside the titlebar's chat name. Mirrors
-/// [`header_icon_button`] (occluded out of the drag strip, click swallowed)
-/// at a title-sized 20px; flips to a check while `copied`.
+fn chat_identity_button_label(copied: bool) -> &'static str {
+    if copied { "Copied" } else { "Copy name + IDs" }
+}
+
+/// Persistent copy-identity button beside the titlebar's chat name. The text
+/// label and quiet border make the action discoverable without hover; it is
+/// kept outside the title's overflow clipping above. Like
+/// [`header_icon_button`], it is occluded out of the drag strip and swallows
+/// the click. The label flips to `Copied` with the icon while `copied`.
 fn chat_identity_button(
     copied: bool,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let fade_key = "chat-identity-copy".to_string();
+    let label = chat_identity_button_label(copied);
     div()
         .id("chat-identity-copy")
-        .size(px(20.0))
+        .h(px(22.0))
+        .px(px(6.0))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
+        .gap(px(4.0))
         .rounded(px(5.0))
+        .border_1()
+        .border_color(theme.border)
         .cursor_pointer()
         .bg(motion::hover_blend(
             &fade_key,
-            crate::theme::wash(0.0),
-            crate::theme::wash(0.11),
+            crate::theme::wash(0.05),
+            crate::theme::wash(0.13),
         ))
         .on_hover(motion::hover_listener(fade_key))
         .occlude()
         .role(gpui::Role::Button)
         .aria_label(if copied {
-            "Chat info copied"
+            "Chat name and IDs copied"
         } else {
-            "Copy chat info"
+            "Copy chat name and IDs"
         })
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |event, window, cx| {
@@ -539,8 +555,14 @@ fn chat_identity_button(
         })
         .child(
             icon(if copied { icons::CHECK } else { icons::COPY })
-                .size(px(13.0))
+                .size(px(12.0))
                 .text_color(theme.text_muted),
+        )
+        .child(
+            div()
+                .text_size(crate::typography::ui_rems(10.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(label)),
         )
 }
 
@@ -561,7 +583,40 @@ mod chat_identity_tests {
         let want = "Fix login \u{2014} chat chat-1";
         assert_eq!(chat_identity_string("Fix login", "chat-1", None), want);
         assert_eq!(chat_identity_string("Fix login", "chat-1", Some("")), want);
-        assert_eq!(chat_identity_string("Fix login", "chat-1", Some("  ")), want);
+        assert_eq!(
+            chat_identity_string("Fix login", "chat-1", Some("  ")),
+            want
+        );
+    }
+
+    #[test]
+    fn identity_for_uses_the_visible_title_fallback_and_collapses_lines() {
+        let titled: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-1", "deviceId": "local", "archived": false,
+            "title": "Fix\nlogin", "harnessSessionId": "session-2",
+            "createdAt": chrono::Utc::now(),
+        }))
+        .unwrap();
+        assert_eq!(
+            chat_identity_for(&titled),
+            "Fix login \u{2014} chat chat-1 \u{2014} session session-2"
+        );
+
+        let untitled: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-2", "deviceId": "local", "archived": false,
+            "createdAt": chrono::Utc::now(),
+        }))
+        .unwrap();
+        assert_eq!(
+            chat_identity_for(&untitled),
+            "New session \u{2014} chat chat-2"
+        );
+    }
+
+    #[test]
+    fn identity_button_has_a_persistent_action_label() {
+        assert_eq!(chat_identity_button_label(false), "Copy name + IDs");
+        assert_eq!(chat_identity_button_label(true), "Copied");
     }
 }
 

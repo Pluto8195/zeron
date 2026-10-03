@@ -43,7 +43,11 @@ fn transcript_with_no_link() -> String {
 #[tokio::test]
 async fn repair_mines_a_pr_and_ticket_mention_from_the_transcript() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let transcript_path = dir.path().join("external-session.jsonl");
     std::fs::write(&transcript_path, transcript_with_pr_mention()).expect("write transcript");
@@ -53,7 +57,11 @@ async fn repair_mines_a_pr_and_ticket_mention_from_the_transcript() {
         .import(chat_id, "external-session-id-1", &transcript_path)
         .expect("import");
 
-    let before = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
+    let before = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
     assert!(before.linked_pr_url.is_none(), "precondition: no link yet");
     assert!(before.linked_ticket_id.is_none());
 
@@ -63,8 +71,15 @@ async fn repair_mines_a_pr_and_ticket_mention_from_the_transcript() {
         .expect("repair pass");
     assert_eq!(repaired, 1);
 
-    let after = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
-    assert_eq!(after.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/42"));
+    let after = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
+    assert_eq!(
+        after.linked_pr_url.as_deref(),
+        Some("https://github.com/acme/widgets/pull/42")
+    );
     assert_eq!(after.linked_pr_source, Some(ChatLinkSource::Mentioned));
     assert_eq!(after.linked_ticket_id.as_deref(), Some("ENG-2715"));
     assert_eq!(after.linked_ticket_source, Some(ChatLinkSource::Mentioned));
@@ -83,7 +98,11 @@ async fn repair_mines_a_pr_and_ticket_mention_from_the_transcript() {
 #[tokio::test]
 async fn repair_marks_a_link_less_chat_scanned_so_it_is_never_reparsed() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let transcript_path = dir.path().join("external-session.jsonl");
     std::fs::write(&transcript_path, transcript_with_no_link()).expect("write transcript");
@@ -99,7 +118,11 @@ async fn repair_marks_a_link_less_chat_scanned_so_it_is_never_reparsed() {
         .expect("repair pass");
     assert_eq!(repaired, 0, "nothing to mine — no link written");
 
-    let chat = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
+    let chat = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
     assert!(chat.linked_pr_url.is_none());
     assert!(chat.linked_ticket_id.is_none());
 
@@ -119,7 +142,11 @@ async fn repair_marks_a_link_less_chat_scanned_so_it_is_never_reparsed() {
 #[tokio::test]
 async fn repair_never_touches_a_chat_that_already_has_a_link() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let transcript_path = dir.path().join("external-session.jsonl");
     std::fs::write(&transcript_path, transcript_with_pr_mention()).expect("write transcript");
@@ -146,10 +173,20 @@ async fn repair_never_touches_a_chat_that_already_has_a_link() {
         .external_import
         .repair_missing_links(&core.context_usage)
         .expect("repair pass");
-    assert_eq!(repaired, 0, "a chat that already has a link must be skipped outright");
+    assert_eq!(
+        repaired, 0,
+        "a chat that already has a link must be skipped outright"
+    );
 
-    let chat = core.workspace.chat(chat_id).expect("read chat").expect("chat exists");
-    assert_eq!(chat.linked_pr_url.as_deref(), Some("https://github.com/acme/widgets/pull/999"));
+    let chat = core
+        .workspace
+        .chat(chat_id)
+        .expect("read chat")
+        .expect("chat exists");
+    assert_eq!(
+        chat.linked_pr_url.as_deref(),
+        Some("https://github.com/acme/widgets/pull/999")
+    );
     assert_eq!(chat.linked_pr_source, Some(ChatLinkSource::Manual));
 
     core.shutdown().await;

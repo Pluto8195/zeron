@@ -91,6 +91,8 @@ fn cursor_cli_paths() -> Vec<PathBuf> {
 pub struct CursorHarness {
     /// Test seam: run this program AS the shim instead of node+managed SDK.
     executable: Option<PathBuf>,
+    /// Zeron-owned cwd for automatic catalog probes. Never a user project or HOME.
+    model_discovery_cwd: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Credential-scoped successful catalog, with bounded refresh and backoff.
@@ -101,6 +103,7 @@ impl Default for CursorHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            model_discovery_cwd: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             models_cache: catalog::Catalog::default(),
@@ -127,6 +130,12 @@ impl CursorHarness {
         self
     }
 
+    /// Run automatic model probes in this Zeron-owned directory.
+    pub fn with_model_discovery_cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_discovery_cwd = Some(path.into());
+        self
+    }
+
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
@@ -136,9 +145,12 @@ impl CursorHarness {
     /// Spawn the shim in models mode and map its one catalog frame.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
+        let discovery_cwd =
+            crate::executable::model_discovery_cwd(self.model_discovery_cwd.as_deref())?;
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
         crate::compose_child_path(&mut cmd, &exe);
+        cmd.current_dir(discovery_cwd);
         cmd.arg("models")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

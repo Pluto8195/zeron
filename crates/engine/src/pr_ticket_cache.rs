@@ -144,6 +144,18 @@ pub struct DiffStat {
     pub lines_removed: u32,
 }
 
+/// One durable PR link and whatever detail the non-blocking cache currently
+/// knows about it.  Keeping the URL/source even while `detail` is still
+/// pending lets the overview render every attached PR immediately instead of
+/// collapsing cache misses back into a single anonymous slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrLinkStatus {
+    pub url: String,
+    pub source: Option<zeron_proto::ChatLinkSource>,
+    pub detail: Option<PrStatus>,
+}
+
 /// What's known right now for one chat's branch — either side may still be
 /// `None` because nothing links (no PR/ticket exists) or because the sweep
 /// hasn't gotten to it yet; the caller can't distinguish those without
@@ -153,6 +165,10 @@ pub struct DiffStat {
 #[serde(rename_all = "camelCase")]
 pub struct ChatLinkStatus {
     pub pr: Option<PrStatus>,
+    /// All durable PRs attached to this chat.  `pr`/`pr_source` remain as a
+    /// backwards-compatible primary mirror for older clients.
+    #[serde(default)]
+    pub pr_links: Vec<PrLinkStatus>,
     pub ticket: Option<TicketStatus>,
     /// `cwd` sits under a `.worktrees/`/`.agent-worktrees/` directory —
     /// `is_worktree` (`session_canvas_server.py:300-304`). A pure string
@@ -317,25 +333,96 @@ impl PrTicketCache {
         linked_pr_url: Option<&str>,
         linked_ticket_id: Option<&str>,
     ) -> ChatLinkStatus {
+        let legacy_link =
+            linked_pr_url
+                .filter(|url| !url.is_empty())
+                .map(|url| zeron_proto::ChatPrLink {
+                    url: url.to_string(),
+                    // `status_for` predates per-link provenance; callers attach
+                    // the real legacy source to `pr_source` after this read.
+                    source: zeron_proto::ChatLinkSource::Mentioned,
+                });
+        self.status_for_links(cwd, branch, legacy_link.as_slice(), linked_ticket_id)
+    }
+
+    /// Multi-PR sibling of [`Self::status_for`]. Every durable URL gets its
+    /// own cache key and stable wire row, including while detail is pending.
+    /// The branch-derived PR is also retained when it resolves to a different
+    /// URL, so manually adding one PR does not hide a stacked/sibling PR that
+    /// the checkout itself identifies.
+    pub fn status_for_links(
+        &self,
+        cwd: Option<&str>,
+        branch: Option<&str>,
+        linked_pr_links: &[zeron_proto::ChatPrLink],
+        linked_ticket_id: Option<&str>,
+    ) -> ChatLinkStatus {
         let mut status = ChatLinkStatus::default();
 
-        let pr_key = match linked_pr_url.filter(|url| !url.is_empty()) {
-            Some(url) => Some(PrKey::Url(url.to_string())),
-            None => match (cwd, branch) {
-                (Some(cwd), Some(branch)) if !branch.is_empty() => Some(PrKey::Branch {
-                    cwd: PathBuf::from(cwd),
-                    branch: branch.to_string(),
-                }),
-                _ => None,
-            },
-        };
-        if let Some(key) = pr_key {
+        for link in linked_pr_links.iter().filter(|link| !link.url.is_empty()) {
+            let key = PrKey::Url(link.url.clone());
             let cache = lock(&self.inner.pr_cache);
-            match cache.get(&key) {
-                Some(entry) if entry.fresh(CACHE_TTL) => status.pr = entry.data.clone(),
+            let detail = match cache.get(&key) {
+                Some(entry) if entry.fresh(CACHE_TTL) => entry.data.clone(),
                 _ => {
                     drop(cache);
                     lock(&self.inner.pending_pr).insert(key);
+                    None
+                }
+            };
+            status.pr_links.push(PrLinkStatus {
+                url: link.url.clone(),
+                source: Some(link.source),
+                detail,
+            });
+        }
+
+        // Preserve the historical primary fields for old clients.
+        if let Some(primary) = status.pr_links.first() {
+            status.pr = primary.detail.clone();
+            status.pr_source = primary.source;
+        }
+
+        // Branch inference remains useful even when durable links exist (for
+        // stacked PRs), but linked URLs are authoritative: do not enqueue a
+        // redundant branch lookup just because its cache entry is absent.
+        // Already-cached branch detail may still add a distinct inferred PR,
+        // and URL de-duplication gives durable provenance precedence.
+        let has_durable_pr_links = !status.pr_links.is_empty();
+        let branch_key = match (cwd, branch) {
+            (Some(cwd), Some(branch)) if !branch.is_empty() => Some(PrKey::Branch {
+                cwd: PathBuf::from(cwd),
+                branch: branch.to_string(),
+            }),
+            _ => None,
+        };
+        if let Some(key) = branch_key {
+            let cache = lock(&self.inner.pr_cache);
+            match cache.get(&key) {
+                Some(entry) if entry.fresh(CACHE_TTL) => {
+                    if let Some(detail) = entry.data.clone() {
+                        let inferred_url = detail.url.clone().unwrap_or_default();
+                        if !inferred_url.is_empty()
+                            && !status.pr_links.iter().any(|link| link.url == inferred_url)
+                        {
+                            status.pr_links.push(PrLinkStatus {
+                                url: inferred_url,
+                                source: None,
+                                detail: Some(detail.clone()),
+                            });
+                            if status.pr.is_none() {
+                                status.pr = Some(detail);
+                            }
+                        } else if status.pr.is_none() {
+                            status.pr = Some(detail);
+                        }
+                    }
+                }
+                _ => {
+                    drop(cache);
+                    if !has_durable_pr_links {
+                        lock(&self.inner.pending_pr).insert(key);
+                    }
                 }
             }
         }
@@ -632,7 +719,11 @@ fn summarize_checks(checks: Option<&Value>) -> Option<ChecksStatus> {
     let mut any_failing = false;
     let mut any_pending = false;
     for c in checks {
-        let status = c.get("status").and_then(Value::as_str).unwrap_or("").to_uppercase();
+        let status = c
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_uppercase();
         let conclusion = c
             .get("conclusion")
             .and_then(Value::as_str)
@@ -667,7 +758,11 @@ fn is_bot_login(login: &str) -> bool {
 }
 
 fn pr_json_to_status(data: &Value) -> PrStatus {
-    let reviews = data.get("reviews").and_then(Value::as_array).cloned().unwrap_or_default();
+    let reviews = data
+        .get("reviews")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let author_login = data
         .get("author")
         .and_then(|a| a.get("login"))
@@ -675,7 +770,11 @@ fn pr_json_to_status(data: &Value) -> PrStatus {
         .map(str::to_string);
     let mut reviewers: Vec<String> = reviews
         .iter()
-        .filter_map(|r| r.get("author").and_then(|a| a.get("login")).and_then(Value::as_str))
+        .filter_map(|r| {
+            r.get("author")
+                .and_then(|a| a.get("login"))
+                .and_then(Value::as_str)
+        })
         .filter(|login| !is_bot_login(login) && Some(login.to_string()) != author_login)
         .map(str::to_string)
         .collect();
@@ -690,12 +789,24 @@ fn pr_json_to_status(data: &Value) -> PrStatus {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_lowercase(),
-        is_draft: data.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-        review_decision: data.get("reviewDecision").and_then(Value::as_str).map(str::to_string),
+        is_draft: data
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        review_decision: data
+            .get("reviewDecision")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         reviewers,
         checks: summarize_checks(data.get("statusCheckRollup")),
-        title: data.get("title").and_then(Value::as_str).map(str::to_string),
-        branch: data.get("headRefName").and_then(Value::as_str).map(str::to_string),
+        title: data
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        branch: data
+            .get("headRefName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         mergeable: data
             .get("mergeable")
             .and_then(Value::as_str)
@@ -791,7 +902,9 @@ fn git_diff_shortstat(cwd: &Path) -> Option<DiffStat> {
     if !output.status.success() {
         return None;
     }
-    Some(parse_git_shortstat(&String::from_utf8_lossy(&output.stdout)))
+    Some(parse_git_shortstat(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 /// `git diff --shortstat`'s one-line summary, e.g.
@@ -831,7 +944,10 @@ fn parse_git_shortstat(text: &str) -> DiffStat {
 /// searches every repo the signed-in `gh` account can see — the general
 /// per-user equivalent that works for anyone, not just this org.
 fn fetch_my_open_prs() -> Option<Vec<MyOpenPr>> {
-    run_pr_search("--author=@me", "number,title,url,repository,isDraft,updatedAt")
+    run_pr_search(
+        "--author=@me",
+        "number,title,url,repository,isDraft,updatedAt",
+    )
 }
 
 /// Open PRs where the signed-in user is a requested reviewer. Deliberately NO
@@ -879,7 +995,10 @@ fn parse_pr_search(stdout: &[u8]) -> Option<Vec<MyOpenPr>> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 is_draft: d.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-                updated_at: d.get("updatedAt").and_then(Value::as_str).map(str::to_string),
+                updated_at: d
+                    .get("updatedAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 author: d
                     .get("author")
                     .and_then(|a| a.get("login"))
@@ -892,10 +1011,7 @@ fn parse_pr_search(stdout: &[u8]) -> Option<Vec<MyOpenPr>> {
 
 /// Is a search slot due for a (re)fetch? Stale-or-empty list AND not inside
 /// the post-failure backoff window.
-fn search_due(
-    list_fetched_at: Option<Instant>,
-    failed_at: Option<Instant>,
-) -> bool {
+fn search_due(list_fetched_at: Option<Instant>, failed_at: Option<Instant>) -> bool {
     if failed_at.is_some_and(|t| t.elapsed() < SEARCH_FAILURE_BACKOFF) {
         return false;
     }
@@ -909,10 +1025,7 @@ async fn sweep_search_slot(
     failed_at: &Mutex<Option<Instant>>,
     fetch: fn() -> Option<Vec<MyOpenPr>>,
 ) -> bool {
-    let due = search_due(
-        lock(list).as_ref().map(|(_, at)| *at),
-        *lock(failed_at),
-    );
+    let due = search_due(lock(list).as_ref().map(|(_, at)| *at), *lock(failed_at));
     if !due {
         return false;
     }
@@ -974,7 +1087,10 @@ fn fetch_linear_ticket(ticket_id: &str) -> Option<TicketStatus> {
             .and_then(Value::as_str)
             .unwrap_or(ticket_id)
             .to_string(),
-        title: data.get("title").and_then(Value::as_str).map(str::to_string),
+        title: data
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         url: data.get("url").and_then(Value::as_str).map(str::to_string),
         status,
     })
@@ -986,8 +1102,14 @@ mod tests {
 
     #[test]
     fn extracts_ticket_id_from_branch_names() {
-        assert_eq!(extract_ticket_id("eng-2715-fix-thing"), Some("ENG-2715".into()));
-        assert_eq!(extract_ticket_id("feature/ABC-123-do-stuff"), Some("ABC-123".into()));
+        assert_eq!(
+            extract_ticket_id("eng-2715-fix-thing"),
+            Some("ENG-2715".into())
+        );
+        assert_eq!(
+            extract_ticket_id("feature/ABC-123-do-stuff"),
+            Some("ABC-123".into())
+        );
         assert_eq!(extract_ticket_id("mikey/quick-fix"), None);
         assert_eq!(extract_ticket_id(""), None);
         // 7-letter prefix is outside the `{2,6}` bound — must not match.
@@ -1001,7 +1123,10 @@ mod tests {
         // "xeng-123x" must not match "ENG-123" — the char before/after the
         // whole token must not itself be alphanumeric.
         assert_eq!(extract_ticket_id("xeng-123x"), None);
-        assert_eq!(extract_ticket_id("prefix-eng-123-suffix"), Some("ENG-123".into()));
+        assert_eq!(
+            extract_ticket_id("prefix-eng-123-suffix"),
+            Some("ENG-123".into())
+        );
     }
 
     #[test]
@@ -1010,16 +1135,25 @@ mod tests {
             {"status": "COMPLETED", "conclusion": "SUCCESS"},
             {"status": "COMPLETED", "conclusion": "FAILURE"},
         ]);
-        assert_eq!(summarize_checks(Some(&failing)), Some(ChecksStatus::Failing));
+        assert_eq!(
+            summarize_checks(Some(&failing)),
+            Some(ChecksStatus::Failing)
+        );
 
         let pending = serde_json::json!([
             {"status": "COMPLETED", "conclusion": "SUCCESS"},
             {"status": "IN_PROGRESS", "conclusion": null},
         ]);
-        assert_eq!(summarize_checks(Some(&pending)), Some(ChecksStatus::Pending));
+        assert_eq!(
+            summarize_checks(Some(&pending)),
+            Some(ChecksStatus::Pending)
+        );
 
         let passing = serde_json::json!([{"status": "COMPLETED", "conclusion": "SUCCESS"}]);
-        assert_eq!(summarize_checks(Some(&passing)), Some(ChecksStatus::Passing));
+        assert_eq!(
+            summarize_checks(Some(&passing)),
+            Some(ChecksStatus::Passing)
+        );
 
         assert_eq!(summarize_checks(None), None);
     }
@@ -1128,6 +1262,56 @@ mod tests {
     }
 
     #[test]
+    fn status_for_links_keeps_every_durable_pr_while_details_load() {
+        use zeron_proto::{ChatLinkSource, ChatPrLink};
+
+        let cache = PrTicketCache::new();
+        let links = vec![
+            ChatPrLink {
+                url: "https://github.com/acme/widgets/pull/7".into(),
+                source: ChatLinkSource::Manual,
+            },
+            ChatPrLink {
+                url: "https://github.com/acme/widgets/pull/8".into(),
+                source: ChatLinkSource::CreatedInChat,
+            },
+        ];
+
+        let status = cache.status_for_links(None, None, &links, None);
+        assert_eq!(status.pr_links.len(), 2);
+        assert_eq!(status.pr_links[0].url, links[0].url);
+        assert_eq!(status.pr_links[0].source, Some(ChatLinkSource::Manual));
+        assert!(status.pr_links.iter().all(|link| link.detail.is_none()));
+        assert_eq!(lock(&cache.inner.pending_pr).len(), 2);
+
+        lock(&cache.inner.pr_cache).insert(
+            PrKey::Url(links[1].url.clone()),
+            Entry {
+                data: Some(PrStatus {
+                    number: 8,
+                    url: Some(links[1].url.clone()),
+                    state: "open".into(),
+                    is_draft: false,
+                    review_decision: None,
+                    reviewers: Vec::new(),
+                    checks: None,
+                    title: Some("Second PR".into()),
+                    branch: None,
+                    mergeable: "unknown".into(),
+                    has_reviewer_requested: true,
+                }),
+                fetched_at: Instant::now(),
+            },
+        );
+        let status = cache.status_for_links(None, None, &links, None);
+        assert_eq!(
+            status.pr_links[1].detail.as_ref().map(|pr| pr.number),
+            Some(8)
+        );
+        assert_eq!(status.pr_links[0].url, links[0].url);
+    }
+
+    #[test]
     fn status_for_with_no_branch_is_a_pure_noop() {
         let cache = PrTicketCache::new();
         let status = cache.status_for(Some("/tmp/repo"), None, None, None);
@@ -1153,7 +1337,40 @@ mod tests {
         assert!(status.pr.is_none(), "nothing cached yet");
         let pending = lock(&cache.inner.pending_pr);
         assert_eq!(pending.len(), 1);
-        assert!(pending.contains(&PrKey::Url("https://github.com/acme/widgets/pull/42".to_string())));
+        assert!(pending.contains(&PrKey::Url(
+            "https://github.com/acme/widgets/pull/42".to_string()
+        )));
+        assert!(!pending.contains(&PrKey::Branch {
+            cwd: PathBuf::from("/tmp/repo"),
+            branch: "eng-2715-fix-thing".to_string(),
+        }));
+    }
+
+    #[test]
+    fn status_for_links_does_not_queue_branch_guess_for_linked_prs() {
+        use zeron_proto::{ChatLinkSource, ChatPrLink};
+
+        let cache = PrTicketCache::new();
+        let links = vec![
+            ChatPrLink {
+                url: "https://github.com/acme/widgets/pull/42".into(),
+                source: ChatLinkSource::Manual,
+            },
+            ChatPrLink {
+                url: "https://github.com/acme/widgets/pull/43".into(),
+                source: ChatLinkSource::Mentioned,
+            },
+        ];
+
+        cache.status_for_links(Some("/tmp/repo"), Some("eng-2715-fix-thing"), &links, None);
+
+        let pending = lock(&cache.inner.pending_pr);
+        assert_eq!(pending.len(), 2);
+        assert!(
+            links
+                .iter()
+                .all(|link| pending.contains(&PrKey::Url(link.url.clone())))
+        );
         assert!(!pending.contains(&PrKey::Branch {
             cwd: PathBuf::from("/tmp/repo"),
             branch: "eng-2715-fix-thing".to_string(),
@@ -1179,8 +1396,12 @@ mod tests {
     #[test]
     fn status_for_prefers_linked_ticket_id_over_the_branch_regex() {
         let cache = PrTicketCache::new();
-        let status =
-            cache.status_for(Some("/tmp/repo"), Some("eng-2715-fix-thing"), None, Some("OPS-9"));
+        let status = cache.status_for(
+            Some("/tmp/repo"),
+            Some("eng-2715-fix-thing"),
+            None,
+            Some("OPS-9"),
+        );
         assert!(status.ticket.is_none(), "nothing cached yet");
         let pending = lock(&cache.inner.pending_ticket);
         assert!(pending.contains("OPS-9"));
@@ -1189,7 +1410,9 @@ mod tests {
 
     #[test]
     fn is_worktree_cwd_matches_both_known_layouts() {
-        assert!(is_worktree_cwd("/Users/mikey/Projects/cofactr/workspace/.worktrees/eng-1"));
+        assert!(is_worktree_cwd(
+            "/Users/mikey/Projects/cofactr/workspace/.worktrees/eng-1"
+        ));
         assert!(is_worktree_cwd(
             "/Users/mikey/Projects/cofactr/workspace/.agent-worktrees/ENG-2713"
         ));
@@ -1197,7 +1420,9 @@ mod tests {
         // A substring match elsewhere in the path must not false-positive —
         // the check is specifically for the `/.worktrees/`/`.agent-worktrees/`
         // path segment, not any occurrence of the word.
-        assert!(!is_worktree_cwd("/Users/mikey/Projects/worktrees-are-fun/workspace"));
+        assert!(!is_worktree_cwd(
+            "/Users/mikey/Projects/worktrees-are-fun/workspace"
+        ));
     }
 
     #[test]
@@ -1236,7 +1461,12 @@ mod tests {
     #[test]
     fn status_for_computes_is_worktree_without_touching_the_diff_stat_cache_for_non_worktrees() {
         let cache = PrTicketCache::new();
-        let status = cache.status_for(Some("/Users/mikey/Projects/cofactr/workspace"), None, None, None);
+        let status = cache.status_for(
+            Some("/Users/mikey/Projects/cofactr/workspace"),
+            None,
+            None,
+            None,
+        );
         assert!(!status.is_worktree);
         assert!(status.diff_stat.is_none());
         assert!(
@@ -1291,6 +1521,7 @@ mod tests {
     fn chat_link_status_json_field_names_match_the_overview_ui_contract() {
         let status = ChatLinkStatus {
             pr: None,
+            pr_links: Vec::new(),
             ticket: None,
             is_worktree: true,
             diff_stat: Some(DiffStat {
@@ -1376,7 +1607,10 @@ mod tests {
     fn my_open_prs_pairs_list_entries_with_their_cached_detail() {
         let cache = PrTicketCache::new();
         *lock(&cache.inner.my_prs_list) = Some((
-            vec![sample_my_pr(1, "acme/widgets"), sample_my_pr(2, "acme/widgets")],
+            vec![
+                sample_my_pr(1, "acme/widgets"),
+                sample_my_pr(2, "acme/widgets"),
+            ],
             Instant::now(),
         ));
         // Only #1 has detail cached — #2 must read back with `detail: None`,
@@ -1409,9 +1643,15 @@ mod tests {
         assert_eq!(items.len(), 2);
         let pr1 = items.iter().find(|i| i.summary.number == 1).unwrap();
         assert!(pr1.detail.is_some());
-        assert_eq!(pr1.detail.as_ref().unwrap().action_reasons(), vec![PrAction::CiFailing]);
+        assert_eq!(
+            pr1.detail.as_ref().unwrap().action_reasons(),
+            vec![PrAction::CiFailing]
+        );
         let pr2 = items.iter().find(|i| i.summary.number == 2).unwrap();
-        assert!(pr2.detail.is_none(), "PR with no cached detail yet must read back as None, not panic");
+        assert!(
+            pr2.detail.is_none(),
+            "PR with no cached detail yet must read back as None, not panic"
+        );
     }
 
     #[test]
@@ -1473,16 +1713,30 @@ mod tests {
         let mut pr = sample_my_pr(3, "acme/widgets");
         pr.is_draft = true;
         pr.updated_at = Some("2026-09-01T00:00:00Z".into());
-        let authored = serde_json::to_value(MyPrItem { summary: pr.clone(), detail: None }).unwrap();
+        let authored = serde_json::to_value(MyPrItem {
+            summary: pr.clone(),
+            detail: None,
+        })
+        .unwrap();
         assert_eq!(authored["number"], serde_json::json!(3));
         assert_eq!(authored["repo"], serde_json::json!("acme/widgets"));
         assert_eq!(authored["isDraft"], serde_json::json!(true));
-        assert_eq!(authored["updatedAt"], serde_json::json!("2026-09-01T00:00:00Z"));
+        assert_eq!(
+            authored["updatedAt"],
+            serde_json::json!("2026-09-01T00:00:00Z")
+        );
         assert_eq!(authored["detail"], serde_json::Value::Null);
-        assert!(authored.get("author").is_none(), "authored payload must not grow an author key");
+        assert!(
+            authored.get("author").is_none(),
+            "authored payload must not grow an author key"
+        );
 
         pr.author = Some("octocat".into());
-        let review = serde_json::to_value(MyPrItem { summary: pr, detail: None }).unwrap();
+        let review = serde_json::to_value(MyPrItem {
+            summary: pr,
+            detail: None,
+        })
+        .unwrap();
         assert_eq!(review["author"], serde_json::json!("octocat"));
     }
 
@@ -1513,7 +1767,10 @@ mod tests {
         }
         let list = Mutex::new(None);
         let failed = Mutex::new(None);
-        assert!(sweep_search_slot(&list, &failed, fail).await, "first tick attempts");
+        assert!(
+            sweep_search_slot(&list, &failed, fail).await,
+            "first tick attempts"
+        );
         assert!(failed.lock().unwrap().is_some());
         assert!(list.lock().unwrap().is_none());
         // Next tick (20s later in prod) is inside the 90s backoff: no attempt,
@@ -1521,7 +1778,8 @@ mod tests {
         assert!(!sweep_search_slot(&list, &failed, ok).await);
         assert!(list.lock().unwrap().is_none());
         // Backoff elapsed: retries and clears the failure marker.
-        *failed.lock().unwrap() = Instant::now().checked_sub(SEARCH_FAILURE_BACKOFF + Duration::from_secs(1));
+        *failed.lock().unwrap() =
+            Instant::now().checked_sub(SEARCH_FAILURE_BACKOFF + Duration::from_secs(1));
         assert!(sweep_search_slot(&list, &failed, ok).await);
         assert!(failed.lock().unwrap().is_none());
         assert!(list.lock().unwrap().is_some());
@@ -1536,6 +1794,9 @@ mod tests {
     #[ignore = "depends on `gh` being installed and authenticated, and on network access"]
     fn live_my_open_prs_search_runs_and_parses() {
         let result = fetch_my_open_prs();
-        assert!(result.is_some(), "gh search prs must return parseable JSON, even if empty");
+        assert!(
+            result.is_some(),
+            "gh search prs must return parseable JSON, even if empty"
+        );
     }
 }

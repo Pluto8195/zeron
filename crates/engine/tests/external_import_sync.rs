@@ -42,8 +42,18 @@ fn bookkeeping_line() -> String {
 /// whatever the file currently holds.
 fn initial_transcript() -> String {
     [
-        user_line("u1", "null", "2026-01-01T00:00:01.000Z", "add a health check endpoint"),
-        assistant_line("asst1", "u1", "2026-01-01T00:00:02.000Z", "I'll add a health check route."),
+        user_line(
+            "u1",
+            "null",
+            "2026-01-01T00:00:01.000Z",
+            "add a health check endpoint",
+        ),
+        assistant_line(
+            "asst1",
+            "u1",
+            "2026-01-01T00:00:02.000Z",
+            "I'll add a health check route.",
+        ),
     ]
     .join("\n")
         + "\n"
@@ -56,8 +66,18 @@ fn initial_transcript() -> String {
 fn second_turn_opens() -> String {
     [
         bookkeeping_line(),
-        user_line("u2", "asst1", "2026-01-01T00:00:03.000Z", "thanks, also add a test"),
-        assistant_line("asst2", "u2", "2026-01-01T00:00:04.000Z", "Added a test too."),
+        user_line(
+            "u2",
+            "asst1",
+            "2026-01-01T00:00:03.000Z",
+            "thanks, also add a test",
+        ),
+        assistant_line(
+            "asst2",
+            "u2",
+            "2026-01-01T00:00:04.000Z",
+            "Added a test too.",
+        ),
     ]
     .join("\n")
         + "\n"
@@ -65,15 +85,24 @@ fn second_turn_opens() -> String {
 
 /// Closes `asst2`'s turn with a third genuine human message.
 fn third_message_closes_it() -> String {
-    [user_line("u3", "asst2", "2026-01-01T00:00:05.000Z", "great, thanks")]
-        .join("\n")
+    [user_line(
+        "u3",
+        "asst2",
+        "2026-01-01T00:00:05.000Z",
+        "great, thanks",
+    )]
+    .join("\n")
         + "\n"
 }
 
 #[tokio::test]
 async fn sync_with_no_new_content_is_a_safe_noop() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
     let transcript_path = dir.path().join("session.jsonl");
     std::fs::write(&transcript_path, initial_transcript()).expect("write transcript");
 
@@ -120,14 +149,20 @@ async fn sync_picks_up_a_closed_message_but_defers_the_new_open_reply() {
     );
 
     // Nothing further to add while the tail stays open.
-    let result_repeat = core.external_import.sync(chat_id).expect("sync again, still open");
+    let result_repeat = core
+        .external_import
+        .sync(chat_id)
+        .expect("sync again, still open");
     assert_eq!(result_repeat.new_message_count, 0);
 
     // A third message closes asst2's turn.
     grown.push_str(&third_message_closes_it());
     std::fs::write(&transcript_path, &grown).expect("close the turn");
 
-    let result_final = core.external_import.sync(chat_id).expect("sync after close");
+    let result_final = core
+        .external_import
+        .sync(chat_id)
+        .expect("sync after close");
     assert_eq!(result_final.new_message_count, 2, "asst2 (now closed) + u3");
 
     core.shutdown().await;
@@ -149,7 +184,11 @@ async fn sync_picks_up_a_closed_message_but_defers_the_new_open_reply() {
 #[tokio::test]
 async fn sync_on_a_never_imported_chat_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
     let err = core
         .external_import
         .sync("no-such-chat")

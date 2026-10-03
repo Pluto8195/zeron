@@ -128,13 +128,18 @@ impl ChatCategoryClassifier for NoJev {
 
 /// `TYPESAFE_API_KEY`, `None` when unset or empty.
 pub fn api_key() -> Option<String> {
-    std::env::var("TYPESAFE_API_KEY").ok().filter(|s| !s.is_empty())
+    std::env::var("TYPESAFE_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// One System One `choice` call classifying a chat into [`CHAT_CATEGORIES`].
 /// `None` on ANY failure (no key, network error, timeout, bad JSON, torn
 /// answer): every caller falls back to the heuristic.
-pub async fn classify_with_jev(http: &reqwest::Client, input: &ChatClassificationInput) -> Option<String> {
+pub async fn classify_with_jev(
+    http: &reqwest::Client,
+    input: &ChatClassificationInput,
+) -> Option<String> {
     match classify_outcome(http, input).await {
         JevOutcome::Category(category) => Some(category),
         JevOutcome::Inconclusive | JevOutcome::Failed => None,
@@ -142,7 +147,10 @@ pub async fn classify_with_jev(http: &reqwest::Client, input: &ChatClassificatio
 }
 
 /// [`classify_with_jev`], keeping the failed/inconclusive distinction.
-pub async fn classify_outcome(http: &reqwest::Client, input: &ChatClassificationInput) -> JevOutcome {
+pub async fn classify_outcome(
+    http: &reqwest::Client,
+    input: &ChatClassificationInput,
+) -> JevOutcome {
     let Some(api_key) = api_key() else {
         return JevOutcome::Failed;
     };
@@ -160,7 +168,13 @@ async fn classify_at(
 ) -> JevOutcome {
     let payload = build_category_payload(input);
     let call = async {
-        let response = http.post(url).bearer_auth(api_key).json(&payload).send().await.ok()?;
+        let response = http
+            .post(url)
+            .bearer_auth(api_key)
+            .json(&payload)
+            .send()
+            .await
+            .ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -184,7 +198,12 @@ pub fn build_category_payload(input: &ChatClassificationInput) -> serde_json::Va
         .collect();
     let skills: Vec<&String> = input.skills_loaded.iter().take(MAX_SKILLS).collect();
 
-    let sum = |names: &[&str]| -> usize { names.iter().map(|n| input.tool_counts.get(*n).copied().unwrap_or(0)).sum() };
+    let sum = |names: &[&str]| -> usize {
+        names
+            .iter()
+            .map(|n| input.tool_counts.get(*n).copied().unwrap_or(0))
+            .sum()
+    };
     let total: usize = input.tool_counts.values().sum();
     // Most-called tools first; the long tail (MCP tools etc.) is dropped.
     let mut by_count: Vec<(&String, &usize)> = input.tool_counts.iter().collect();
@@ -281,7 +300,10 @@ pub fn parse_category_response(body: &serde_json::Value) -> JevOutcome {
     };
     let mut best: Option<(&str, f64)> = None;
     for category in CHAT_CATEGORIES {
-        let Some(p) = probabilities.get(category).and_then(serde_json::Value::as_f64) else {
+        let Some(p) = probabilities
+            .get(category)
+            .and_then(serde_json::Value::as_f64)
+        else {
             continue;
         };
         if !p.is_finite() {
@@ -382,11 +404,15 @@ impl ChatCategoryClassifier for LiveJevClassifier {
         let outcome = std::thread::Builder::new()
             .name("jev-classify".into())
             .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
                     return JevOutcome::Failed;
                 };
                 runtime.block_on(async {
-                    let Ok(http) = reqwest::Client::builder().pool_max_idle_per_host(0).build() else {
+                    let Ok(http) = reqwest::Client::builder().pool_max_idle_per_host(0).build()
+                    else {
                         return JevOutcome::Failed;
                     };
                     classify_outcome(&http, &input).await
@@ -410,7 +436,11 @@ mod tests {
         ChatClassificationInput {
             first_messages: vec!["sentry shows a crash in the health endpoint".into()],
             skills_loaded: vec!["sentry-api".into()],
-            tool_counts: BTreeMap::from([("Read".to_string(), 7), ("Edit".to_string(), 2), ("Bash".to_string(), 1)]),
+            tool_counts: BTreeMap::from([
+                ("Read".to_string(), 7),
+                ("Edit".to_string(), 2),
+                ("Bash".to_string(), 1),
+            ]),
             turn_count: 9,
         }
     }
@@ -422,7 +452,10 @@ mod tests {
         let payload = build_category_payload(&input());
         assert_eq!(payload["model"], "jev-latest");
         let state = &payload["state"];
-        assert_eq!(state["first_human_messages"][0], "sentry shows a crash in the health endpoint");
+        assert_eq!(
+            state["first_human_messages"][0],
+            "sentry shows a crash in the health endpoint"
+        );
         assert_eq!(state["skills_loaded"][0], "sentry-api");
         assert_eq!(state["tool_calls"]["Read"], 7);
         assert_eq!(state["tool_call_totals"]["total"], 10);
@@ -435,12 +468,18 @@ mod tests {
         assert!(question["instructions"].is_string());
         let criteria = question["criteria"].as_object().unwrap();
         for category in CHAT_CATEGORIES {
-            assert!(criteria.contains_key(category), "missing criterion for {category}");
+            assert!(
+                criteria.contains_key(category),
+                "missing criterion for {category}"
+            );
         }
         assert_eq!(criteria.len(), CHAT_CATEGORIES.len());
         let debug = criteria["debug"]["what"].as_str().unwrap();
         for word in ["bugs", "firefights", "incidents", "Sentry"] {
-            assert!(debug.contains(word), "debug criterion should mention {word}");
+            assert!(
+                debug.contains(word),
+                "debug criterion should mention {word}"
+            );
         }
     }
 
@@ -453,12 +492,22 @@ mod tests {
         let payload = build_category_payload(&big);
         let messages = payload["state"]["first_human_messages"].as_array().unwrap();
         assert_eq!(messages.len(), MAX_MESSAGES);
-        assert!(messages.iter().all(|m| m.as_str().unwrap().chars().count() == MESSAGE_TRUNCATE_CHARS));
-        assert_eq!(payload["state"]["skills_loaded"].as_array().unwrap().len(), MAX_SKILLS);
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.as_str().unwrap().chars().count() == MESSAGE_TRUNCATE_CHARS)
+        );
+        assert_eq!(
+            payload["state"]["skills_loaded"].as_array().unwrap().len(),
+            MAX_SKILLS
+        );
         let tools = payload["state"]["tool_calls"].as_object().unwrap();
         assert_eq!(tools.len(), MAX_TOOLS);
         // Totals still reflect every tool, not just the ones sent.
-        assert_eq!(payload["state"]["tool_call_totals"]["total"], (0..100).sum::<usize>());
+        assert_eq!(
+            payload["state"]["tool_call_totals"]["total"],
+            (0..100).sum::<usize>()
+        );
         assert!(tools.contains_key("tool-99"), "most-called tools are kept");
     }
 
@@ -467,7 +516,9 @@ mod tests {
         let mut multibyte = input();
         multibyte.first_messages = vec!["\u{1f600}".repeat(2000)];
         let payload = build_category_payload(&multibyte);
-        let message = payload["state"]["first_human_messages"][0].as_str().unwrap();
+        let message = payload["state"]["first_human_messages"][0]
+            .as_str()
+            .unwrap();
         assert_eq!(message.chars().count(), MESSAGE_TRUNCATE_CHARS);
     }
 
@@ -487,14 +538,20 @@ mod tests {
             "implementing": 0.05, "pr_review": 0.0, "debug": 0.8, "research": 0.1,
             "planning": 0.0, "quick_question": 0.05, "other": 0.0,
         }));
-        assert_eq!(parse_category_response(&body), JevOutcome::Category("debug".into()));
+        assert_eq!(
+            parse_category_response(&body),
+            JevOutcome::Category("debug".into())
+        );
     }
 
     #[test]
     fn parse_uses_probabilities_not_the_choice_field() {
         let mut body = response(serde_json::json!({"research": 0.9, "other": 0.1}));
         body["answers"]["category"]["choice"] = "planning".into();
-        assert_eq!(parse_category_response(&body), JevOutcome::Category("research".into()));
+        assert_eq!(
+            parse_category_response(&body),
+            JevOutcome::Category("research".into())
+        );
     }
 
     #[test]
@@ -508,32 +565,56 @@ mod tests {
 
     #[test]
     fn parse_at_the_floor_is_accepted() {
-        let body = response(serde_json::json!({"implementing": 0.4, "debug": 0.3, "research": 0.3}));
-        assert_eq!(parse_category_response(&body), JevOutcome::Category("implementing".into()));
+        let body =
+            response(serde_json::json!({"implementing": 0.4, "debug": 0.3, "research": 0.3}));
+        assert_eq!(
+            parse_category_response(&body),
+            JevOutcome::Category("implementing".into())
+        );
     }
 
     #[test]
     fn parse_exact_tie_goes_to_the_earlier_category() {
         let body = response(serde_json::json!({"research": 0.5, "debug": 0.5}));
-        assert_eq!(parse_category_response(&body), JevOutcome::Category("debug".into()));
+        assert_eq!(
+            parse_category_response(&body),
+            JevOutcome::Category("debug".into())
+        );
     }
 
     #[test]
     fn parse_ignores_unknown_options() {
         let body = response(serde_json::json!({"mystery": 0.95, "other": 0.5}));
-        assert_eq!(parse_category_response(&body), JevOutcome::Category("other".into()));
+        assert_eq!(
+            parse_category_response(&body),
+            JevOutcome::Category("other".into())
+        );
     }
 
     #[test]
     fn parse_malformed_is_failed() {
-        assert_eq!(parse_category_response(&serde_json::json!({})), JevOutcome::Failed);
-        assert_eq!(parse_category_response(&serde_json::json!({"answers": {}})), JevOutcome::Failed);
         assert_eq!(
-            parse_category_response(&serde_json::json!({"answers": {"category": {"choice": "debug"}}})),
+            parse_category_response(&serde_json::json!({})),
             JevOutcome::Failed
         );
-        assert_eq!(parse_category_response(&response(serde_json::json!({"mystery": 1.0}))), JevOutcome::Failed);
-        assert_eq!(parse_category_response(&response(serde_json::json!("nope"))), JevOutcome::Failed);
+        assert_eq!(
+            parse_category_response(&serde_json::json!({"answers": {}})),
+            JevOutcome::Failed
+        );
+        assert_eq!(
+            parse_category_response(
+                &serde_json::json!({"answers": {"category": {"choice": "debug"}}})
+            ),
+            JevOutcome::Failed
+        );
+        assert_eq!(
+            parse_category_response(&response(serde_json::json!({"mystery": 1.0}))),
+            JevOutcome::Failed
+        );
+        assert_eq!(
+            parse_category_response(&response(serde_json::json!("nope"))),
+            JevOutcome::Failed
+        );
     }
 
     // ── HTTP failure contract (local server, no TypeSafe) ───────────────
@@ -569,7 +650,10 @@ mod tests {
     #[tokio::test]
     async fn http_success_yields_the_category() {
         let url = serve_once(200, GOOD_BODY, false).await;
-        assert_eq!(run(&url, Duration::from_secs(5)).await, JevOutcome::Category("debug".into()));
+        assert_eq!(
+            run(&url, Duration::from_secs(5)).await,
+            JevOutcome::Category("debug".into())
+        );
     }
 
     #[tokio::test]
@@ -593,21 +677,32 @@ mod tests {
         let torn = body.replace("0.4", "0.35");
         let torn: &'static str = Box::leak(torn.into_boxed_str());
         let url = serve_once(200, torn, false).await;
-        assert_eq!(run(&url, Duration::from_secs(5)).await, JevOutcome::Inconclusive);
+        assert_eq!(
+            run(&url, Duration::from_secs(5)).await,
+            JevOutcome::Inconclusive
+        );
     }
 
     #[tokio::test]
     async fn timeout_is_failed() {
         let url = serve_once(200, GOOD_BODY, true).await;
         let started = Instant::now();
-        assert_eq!(run(&url, Duration::from_millis(150)).await, JevOutcome::Failed);
+        assert_eq!(
+            run(&url, Duration::from_millis(150)).await,
+            JevOutcome::Failed
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
     async fn connection_refused_is_failed() {
         // Bind then drop to get a port nothing listens on.
-        let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let url = format!("http://127.0.0.1:{port}/v1/systemone");
         assert_eq!(run(&url, Duration::from_secs(5)).await, JevOutcome::Failed);
     }
@@ -622,7 +717,10 @@ mod tests {
             live.record(&JevOutcome::Failed);
         }
         assert!(live.breaker_open());
-        assert!(ChatCategoryClassifier::circuit_open(&live), "trait seam reports the open breaker");
+        assert!(
+            ChatCategoryClassifier::circuit_open(&live),
+            "trait seam reports the open breaker"
+        );
         assert!(!NoJev.circuit_open());
 
         let live = LiveJevClassifier::new();
@@ -641,7 +739,10 @@ mod tests {
         rt.block_on(async {
             let outcome = classify_outcome(&reqwest::Client::new(), &input()).await;
             eprintln!("live outcome: {outcome:?}");
-            assert!(matches!(outcome, JevOutcome::Category(_)), "expected a conclusive live answer");
+            assert!(
+                matches!(outcome, JevOutcome::Category(_)),
+                "expected a conclusive live answer"
+            );
         });
     }
 

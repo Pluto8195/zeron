@@ -36,6 +36,7 @@ pub mod profile;
 pub mod project_actions;
 pub mod registry;
 pub mod repos;
+pub mod repository_topology;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
@@ -336,12 +337,13 @@ impl EngineCore {
         // off the boot path since it's a blocking doc-store walk.
         {
             let importer = external_import.clone();
-            tokio::task::spawn_blocking(move || {
-                match importer.repair_missing_timestamps() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(count = n, "repaired missing last_message_at on imported chats"),
-                    Err(err) => tracing::warn!(error = %err, "last_message_at repair pass failed"),
-                }
+            tokio::task::spawn_blocking(move || match importer.repair_missing_timestamps() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    count = n,
+                    "repaired missing last_message_at on imported chats"
+                ),
+                Err(err) => tracing::warn!(error = %err, "last_message_at repair pass failed"),
             });
         }
         // Same reasoning, for chats imported before category/origin/branch
@@ -352,7 +354,10 @@ impl EngineCore {
             tokio::task::spawn_blocking(move || {
                 match importer.repair_missing_classification() {
                     Ok(0) => {}
-                    Ok(n) => tracing::info!(count = n, "repaired missing classification on imported chats"),
+                    Ok(n) => tracing::info!(
+                        count = n,
+                        "repaired missing classification on imported chats"
+                    ),
                     Err(err) => tracing::warn!(error = %err, "classification repair pass failed"),
                 }
                 // Then (same thread, so the two never race on a cursor file)
@@ -367,7 +372,9 @@ impl EngineCore {
                         jev_deferred = r.jev_deferred,
                         "reclassified imported chats with a stale classifier version"
                     ),
-                    Err(err) => tracing::warn!(error = %err, "classifier-version reclassify pass failed"),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "classifier-version reclassify pass failed")
+                    }
                 }
             });
         }
@@ -381,12 +388,13 @@ impl EngineCore {
         // pass keys off `is_synthetic_prompt`.
         {
             let importer = external_import.clone();
-            tokio::task::spawn_blocking(move || {
-                match importer.repair_junk_imports() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(count = n, "removed junk classifier/title-gen chats imported before this fix"),
-                    Err(err) => tracing::warn!(error = %err, "junk-import repair pass failed"),
-                }
+            tokio::task::spawn_blocking(move || match importer.repair_junk_imports() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    count = n,
+                    "removed junk classifier/title-gen chats imported before this fix"
+                ),
+                Err(err) => tracing::warn!(error = %err, "junk-import repair pass failed"),
             });
         }
         // Same reasoning again, for chats imported before `import()` learned
@@ -395,12 +403,13 @@ impl EngineCore {
         // on the wrong harness.
         {
             let importer = external_import.clone();
-            tokio::task::spawn_blocking(move || {
-                match importer.repair_missing_config() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(count = n, "backfilled missing Claude Code config on imported chats"),
-                    Err(err) => tracing::warn!(error = %err, "config repair pass failed"),
-                }
+            tokio::task::spawn_blocking(move || match importer.repair_missing_config() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    count = n,
+                    "backfilled missing Claude Code config on imported chats"
+                ),
+                Err(err) => tracing::warn!(error = %err, "config repair pass failed"),
             });
         }
         // Shares the same store `external_import`/`doc_host` use — the live
@@ -441,7 +450,10 @@ impl EngineCore {
             tokio::task::spawn_blocking(move || {
                 match importer.repair_missing_links(&context_usage) {
                     Ok(0) => {}
-                    Ok(n) => tracing::info!(count = n, "backfilled missing PR/ticket links on imported chats"),
+                    Ok(n) => tracing::info!(
+                        count = n,
+                        "backfilled missing PR/ticket links on imported chats"
+                    ),
                     Err(err) => tracing::warn!(error = %err, "PR/ticket link repair pass failed"),
                 }
             });
@@ -451,10 +463,33 @@ impl EngineCore {
         // only for changed files (see `sync_stale_imports`).
         {
             let importer = external_import.clone();
-            tokio::task::spawn_blocking(move || match importer.sync_stale_imports() {
-                Ok((0, _)) => {}
-                Ok((n, m)) => tracing::info!(count = n, new_messages = m, "synced stale imported chats"),
-                Err(err) => tracing::warn!(error = %err, "stale import sync pass failed"),
+            let completed_tail_recovery = sessions.clone();
+            tokio::spawn(async move {
+                let sync = tokio::task::spawn_blocking(move || importer.sync_stale_imports()).await;
+                match sync {
+                    Ok(Ok((0, _))) => {}
+                    Ok(Ok((n, m))) => {
+                        tracing::info!(count = n, new_messages = m, "synced stale imported chats")
+                    }
+                    Ok(Err(err)) => tracing::warn!(error = %err, "stale import sync pass failed"),
+                    Err(err) => tracing::warn!(error = %err, "stale import sync pass panicked"),
+                }
+                // Imported EOF tails and native journal commits share the same
+                // repair shape. Reconcile only after the stale-source pass so
+                // the importer gets first chance to append its authoritative
+                // assistant row and the journal fallback cannot race it.
+                match tokio::task::spawn_blocking(move || {
+                    completed_tail_recovery.recover_completed_tails()
+                })
+                .await
+                {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => {
+                        tracing::info!(count = n, "recovered completed assistant journal tails")
+                    }
+                    Ok(Err(err)) => tracing::warn!(error = %err, "completed-tail recovery failed"),
+                    Err(err) => tracing::warn!(error = %err, "completed-tail recovery panicked"),
+                }
             });
         }
         // Auto-adopt externally started sessions: once at boot (queued after
@@ -960,17 +995,20 @@ impl Engine {
         });
 
         let preview_org = profile.org_id().to_string();
+        let registry = Arc::new(registry::profile_registry(
+            profile.store_root().join("model-discovery"),
+        ));
         let core = match lock {
             Some(lock) => EngineCore::assemble_with_profile_locked(
                 profile,
-                Arc::new(default_registry()),
+                registry,
                 config.default_harness,
                 edge.clone(),
                 lock,
             )?,
             None => EngineCore::assemble_with_profile(
                 profile,
-                Arc::new(default_registry()),
+                registry,
                 config.default_harness,
                 edge.clone(),
             )?,
@@ -985,6 +1023,12 @@ impl Engine {
                 .into_iter()
                 .filter(|chat| chat.device_id == preview_device)
                 .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
+                // Preview discovery is a periodic background task, not an
+                // explicit request to inspect the chat's folder. Historical
+                // imports can retain HOME (or a privacy-managed child) as
+                // their cwd, so keep those roots out before the preview
+                // scanner canonicalizes or compares anything on disk.
+                .filter(|path| preview_project_path_allowed(path))
                 .collect()
         });
         let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
@@ -1111,6 +1155,24 @@ impl Engine {
         server.abort();
         runtime.shutdown().await;
         Ok(())
+    }
+}
+
+fn preview_project_path_allowed(path: &Path) -> bool {
+    !repos::is_automatic_access_blocked(path)
+}
+
+#[cfg(test)]
+mod preview_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn preview_projects_exclude_home_and_privacy_managed_children() {
+        let home = repos::home_dir();
+        assert!(!preview_project_path_allowed(&home));
+        assert!(!preview_project_path_allowed(&home.join("Music")));
+        assert!(!preview_project_path_allowed(&home.join("Pictures")));
+        assert!(preview_project_path_allowed(&home.join("Projects")));
     }
 }
 

@@ -863,6 +863,7 @@ pub enum ShortcutId {
     ToggleChanges,
     ToggleFiles,
     ToggleTerminal,
+    OpenMyPrs,
     NewSession,
     NewProject,
     OpenModelPicker,
@@ -873,7 +874,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 13 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 14 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -881,6 +882,7 @@ impl ShortcutId {
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleFiles,
         ShortcutId::ToggleTerminal,
+        ShortcutId::OpenMyPrs,
         ShortcutId::NewSession,
         ShortcutId::NewProject,
         ShortcutId::OpenModelPicker,
@@ -912,6 +914,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleFiles => "Toggle files panel",
             ShortcutId::ToggleTerminal => "Toggle terminal",
+            ShortcutId::OpenMyPrs => "Toggle My PRs",
             ShortcutId::NewSession => "New session",
             ShortcutId::NewProject => "New project",
             ShortcutId::OpenModelPicker => "Open model picker",
@@ -939,6 +942,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "mod-r",
             ShortcutId::ToggleFiles => "mod-e",
             ShortcutId::ToggleTerminal => "mod-j",
+            ShortcutId::OpenMyPrs => "mod-p",
             ShortcutId::NewSession => "mod-n",
             ShortcutId::NewProject => "mod-shift-n",
             ShortcutId::OpenModelPicker => "mod-/",
@@ -986,6 +990,7 @@ pub struct KeymapConfig {
     pub toggle_changes: String,
     pub toggle_files: String,
     pub toggle_terminal: String,
+    pub open_my_prs: String,
     pub new_session: String,
     pub new_project: String,
     pub open_model_picker: String,
@@ -1050,6 +1055,7 @@ impl Default for KeymapConfig {
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_files: ShortcutId::ToggleFiles.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
+            open_my_prs: ShortcutId::OpenMyPrs.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
             new_project: ShortcutId::NewProject.default_combo().into(),
             open_model_picker: ShortcutId::OpenModelPicker.default_combo().into(),
@@ -1071,6 +1077,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleFiles => &self.toggle_files,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
+            ShortcutId::OpenMyPrs => &self.open_my_prs,
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NewProject => &self.new_project,
             ShortcutId::OpenModelPicker => &self.open_model_picker,
@@ -1094,6 +1101,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleFiles => self.toggle_files = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
+            ShortcutId::OpenMyPrs => self.open_my_prs = combo,
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NewProject => self.new_project = combo,
             ShortcutId::OpenModelPicker => self.open_model_picker = combo,
@@ -1468,7 +1476,10 @@ impl UiSettings {
                         .get_mut("keymap")
                         .and_then(serde_json::Value::as_object_mut)
                     {
-                        for (id, field) in [(ShortcutId::ToggleFiles, "toggleFiles")] {
+                        for (id, field) in [
+                            (ShortcutId::ToggleFiles, "toggleFiles"),
+                            (ShortcutId::OpenMyPrs, "openMyPrs"),
+                        ] {
                             let default = platform_combo(id.default_combo());
                             let taken = !keymap.contains_key(field)
                                 && keymap.values().any(|existing| {
@@ -2760,6 +2771,7 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-b");
         assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-r");
         assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-j");
+        assert_eq!(keymap.get(ShortcutId::OpenMyPrs), "mod-p");
         let ctrl = if cfg!(target_os = "macos") {
             "ctrl"
         } else {
@@ -3112,6 +3124,18 @@ mod tests {
         .unwrap();
         let keymap = UiSettings::load(dir.path()).keymap;
         assert_eq!(keymap.get(ShortcutId::ToggleFiles), "mod-e");
+
+        // The same collision-safe upgrade rule applies to My PRs: an older
+        // custom Cmd/Ctrl+P binding wins, so the new action arrives unbound.
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"saveFile": "mod-s", "toggleFiles": "mod-e", "toggleTerminal": "mod-p"}}"#,
+        )
+        .unwrap();
+        let keymap = UiSettings::load(dir.path()).keymap;
+        assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-p");
+        assert_eq!(keymap.get(ShortcutId::OpenMyPrs), "");
+        assert!(conflicted_shortcuts(&keymap).is_empty());
     }
 
     #[test]

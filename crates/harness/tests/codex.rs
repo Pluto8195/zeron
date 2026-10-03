@@ -935,6 +935,38 @@ async fn models_discovers_visible_catalog_with_pagination() {
 }
 
 #[tokio::test]
+async fn model_discovery_process_uses_configured_private_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let discovery = dir.path().join("profile-model-discovery");
+    let observed = dir.path().join("observed-cwd");
+    let wrapper = dir.path().join("codex-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\npwd > \"{}\"\nexec \"{}\" \"$@\"\n",
+            observed.display(),
+            fixture_path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    CodexHarness::new()
+        .with_executable(wrapper)
+        .with_model_discovery_cwd(&discovery)
+        .models()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(observed).unwrap().trim(),
+        discovery.canonicalize().unwrap().to_string_lossy()
+    );
+}
+
+#[tokio::test]
 async fn resumed_parent_recovers_v1_and_v2_child_owners_without_replaying_chips() {
     for mode in ["v1", "v2"] {
         let mut req = request("scenario:resumed-child");

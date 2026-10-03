@@ -171,7 +171,9 @@ async fn create_chat_worktree_without_an_existing_chat_row_still_creates_the_wor
         .await
         .expect("CreateChatWorktree call succeeds even with no chat row yet");
     assert!(
-        Path::new(reply["worktreePath"].as_str().unwrap()).join(".git").exists()
+        Path::new(reply["worktreePath"].as_str().unwrap())
+            .join(".git")
+            .exists()
     );
 
     core.shutdown().await;
@@ -215,7 +217,10 @@ async fn repo_chat_and_worktree(
         )
         .await
         .expect("CreateChatWorktree");
-    (repo_dir, reply["worktreePath"].as_str().unwrap().to_string())
+    (
+        repo_dir,
+        reply["worktreePath"].as_str().unwrap().to_string(),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,7 +238,12 @@ async fn plan_chat_closeout_reply_has_exactly_the_pinned_wire_fields() {
         )
         .await
         .expect("PlanChatCloseout call");
-    let mut keys: Vec<&str> = reply.as_object().unwrap().keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = reply
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     assert_eq!(
         keys,

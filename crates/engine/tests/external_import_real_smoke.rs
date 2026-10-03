@@ -12,7 +12,10 @@ use std::sync::Arc;
 use zeron_engine::{EngineCore, EngineProfile, HarnessId, default_registry};
 
 async fn import_one(real_path: &std::path::Path, session_id: &str, chat_id: &str) {
-    assert!(real_path.is_file(), "expected real transcript at {real_path:?}");
+    assert!(
+        real_path.is_file(),
+        "expected real transcript at {real_path:?}"
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let core = EngineCore::assemble_with_profile(

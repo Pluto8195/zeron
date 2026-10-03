@@ -331,19 +331,54 @@ impl Uploads {
         } else {
             path
         };
-        // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
-        let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
         let read_roots = self
             .inner
             .read_only_roots
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let allowed = std::iter::once(&self.inner.dir)
-            .chain(read_roots.iter())
-            .chain(extra_roots.iter())
-            .filter_map(|root| std::fs::canonicalize(root).ok())
-            .any(|root| resolved.starts_with(&root) && resolved != root);
+        // Resolve and validate roots before touching the requested path. A
+        // historical chat cwd may be a symlink to HOME; it must not make an
+        // arbitrary protected file eligible long enough for canonicalization
+        // itself to trigger a macOS privacy prompt.
+        let requested = Path::new(path);
+        // The cache root is owned by us and safe to resolve eagerly. On macOS,
+        // tempfile paths can be spelled `/var/...` while a generated image is
+        // returned as `/private/var/...`; compare the request with both the
+        // configured and canonical spellings before rejecting it. Do not do
+        // this eagerly for historical/chat roots, which may touch protected
+        // locations merely by being canonicalized.
+        let upload_root = (!crate::repos::is_automatic_access_blocked(&self.inner.dir))
+            .then(|| std::fs::canonicalize(&self.inner.dir).ok())
+            .flatten()
+            .filter(|root| !crate::repos::is_automatic_access_blocked(root));
+        let mut allowed_roots: Vec<PathBuf> = upload_root
+            .filter(|root| requested.starts_with(&self.inner.dir) || requested.starts_with(root))
+            .into_iter()
+            .collect();
+        allowed_roots.extend(
+            read_roots
+                .iter()
+                .chain(extra_roots.iter())
+                // Reject obvious protected roots without touching the filesystem,
+                // then discard the hundreds of unrelated chat roots before any
+                // canonicalization/metadata probe.
+                .filter(|root| !crate::repos::is_automatic_access_blocked(root))
+                .filter(|root| requested.starts_with(root))
+                .filter_map(|root| {
+                    let canonical = std::fs::canonicalize(root).ok()?;
+                    (!crate::repos::is_automatic_access_blocked(&canonical)).then_some(canonical)
+                })
+                .collect::<Vec<_>>(),
+        );
+        if allowed_roots.is_empty() {
+            return Err(outside());
+        }
+        // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
+        let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
+        let allowed = allowed_roots
+            .iter()
+            .any(|root| resolved.starts_with(root) && resolved != *root);
         if !allowed {
             return Err(outside());
         }
@@ -552,6 +587,23 @@ mod tests {
         let target = uploads.pending_target("../../../etc", "../../passwd");
         assert!(target.starts_with(dir.path()));
         assert!(!target.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn attachment_read_traversal_cannot_escape_the_jail() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("uploads");
+        std::fs::create_dir(&root).unwrap();
+        let outside = parent.path().join("outside.png");
+        std::fs::write(&outside, b"private").unwrap();
+        let uploads = Uploads::from_root(&root);
+
+        let traversal = root.join("..").join("outside.png");
+        let error = uploads
+            .read_chunk(traversal.to_str().unwrap(), 0, &[])
+            .expect_err("a lexical cache descendant that resolves outside must be rejected");
+
+        assert!(error.to_string().contains("outside the upload cache"));
     }
 }
 

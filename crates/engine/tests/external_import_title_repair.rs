@@ -54,14 +54,19 @@ fn assistant_ack_line(session_id: &str, uuid: &str, parent: &str, cwd: &str) -> 
 /// whose `import()` call happens BEFORE the repair-relevant state is added
 /// (an ai-title appended afterward, or a registry file created afterward),
 /// proving the repair — not `import()` itself — is what resolves it.
-fn write_transcript(dir: &std::path::Path, name: &str, lines: Vec<serde_json::Value>) -> std::path::PathBuf {
+fn write_transcript(
+    dir: &std::path::Path,
+    name: &str,
+    lines: Vec<serde_json::Value>,
+) -> std::path::PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, transcript_with_lines(lines)).expect("write transcript");
     path
 }
 
 #[tokio::test]
-async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_never_overwrites_idempotent() {
+async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_never_overwrites_idempotent()
+ {
     let fake_home = tempfile::tempdir().expect("fake home tempdir");
     let previous_home = std::env::var_os("HOME");
     // SAFETY: test-only, scoped to this one function, restored at the end —
@@ -72,10 +77,18 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
     // No agent-mode registry directory at all yet — created partway through,
     // below, to prove the repair reads it fresh each pass rather than
     // caching a snapshot from boot.
-    let registry_dir = fake_home.path().join(".config").join("agent-mode").join("session-ids");
+    let registry_dir = fake_home
+        .path()
+        .join(".config")
+        .join("agent-mode")
+        .join("session-ids");
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(EngineProfile::development(data_dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        data_dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
     let transcripts_dir = tempfile::tempdir().expect("transcripts dir");
 
     // Chat A: no ai-title, no registry entry at import time — lands
@@ -96,8 +109,14 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
             assistant_ack_line("sess-a", "a1", "u1", "/work/a"),
         ],
     );
-    core.external_import.import("chat-a", "sess-a", &path_a).expect("import a");
-    let chat_a = core.workspace.chat("chat-a").expect("read").expect("exists");
+    core.external_import
+        .import("chat-a", "sess-a", &path_a)
+        .expect("import a");
+    let chat_a = core
+        .workspace
+        .chat("chat-a")
+        .expect("read")
+        .expect("exists");
     assert!(chat_a.title.is_none(), "no derivable title at import time");
 
     // Chat B: no ai-title, no registry entry — falls back to the first real
@@ -112,9 +131,18 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
             assistant_ack_line("sess-b", "a1", "u1", "/work/b"),
         ],
     );
-    core.external_import.import("chat-b", "sess-b", &path_b).expect("import b");
-    let chat_b_before = core.workspace.chat("chat-b").expect("read").expect("exists");
-    assert_eq!(chat_b_before.title.as_deref(), Some("fix the flaky retry test"));
+    core.external_import
+        .import("chat-b", "sess-b", &path_b)
+        .expect("import b");
+    let chat_b_before = core
+        .workspace
+        .chat("chat-b")
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        chat_b_before.title.as_deref(),
+        Some("fix the flaky retry test")
+    );
 
     // Chat C: genuinely nothing derivable at all (transcript with only a
     // synthetic first message, and stays that way) — must end up
@@ -132,15 +160,27 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
             assistant_ack_line("sess-c", "a1", "u1", "/work/c"),
         ],
     );
-    core.external_import.import("chat-c", "sess-c", &path_c).expect("import c");
-    assert!(core.workspace.chat("chat-c").expect("read").expect("exists").title.is_none());
+    core.external_import
+        .import("chat-c", "sess-c", &path_c)
+        .expect("import c");
+    assert!(
+        core.workspace
+            .chat("chat-c")
+            .expect("read")
+            .expect("exists")
+            .title
+            .is_none()
+    );
 
     // Now bring chat A's registry entry into existence and add an ai-title
     // to its transcript too, to prove the repair prefers the registry over
     // the ai-title, exactly like `import()`'s own chain.
     std::fs::create_dir_all(&registry_dir).expect("registry dir");
-    std::fs::write(registry_dir.join("review-growthbook-wrapper.session-id"), "sess-a\n")
-        .expect("write registry entry for chat a");
+    std::fs::write(
+        registry_dir.join("review-growthbook-wrapper.session-id"),
+        "sess-a\n",
+    )
+    .expect("write registry entry for chat a");
     let mut a_contents = std::fs::read_to_string(&path_a).expect("read a transcript");
     a_contents.push_str(
         &serde_json::json!({"type": "ai-title", "aiTitle": "An AI-generated title nobody asked for", "sessionId": "sess-a"})
@@ -151,31 +191,52 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
 
     // Also give chat B's session a registry entry — must be ignored, since
     // chat B already has a real title.
-    std::fs::write(registry_dir.join("review-should-be-ignored.session-id"), "sess-b\n")
-        .expect("write registry entry for chat b (must be ignored)");
+    std::fs::write(
+        registry_dir.join("review-should-be-ignored.session-id"),
+        "sess-b\n",
+    )
+    .expect("write registry entry for chat b (must be ignored)");
 
     let repaired = core
         .external_import
         .repair_missing_titles(&core.context_usage)
         .expect("repair pass");
-    assert_eq!(repaired, 1, "only chat A should have been resolved (B already titled, C undecidable)");
+    assert_eq!(
+        repaired, 1,
+        "only chat A should have been resolved (B already titled, C undecidable)"
+    );
 
-    let chat_a_after = core.workspace.chat("chat-a").expect("read").expect("exists");
+    let chat_a_after = core
+        .workspace
+        .chat("chat-a")
+        .expect("read")
+        .expect("exists");
     assert_eq!(
         chat_a_after.title.as_deref(),
         Some("growthbook-wrapper"),
         "registry name must beat the ai-title added afterward"
     );
 
-    let chat_b_after = core.workspace.chat("chat-b").expect("read").expect("exists");
+    let chat_b_after = core
+        .workspace
+        .chat("chat-b")
+        .expect("read")
+        .expect("exists");
     assert_eq!(
         chat_b_after.title.as_deref(),
         Some("fix the flaky retry test"),
         "an already-titled chat must never be overwritten, even with a matching registry entry"
     );
 
-    let chat_c_after = core.workspace.chat("chat-c").expect("read").expect("exists");
-    assert!(chat_c_after.title.is_none(), "chat C has nothing derivable and must stay untitled");
+    let chat_c_after = core
+        .workspace
+        .chat("chat-c")
+        .expect("read")
+        .expect("exists");
+    assert!(
+        chat_c_after.title.is_none(),
+        "chat C has nothing derivable and must stay untitled"
+    );
 
     // Idempotent: a second pass repairs nothing further (A is done, B was
     // never touched, C is marker-skipped).
@@ -194,8 +255,15 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
         .external_import
         .repair_missing_titles(&core.context_usage)
         .expect("third repair pass");
-    assert_eq!(repaired_third, 0, "marker-skipped chat must not be re-resolved even once data appears");
-    let chat_c_third = core.workspace.chat("chat-c").expect("read").expect("exists");
+    assert_eq!(
+        repaired_third, 0,
+        "marker-skipped chat must not be re-resolved even once data appears"
+    );
+    let chat_c_third = core
+        .workspace
+        .chat("chat-c")
+        .expect("read")
+        .expect("exists");
     assert!(chat_c_third.title.is_none());
 
     core.shutdown().await;
@@ -215,25 +283,52 @@ async fn repair_resolves_titles_registry_beats_ai_title_beats_first_message_neve
 #[tokio::test]
 async fn repair_never_touches_a_native_chat_with_no_import_cursor() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     // A native chat: created directly through the workspace host, never
     // through `ExternalSessionImporter::import` — no cursor, and critically
     // no `harness_session_id` either at creation (a brand-new chat has
     // neither), which alone is enough to exclude it.
     core.workspace
-        .create_chat("native-chat", None, Some(&core.device_id), None, Some("~/work".to_string()))
+        .create_chat(
+            "native-chat",
+            None,
+            Some(&core.device_id),
+            None,
+            Some("~/work".to_string()),
+        )
         .expect("create native chat");
-    assert!(core.workspace.chat("native-chat").expect("read").expect("exists").title.is_none());
+    assert!(
+        core.workspace
+            .chat("native-chat")
+            .expect("read")
+            .expect("exists")
+            .title
+            .is_none()
+    );
 
     let repaired = core
         .external_import
         .repair_missing_titles(&core.context_usage)
         .expect("repair pass");
-    assert_eq!(repaired, 0, "a chat with no harness_session_id/import cursor must never be touched");
+    assert_eq!(
+        repaired, 0,
+        "a chat with no harness_session_id/import cursor must never be touched"
+    );
 
-    let native_after = core.workspace.chat("native-chat").expect("read").expect("exists");
-    assert!(native_after.title.is_none(), "still untitled — the repair must not have invented anything");
+    let native_after = core
+        .workspace
+        .chat("native-chat")
+        .expect("read")
+        .expect("exists");
+    assert!(
+        native_after.title.is_none(),
+        "still untitled — the repair must not have invented anything"
+    );
 
     core.shutdown().await;
 }

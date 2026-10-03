@@ -24,7 +24,13 @@ async fn reads_a_live_doc_stamped_context_usage() {
 
     let chat_id = "live-chat";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/project".into()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/project".into()),
+        )
         .expect("create chat row");
 
     // Simulate what the live run loop's `AgentEvent::ContextUsage` handling
@@ -67,10 +73,18 @@ fn synthetic_transcript_with_usage(input: u64, cache_read: u64, cache_creation: 
 #[tokio::test]
 async fn falls_back_to_the_transcript_tail_for_an_externally_imported_chat() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let transcript_path = dir.path().join("external-session.jsonl");
-    std::fs::write(&transcript_path, synthetic_transcript_with_usage(500, 2000, 300)).expect("write transcript");
+    std::fs::write(
+        &transcript_path,
+        synthetic_transcript_with_usage(500, 2000, 300),
+    )
+    .expect("write transcript");
 
     let chat_id = "imported-chat";
     core.external_import
@@ -92,7 +106,11 @@ async fn falls_back_to_the_transcript_tail_for_an_externally_imported_chat() {
 #[tokio::test]
 async fn a_transcript_with_no_usage_anywhere_resolves_to_none() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let transcript_path = dir.path().join("no-usage-session.jsonl");
     std::fs::write(
@@ -122,7 +140,11 @@ async fn a_transcript_with_no_usage_anywhere_resolves_to_none() {
 #[tokio::test]
 async fn a_chat_with_neither_a_live_stamp_nor_any_resolvable_transcript_is_none() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let chat_id = "bare-native-chat";
     core.workspace

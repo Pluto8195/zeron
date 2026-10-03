@@ -28,21 +28,39 @@ async fn repair_marks_a_harness_session_chat_with_no_findable_transcript_and_doe
     // glob can never match anything.
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(EngineProfile::development(data_dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        data_dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     let chat_id = "orphaned-harness-chat";
     let session_id = "sess-vanished";
     core.workspace
-        .create_chat(chat_id, None, Some(&core.device_id), None, Some("/work/gone".to_string()))
+        .create_chat(
+            chat_id,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/work/gone".to_string()),
+        )
         .expect("create chat");
-    core.workspace.set_chat_harness_session(chat_id, session_id, "/work/gone");
+    core.workspace
+        .set_chat_harness_session(chat_id, session_id, "/work/gone");
 
     let repaired = core
         .external_import
         .repair_missing_titles(&core.context_usage)
         .expect("repair pass");
     assert_eq!(repaired, 0, "no transcript anywhere to derive a title from");
-    assert!(core.workspace.chat(chat_id).expect("read").expect("exists").title.is_none());
+    assert!(
+        core.workspace
+            .chat(chat_id)
+            .expect("read")
+            .expect("exists")
+            .title
+            .is_none()
+    );
 
     // Second pass must short-circuit on the marker file rather than
     // re-globbing the filesystem every boot — not directly observable from
@@ -52,7 +70,14 @@ async fn repair_marks_a_harness_session_chat_with_no_findable_transcript_and_doe
         .repair_missing_titles(&core.context_usage)
         .expect("second repair pass");
     assert_eq!(repaired_again, 0);
-    assert!(core.workspace.chat(chat_id).expect("read").expect("exists").title.is_none());
+    assert!(
+        core.workspace
+            .chat(chat_id)
+            .expect("read")
+            .expect("exists")
+            .title
+            .is_none()
+    );
 
     core.shutdown().await;
 

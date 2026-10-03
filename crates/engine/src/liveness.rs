@@ -260,7 +260,13 @@ mod tests {
             args: "/opt/homebrew/bin/claude --resume=abc-123".into(),
         }];
         assert!(processes_matching(&rows, "claude", "abc-123", "", |_| None));
-        assert!(!processes_matching(&rows, "claude", "not-present", "", |_| None));
+        assert!(!processes_matching(
+            &rows,
+            "claude",
+            "not-present",
+            "",
+            |_| None
+        ));
     }
 
     #[test]
@@ -271,7 +277,13 @@ mod tests {
             pid: 1,
             args: "node /usr/local/bin/claude-wrapper.js --session claude-thing".into(),
         }];
-        assert!(!processes_matching(&rows, "claude", "claude-thing", "", |_| None));
+        assert!(!processes_matching(
+            &rows,
+            "claude",
+            "claude-thing",
+            "",
+            |_| None
+        ));
     }
 
     #[test]
@@ -281,8 +293,20 @@ mod tests {
             args: "/opt/homebrew/bin/claude".into(),
         }];
         let lookup = |pid: u32| (pid == 42).then(|| "/work/project".to_string());
-        assert!(processes_matching(&rows, "claude", "no-match-id", "/work/project", lookup));
-        assert!(!processes_matching(&rows, "claude", "no-match-id", "/other/dir", lookup));
+        assert!(processes_matching(
+            &rows,
+            "claude",
+            "no-match-id",
+            "/work/project",
+            lookup
+        ));
+        assert!(!processes_matching(
+            &rows,
+            "claude",
+            "no-match-id",
+            "/other/dir",
+            lookup
+        ));
     }
 
     #[test]
@@ -291,7 +315,13 @@ mod tests {
             pid: 42,
             args: "/opt/homebrew/bin/claude".into(),
         }];
-        assert!(!processes_matching(&rows, "claude", "no-id", "/work/project", |_| None));
+        assert!(!processes_matching(
+            &rows,
+            "claude",
+            "no-id",
+            "/work/project",
+            |_| None
+        ));
     }
 
     #[test]
@@ -301,7 +331,10 @@ mod tests {
         // above), just confirm the real invocation path is wired correctly
         // and doesn't error out.
         let rows = list_processes();
-        assert!(!rows.is_empty(), "expected `ps` to report at least this test process");
+        assert!(
+            !rows.is_empty(),
+            "expected `ps` to report at least this test process"
+        );
     }
 
     #[test]
@@ -314,7 +347,10 @@ mod tests {
         let Some(cwd) = real_cwd_of(std::process::id()) else {
             return; // no `lsof` on this machine/platform — skip
         };
-        assert!(cwd.starts_with('/'), "expected an absolute path, got {cwd:?}");
+        assert!(
+            cwd.starts_with('/'),
+            "expected an absolute path, got {cwd:?}"
+        );
     }
 
     #[test]
@@ -340,6 +376,9 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        assert!(found, "expected to find the real spawned `sleep {fingerprint}` process via ps");
+        assert!(
+            found,
+            "expected to find the real spawned `sleep {fingerprint}` process via ps"
+        );
     }
 }

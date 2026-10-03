@@ -185,6 +185,16 @@ pub enum ChatLinkSource {
     Mentioned,
 }
 
+/// One durable pull-request link attached to a chat. PR links are stored as
+/// independent registry rows so links added concurrently on different devices
+/// merge without replacing one another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatPrLink {
+    pub url: String,
+    pub source: ChatLinkSource,
+}
+
 impl ChatLinkSource {
     /// Higher ranks win ties against a lower-or-absent stored source.
     fn rank(self) -> u8 {
@@ -1230,7 +1240,10 @@ mod tests {
     fn chat_link_source_wire_shape_is_snake_case() {
         // Deliberately snake_case (`created_in_chat`), unlike every other
         // enum/field on `Chat` — the design fixes this exact spelling.
-        assert_eq!(serde_json::to_value(ChatLinkSource::Manual).unwrap(), serde_json::json!("manual"));
+        assert_eq!(
+            serde_json::to_value(ChatLinkSource::Manual).unwrap(),
+            serde_json::json!("manual")
+        );
         assert_eq!(
             serde_json::to_value(ChatLinkSource::CreatedInChat).unwrap(),
             serde_json::json!("created_in_chat")

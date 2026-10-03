@@ -70,7 +70,11 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
         std::env::set_var("HOME", fake_home.path());
     }
 
-    let registry_dir = fake_home.path().join(".config").join("agent-mode").join("session-ids");
+    let registry_dir = fake_home
+        .path()
+        .join(".config")
+        .join("agent-mode")
+        .join("session-ids");
     std::fs::create_dir_all(&registry_dir).expect("registry dir");
     std::fs::write(
         registry_dir.join("review-growthbook-wrapper.session-id"),
@@ -79,7 +83,11 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
     .expect("write registry entry");
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(EngineProfile::development(data_dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        data_dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
     let transcripts_dir = tempfile::tempdir().expect("transcripts dir");
 
     // (1) A session with BOTH a registry entry and an ai-title: the registry
@@ -89,7 +97,12 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
         std::fs::write(
             &path,
             transcript_with_lines(vec![
-                user_line("sess-registry", "u1", "/work/one", "totally unrelated pasted ticket text"),
+                user_line(
+                    "sess-registry",
+                    "u1",
+                    "/work/one",
+                    "totally unrelated pasted ticket text",
+                ),
                 assistant_ack_line("sess-registry", "a1", "u1", "/work/one"),
                 ai_title_line("sess-registry", "An AI-generated title nobody asked for"),
             ]),
@@ -100,7 +113,11 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
             .import("chat-registry", "sess-registry", &path)
             .expect("import");
         assert_eq!(result.title.as_deref(), Some("growthbook-wrapper"));
-        let chat = core.workspace.chat("chat-registry").expect("read chat").expect("exists");
+        let chat = core
+            .workspace
+            .chat("chat-registry")
+            .expect("read chat")
+            .expect("exists");
         assert_eq!(chat.title.as_deref(), Some("growthbook-wrapper"));
     }
 
@@ -111,7 +128,12 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
         std::fs::write(
             &path,
             transcript_with_lines(vec![
-                user_line("sess-ai-title", "u1", "/work/two", "add a health check endpoint"),
+                user_line(
+                    "sess-ai-title",
+                    "u1",
+                    "/work/two",
+                    "add a health check endpoint",
+                ),
                 assistant_ack_line("sess-ai-title", "a1", "u1", "/work/two"),
                 ai_title_line("sess-ai-title", "Add health check endpoint"),
             ]),
@@ -131,7 +153,12 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
         std::fs::write(
             &path,
             transcript_with_lines(vec![
-                user_line("sess-first-msg", "u1", "/work/three", "fix the flaky retry test"),
+                user_line(
+                    "sess-first-msg",
+                    "u1",
+                    "/work/three",
+                    "fix the flaky retry test",
+                ),
                 assistant_ack_line("sess-first-msg", "a1", "u1", "/work/three"),
             ]),
         )
@@ -165,8 +192,14 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
             .import("chat-pasted", "sess-pasted", &path)
             .expect("import");
         let title = result.title.expect("title resolved");
-        assert!(!title.contains("pasted_content"), "wrapper tag must be stripped: {title}");
-        assert!(title.starts_with("You're picking up implementation work"), "got: {title}");
+        assert!(
+            !title.contains("pasted_content"),
+            "wrapper tag must be stripped: {title}"
+        );
+        assert!(
+            title.starts_with("You're picking up implementation work"),
+            "got: {title}"
+        );
     }
 
     // (5) A synthetic CLASSIFY prompt as the first `user` turn must be
@@ -180,7 +213,12 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
                 assistant_ack_line("sess-synthetic", "a1", "u1", "/work/five"),
                 user_line("sess-synthetic", "u2", "/work/five", TITLEGEN_MESSAGE),
                 assistant_ack_line("sess-synthetic", "a2", "u2", "/work/five"),
-                user_line("sess-synthetic", "u3", "/work/five", "the actual real first message"),
+                user_line(
+                    "sess-synthetic",
+                    "u3",
+                    "/work/five",
+                    "the actual real first message",
+                ),
                 assistant_ack_line("sess-synthetic", "a3", "u3", "/work/five"),
             ]),
         )
@@ -189,7 +227,10 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
             .external_import
             .import("chat-synthetic", "sess-synthetic", &path)
             .expect("import");
-        assert_eq!(result.title.as_deref(), Some("the actual real first message"));
+        assert_eq!(
+            result.title.as_deref(),
+            Some("the actual real first message")
+        );
     }
 
     // (6) A long first message is truncated to one line, ~60 chars, with an
@@ -210,9 +251,16 @@ async fn priority_chain_registry_beats_ai_title_beats_first_message() {
             .import("chat-long", "sess-long", &path)
             .expect("import");
         let title = result.title.expect("title resolved");
-        assert!(title.chars().count() <= 61, "title too long: {title:?} ({} chars)", title.chars().count());
+        assert!(
+            title.chars().count() <= 61,
+            "title too long: {title:?} ({} chars)",
+            title.chars().count()
+        );
         assert!(title.ends_with('\u{2026}'));
-        assert!(!title.contains('\n'), "title must be single-line: {title:?}");
+        assert!(
+            !title.contains('\n'),
+            "title must be single-line: {title:?}"
+        );
     }
 
     core.shutdown().await;

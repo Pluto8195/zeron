@@ -344,6 +344,13 @@ async fn resolve_identity(
     cwd: &str,
     fresh: bool,
 ) -> Option<CheckoutIdentity> {
+    // Historical imports can legitimately retain HOME as their cwd. They are
+    // conversation context, not authorization for boot-time Git discovery or
+    // recursive FSEvents setup across a person's files.
+    if crate::repos::is_automatic_access_blocked(Path::new(cwd)) {
+        lock(&inner.identities).remove(cwd);
+        return None;
+    }
     if !fresh && let Some(identity) = lock(&inner.identities).get(cwd).cloned() {
         return Some(identity);
     }
@@ -466,6 +473,9 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
 /// unreadable dirs as leaves. `.git` internal churn is real diff signal, so it
 /// counts toward the budget rather than being skipped.
 fn exceeds_watch_budget(root: &Path) -> bool {
+    if crate::repos::is_automatic_access_blocked(root) {
+        return true;
+    }
     let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
     let mut seen = 0usize;
     while let Some(dir) = queue.pop_front() {

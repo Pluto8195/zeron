@@ -1,11 +1,16 @@
-//! Subagent detection for an external Claude Code session (ticket 002 phase
-//! 3): metadata only, not import. A session that spawned subagents (via the
-//! Agent/Task tool) gets a sibling directory next to its own transcript file:
+//! Subagent detection for external Claude Code and Codex sessions (ticket 002
+//! phase 3): metadata only, not import. A Claude session that spawned
+//! subagents (via the Agent/Task tool) gets a sibling directory next to its
+//! own transcript file:
 //!
 //!   {project_dir}/{session_id}.jsonl          <- the session's own transcript
 //!   {project_dir}/{session_id}/subagents/
 //!       agent-{agent_id}.meta.json            <- spawn metadata (small)
 //!       agent-{agent_id}.jsonl                <- the subagent's own transcript
+//!
+//! Codex instead records `SubAgentActivity` lifecycle items in the parent
+//! rollout and writes each child thread as another `rollout-*-{thread_id}.jsonl`
+//! in the same date directory. Both layouts produce the same wire summary.
 //!
 //! Verified against real on-disk data on this machine (this very session's
 //! own subagents directory, among others) — not assumed from the ticket's
@@ -43,6 +48,8 @@
 //! `Chat` rows for subagents at all, so the question doesn't need answering
 //! yet — flagged for whoever builds actual subagent import.
 
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -82,7 +89,9 @@ pub enum SubagentStatus {
 fn subagent_status(jsonl_path: &Path) -> SubagentStatus {
     match std::fs::metadata(jsonl_path).and_then(|m| m.modified()) {
         Ok(mtime) => match mtime.elapsed() {
-            Ok(elapsed) if elapsed.as_secs() < SUBAGENT_IDLE_DONE_SECONDS => SubagentStatus::Running,
+            Ok(elapsed) if elapsed.as_secs() < SUBAGENT_IDLE_DONE_SECONDS => {
+                SubagentStatus::Running
+            }
             Ok(_) => SubagentStatus::Done,
             Err(_) => SubagentStatus::Running,
         },
@@ -122,6 +131,31 @@ fn subagents_dir_for(transcript_path: &Path) -> Option<PathBuf> {
     Some(parent.join(session_id).join("subagents"))
 }
 
+/// Resolve a Codex child thread's rollout next to its parent rollout. Codex
+/// names every rollout `rollout-<timestamp>-<thread-id>.jsonl`; the timestamp
+/// is not present in `SubAgentActivity`, so match the globally unique thread
+/// id suffix instead of trying to manufacture a filename.
+fn codex_subagent_transcript_path(
+    parent_transcript_path: &Path,
+    agent_id: &str,
+) -> Option<PathBuf> {
+    if agent_id.is_empty() || agent_id.contains(['/', '\\']) {
+        return None;
+    }
+    let suffix = format!("-{agent_id}.jsonl");
+    std::fs::read_dir(parent_transcript_path.parent()?)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path != parent_transcript_path
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+        })
+}
+
 /// The on-disk path a subagent `agent_id`'s own transcript WOULD live at,
 /// given its parent session's transcript path — derived server-side the same
 /// way [`scan_subagents`] derives every `transcript_path` it returns, never
@@ -131,9 +165,15 @@ fn subagents_dir_for(transcript_path: &Path) -> Option<PathBuf> {
 /// derivation's — an unknown/not-yet-written agent id resolves to a path
 /// that just doesn't exist yet, which `subagent_transcript::TranscriptCache`
 /// treats as an empty transcript rather than an error).
-pub(crate) fn subagent_transcript_path(parent_transcript_path: &Path, agent_id: &str) -> Option<PathBuf> {
-    let dir = subagents_dir_for(parent_transcript_path)?;
-    Some(dir.join(format!("agent-{agent_id}.jsonl")))
+pub(crate) fn subagent_transcript_path(
+    parent_transcript_path: &Path,
+    agent_id: &str,
+) -> Option<PathBuf> {
+    let claude = subagents_dir_for(parent_transcript_path)?.join(format!("agent-{agent_id}.jsonl"));
+    if claude.exists() {
+        return Some(claude);
+    }
+    codex_subagent_transcript_path(parent_transcript_path, agent_id).or(Some(claude))
 }
 
 /// Subagents spawned by the session at `transcript_path` (its own
@@ -146,7 +186,10 @@ pub fn scan_subagents(transcript_path: &Path) -> Result<Vec<SubagentSummary>, En
         return Ok(Vec::new());
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new()); // no subagents directory — not an error
+        // Codex persists child threads as sibling rollout files and records
+        // their lifecycle in the parent rollout, rather than creating
+        // Claude's `{session}/subagents` directory.
+        return scan_codex_subagents(transcript_path);
     };
 
     let mut out = Vec::new();
@@ -178,6 +221,120 @@ pub fn scan_subagents(transcript_path: &Path) -> Result<Vec<SubagentSummary>, En
         });
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLifecycle {
+    Running,
+    Done,
+    Unknown,
+}
+
+impl CodexLifecycle {
+    fn from_kind(kind: Option<&str>) -> Self {
+        match kind {
+            Some("started" | "spawned" | "interacted") => Self::Running,
+            Some("completed" | "failed" | "errored") => Self::Done,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CodexSubagent {
+    agent_id: String,
+    description: Option<String>,
+    lifecycle: CodexLifecycle,
+}
+
+fn value_str<'a>(value: &'a serde_json::Value, snake: &str, camel: &str) -> Option<&'a str> {
+    value
+        .get(snake)
+        .or_else(|| value.get(camel))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Parse the parent's durable Codex rollout. A child emits several
+/// `SubAgentActivity` items (started, interacted, completed); one overview
+/// row represents the child thread, so preserve first-seen order while the
+/// latest lifecycle item updates that row's status.
+fn scan_codex_subagents(transcript_path: &Path) -> Result<Vec<SubagentSummary>, EngineError> {
+    let Ok(file) = std::fs::File::open(transcript_path) else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::<CodexSubagent>::new();
+    let mut by_id = HashMap::<String, usize>::new();
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if raw.get("type").and_then(serde_json::Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(item) = raw.get("payload").and_then(|payload| payload.get("item")) else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(serde_json::Value::as_str);
+        if !matches!(
+            item_type,
+            Some("SubAgentActivity" | "subAgentActivity" | "sub_agent_activity")
+        ) {
+            continue;
+        }
+        let Some(agent_id) = value_str(item, "agent_thread_id", "agentThreadId") else {
+            continue;
+        };
+        let agent_path = value_str(item, "agent_path", "agentPath").unwrap_or_default();
+        if agent_id.is_empty() || matches!(agent_path, "/" | "/root") {
+            continue;
+        }
+        let description = agent_path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .map(str::to_owned);
+        let lifecycle =
+            CodexLifecycle::from_kind(item.get("kind").and_then(serde_json::Value::as_str));
+        if let Some(&index) = by_id.get(agent_id) {
+            let row = &mut found[index];
+            if description.is_some() {
+                row.description = description;
+            }
+            if lifecycle != CodexLifecycle::Unknown {
+                row.lifecycle = lifecycle;
+            }
+        } else {
+            by_id.insert(agent_id.to_owned(), found.len());
+            found.push(CodexSubagent {
+                agent_id: agent_id.to_owned(),
+                description,
+                lifecycle,
+            });
+        }
+    }
+
+    Ok(found
+        .into_iter()
+        .map(|row| {
+            let path = codex_subagent_transcript_path(transcript_path, &row.agent_id);
+            let status = match row.lifecycle {
+                CodexLifecycle::Running => SubagentStatus::Running,
+                CodexLifecycle::Done => SubagentStatus::Done,
+                CodexLifecycle::Unknown => path
+                    .as_deref()
+                    .map(subagent_status)
+                    .unwrap_or(SubagentStatus::Done),
+            };
+            SubagentSummary {
+                agent_id: row.agent_id,
+                description: row.description,
+                agent_type: Some("codex".to_string()),
+                transcript_path: path
+                    .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                status,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -230,7 +387,10 @@ mod tests {
         write(&transcript, "{}\n");
 
         let subdir = dir.path().join(session_id).join("subagents");
-        write(&subdir.join("agent-good.meta.json"), r#"{"description":"ok"}"#);
+        write(
+            &subdir.join("agent-good.meta.json"),
+            r#"{"description":"ok"}"#,
+        );
         write(&subdir.join("agent-bad.meta.json"), "not json at all");
 
         let found = scan_subagents(&transcript).expect("scan");
@@ -267,8 +427,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-idle.jsonl");
         write(&path, "{}\n");
-        let stale = SystemTime::now() - std::time::Duration::from_secs(SUBAGENT_IDLE_DONE_SECONDS + 5);
-        std::fs::File::open(&path).unwrap().set_modified(stale).unwrap();
+        let stale =
+            SystemTime::now() - std::time::Duration::from_secs(SUBAGENT_IDLE_DONE_SECONDS + 5);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
         assert_eq!(subagent_status(&path), SubagentStatus::Done);
     }
 
@@ -291,10 +455,118 @@ mod tests {
         write(&transcript, "{}\n");
 
         let subdir = dir.path().join(session_id).join("subagents");
-        write(&subdir.join("agent-live.meta.json"), r#"{"description":"still going"}"#);
+        write(
+            &subdir.join("agent-live.meta.json"),
+            r#"{"description":"still going"}"#,
+        );
         write(&subdir.join("agent-live.jsonl"), "{}\n");
 
         let found = scan_subagents(&transcript).expect("scan");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].status, SubagentStatus::Running);
+    }
+
+    #[test]
+    fn codex_rollout_discovers_and_deduplicates_subagent_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join("rollout-2026-10-01T13-37-15-parent-thread.jsonl");
+        let child = dir
+            .path()
+            .join("rollout-2026-10-01T14-04-18-child-thread.jsonl");
+        let activity = |kind: &str| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "SubAgentActivity",
+                        "kind": kind,
+                        "agent_thread_id": "child-thread",
+                        "agent_path": "/root/ticket_planner"
+                    }
+                }
+            })
+            .to_string()
+        };
+        write(
+            &parent,
+            &format!(
+                "{}\n{}\n{}\n",
+                activity("started"),
+                activity("interacted"),
+                activity("completed")
+            ),
+        );
+        write(&child, "{}\n");
+
+        let found = scan_subagents(&parent).expect("scan Codex rollout");
+        assert_eq!(found.len(), 1, "lifecycle items are one child card");
+        assert_eq!(found[0].agent_id, "child-thread");
+        assert_eq!(found[0].description.as_deref(), Some("ticket_planner"));
+        assert_eq!(found[0].agent_type.as_deref(), Some("codex"));
+        assert_eq!(found[0].transcript_path, child.to_string_lossy());
+        assert_eq!(found[0].status, SubagentStatus::Done);
+        assert_eq!(
+            subagent_transcript_path(&parent, "child-thread").as_deref(),
+            Some(child.as_path())
+        );
+    }
+
+    #[test]
+    fn codex_active_lifecycle_is_running_even_before_child_rollout_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join("rollout-2026-10-01T13-37-15-parent-thread.jsonl");
+        write(
+            &parent,
+            &serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "item": {
+                        "type": "sub_agent_activity",
+                        "kind": "spawned",
+                        "agentThreadId": "new-child",
+                        "agentPath": "/root/implementation"
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let found = scan_subagents(&parent).expect("scan active Codex child");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description.as_deref(), Some("implementation"));
+        assert_eq!(found[0].status, SubagentStatus::Running);
+        assert!(found[0].transcript_path.is_empty());
+    }
+
+    #[test]
+    fn codex_followup_started_after_completion_reopens_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join("rollout-2026-10-01T13-37-15-parent-thread.jsonl");
+        let line = |kind: &str| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"item": {
+                    "type": "SubAgentActivity",
+                    "kind": kind,
+                    "agent_thread_id": "child-thread",
+                    "agent_path": "/root/reviewer"
+                }}
+            })
+            .to_string()
+        };
+        write(
+            &parent,
+            &format!("{}\n{}\n", line("completed"), line("started")),
+        );
+
+        let found = scan_subagents(&parent).expect("scan reopened Codex child");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].status, SubagentStatus::Running);
     }
@@ -320,13 +592,19 @@ mod tests {
         let value = serde_json::to_value(&running).unwrap();
         assert_eq!(value["agentId"], serde_json::json!("abc123"));
         assert_eq!(value["agentType"], serde_json::json!("fork"));
-        assert_eq!(value["transcriptPath"], serde_json::json!("/tmp/agent-abc123.jsonl"));
+        assert_eq!(
+            value["transcriptPath"],
+            serde_json::json!("/tmp/agent-abc123.jsonl")
+        );
         assert_eq!(value["status"], serde_json::json!("running"));
 
         let done = SubagentSummary {
             status: SubagentStatus::Done,
             ..running
         };
-        assert_eq!(serde_json::to_value(&done).unwrap()["status"], serde_json::json!("done"));
+        assert_eq!(
+            serde_json::to_value(&done).unwrap()["status"],
+            serde_json::json!("done")
+        );
     }
 }

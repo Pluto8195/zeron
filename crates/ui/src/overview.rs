@@ -34,8 +34,9 @@
 //! the reference's own packer), so `OverviewRow::tile_size` takes the `max`
 //! of that aspect floor and a deterministic content-height ESTIMATE
 //! ([`tile_content_height_estimate`]) accounting for what varies per row: a
-//! PR/ticket badge row, and the stack of compact subagent tiles — one per
-//! subagent, uncapped, so a 36-subagent card really is ~1.3k px tall.
+//! PR/ticket badge row, and the compact subagent preview (three rows plus a
+//! "+N more" row). Hovering a card temporarily reveals the complete stack
+//! without making every board slot pay for the expanded height.
 //! `tile_size` is the ONE place every consumer reads
 //! a tile's size from — the flat grid, the grouped packer, both overlap-
 //! repair passes, viewport culling and fit-to-matches all use it, so a new
@@ -71,10 +72,8 @@ use gpui::{
     ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Window, div, prelude::*, px,
 };
 
-use zeron_engine::pr_ticket_cache::{
-    ChatLinkStatus, ChecksStatus, MyPrItem, PrAction, PrStatus, TicketStatus,
-};
-use zeron_proto::{Chat, ChatIndicator, ChatLinkSource};
+use zeron_engine::pr_ticket_cache::{ChecksStatus, MyPrItem, PrAction, PrStatus, TicketStatus};
+use zeron_proto::{Chat, ChatIndicator, ChatLinkSource, Space};
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -94,7 +93,7 @@ use crate::transcript::Transcript;
 /// than Zeron's per-message timestamps, so a day is the closer match in
 /// spirit ("this chat has gone quiet") rather than a literal port of the
 /// number.
-const STALE_AFTER: chrono::Duration = chrono::Duration::hours(24);
+const STALE_AFTER: chrono::Duration = chrono::Duration::days(7);
 
 /// How long a fetched `ChatLinkStatus` stays good before this view refetches
 /// it — independent of the server's own cache TTL, just how often the UI
@@ -249,7 +248,11 @@ fn split_fenced_code(text: &str) -> Vec<(bool, String)> {
 fn format_turn_time(timestamp: Option<&str>) -> String {
     timestamp
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&chrono::Local).format("%b %-d, %H:%M").to_string())
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%b %-d, %H:%M")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -346,20 +349,23 @@ struct OverviewRow {
     /// not errors; `group_key` below falls back to `NONE_KEY` for them.
     category: Option<String>,
     origin: Option<String>,
-    /// [`repo_key`] of `chat.cwd` — the Repo grouping key and the repo
-    /// filter's key, computed once so both agree by construction.
+    /// [`repo_key_for_chat`] — the Repo grouping key and the repo filter's
+    /// key, computed once so both agree by construction.
     repo: String,
     /// Linked PR number/title, copied in like `ticket`: the number is the
     /// Ticket dimension's `PR #<n>` fallback (`ticketGroupKey`), the title is
     /// a search field (`sessionMatchesSearch` includes `pr.title`).
     pr_number: Option<u64>,
     pr_title: Option<String>,
+    /// Search-only values for every linked PR (number and title). The two
+    /// singular fields above remain the stable grouping fallback.
+    pr_search_values: Vec<String>,
     /// `CHAT_CONTEXT_USAGE` fraction (`0.0..=1.0`), copied in like `ticket`
     /// because it sets the tile's size and therefore feeds layout. `None`
     /// until the fetch lands, or when the engine has no usage for this chat.
     context_pct: Option<f32>,
-    /// How many compact subagent tiles `subagent_tiles_for` renders for this
-    /// chat (all of them) — copied in from `Overview.subagents` like
+    /// How many compact subagent tiles exist for this chat — copied in from
+    /// `Overview.subagents` like
     /// `ticket`, because it feeds `tile_size` (subagent tiles push a tile
     /// taller than its context-% aspect ratio) and `tile_size` is a method on this type, not
     /// on `Overview`, which has no `&self` access to that map. `0` while the
@@ -389,6 +395,20 @@ impl OverviewRow {
     fn tile_size(&self) -> (f32, f32) {
         let (w, aspect_h) = tile_size_for_pct(self.context_pct);
         let content_h = tile_content_height_estimate(self.subagent_count, self.has_badge_row);
+        (w, aspect_h.max(content_h))
+    }
+
+    /// Temporary visual size while the pointer is over a collapsed
+    /// subagent preview. Board packing deliberately continues to use
+    /// `tile_size`; this card floats above neighbors until the pointer
+    /// leaves, rather than making the entire canvas jump on hover.
+    fn hovered_tile_size(&self) -> (f32, f32) {
+        let (w, aspect_h) = tile_size_for_pct(self.context_pct);
+        let mut content_h = TILE_CONTENT_MIN_H;
+        if self.has_badge_row {
+            content_h += BADGE_ROW_ADDED_H;
+        }
+        content_h += subagent_stack_height(self.subagent_count);
         (w, aspect_h.max(content_h))
     }
 }
@@ -452,6 +472,26 @@ fn repo_key(cwd: Option<&str>) -> String {
     last_segment(cwd).unwrap_or_else(|| overview_grouping::NONE_KEY.to_string())
 }
 
+/// Resolve a chat's repo label without mistaking an isolated checkout's
+/// folder name for the owning project. The persisted Space is authoritative
+/// when the chat runs somewhere other than the Space root (normally a linked
+/// worktree). Same-root and legacy chats retain the cwd-based behavior above.
+///
+/// This is deliberately a lexical comparison: grouping must not canonicalize
+/// arbitrary chat paths merely to render the overview.
+fn repo_key_for_chat(chat: &Chat, space: Option<&Space>) -> String {
+    if let (Some(cwd), Some(space)) = (chat.cwd.as_deref(), space)
+        && lexical_path(cwd) != lexical_path(&space.path)
+    {
+        return space.display_name().to_string();
+    }
+    repo_key(chat.cwd.as_deref())
+}
+
+fn lexical_path(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+}
+
 fn last_segment(path: &str) -> Option<String> {
     match path.trim_end_matches('/').rsplit('/').next() {
         Some(last) if !last.is_empty() => Some(last.to_string()),
@@ -464,7 +504,8 @@ fn workspace_root_of(cwd: &str) -> Option<String> {
     if cwd.is_empty() {
         return None;
     }
-    let contents = std::fs::read_to_string(std::path::Path::new(cwd).join(".workspace-root")).ok()?;
+    let contents =
+        std::fs::read_to_string(std::path::Path::new(cwd).join(".workspace-root")).ok()?;
     let line = contents.lines().next()?.trim();
     (!line.is_empty()).then(|| line.to_string())
 }
@@ -598,7 +639,11 @@ fn checks_style(checks: ChecksStatus) -> (gpui::Hsla, &'static str, &'static str
 /// chat that is no longer `done` drops out of the acknowledged set so its
 /// NEXT completion starts unread again. Returns whether the set changed (so
 /// the caller persists it).
-fn reconcile_acknowledged(acknowledged: &mut BTreeSet<String>, chat_id: &str, is_done: bool) -> bool {
+fn reconcile_acknowledged(
+    acknowledged: &mut BTreeSet<String>,
+    chat_id: &str,
+    is_done: bool,
+) -> bool {
     !is_done && acknowledged.remove(chat_id)
 }
 
@@ -708,8 +753,14 @@ struct ViewPrefs {
 /// load.
 fn view_prefs_from_flags(flags: &BTreeSet<String>) -> ViewPrefs {
     let mut groups: Vec<GroupDimension> = Vec::new();
-    if let Some(list) = flags.iter().find_map(|flag| flag.strip_prefix(GROUP_BY_PREFIX)) {
-        for dim in list.split(',').filter_map(|key| GroupDimension::from_persist_key(key.trim())) {
+    if let Some(list) = flags
+        .iter()
+        .find_map(|flag| flag.strip_prefix(GROUP_BY_PREFIX))
+    {
+        for dim in list
+            .split(',')
+            .filter_map(|key| GroupDimension::from_persist_key(key.trim()))
+        {
             if !groups.contains(&dim) {
                 groups.push(dim);
             }
@@ -749,7 +800,10 @@ fn apply_view_prefs_to_flags(flags: &mut BTreeSet<String>, prefs: &ViewPrefs) {
 /// chats — an invisible "everything is gone" state (typically a stale filter
 /// naming repos that were since renamed/cleaned up). `known` empty means the
 /// chat list hasn't arrived yet, which says nothing.
-fn restored_repo_filter_hides_everything(hidden: &BTreeSet<String>, known: &BTreeSet<String>) -> bool {
+fn restored_repo_filter_hides_everything(
+    hidden: &BTreeSet<String>,
+    known: &BTreeSet<String>,
+) -> bool {
     !known.is_empty() && known.iter().all(|repo| hidden.contains(repo))
 }
 
@@ -763,22 +817,31 @@ enum ReclassifyState {
     /// `RECLASSIFY_OTHER_CHATS` in flight.
     Running,
     /// Result text shown in place of the label until the instant passes.
-    Done { text: String, until: Instant },
+    Done {
+        text: String,
+        until: Instant,
+    },
 }
 
 /// `RECLASSIFY_OTHER_CHATS` reply (`{examined, reclassified, unchanged,
-/// jevCalls, deferred}`; missing fields read as 0).
+/// confirmedOther, inconclusive, failed, jevCalls, deferred}`; missing fields
+/// read as 0).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct ReclassifyOtherReply {
     examined: usize,
     reclassified: usize,
     unchanged: usize,
+    confirmed_other: usize,
+    inconclusive: usize,
+    failed: usize,
     jev_calls: usize,
     deferred: usize,
 }
 
-/// The transient result line, e.g. `5 reclassified, 12 unchanged`.
+/// The transient result line. Successful `other` answers are a real
+/// classification, not a failure, so report them as "remained Other" and
+/// keep failures/inconclusive answers separate.
 fn reclassify_summary(reply: &ReclassifyOtherReply) -> String {
     if reply.examined == 0 {
         return "Nothing to reclassify".to_string();
@@ -786,7 +849,23 @@ fn reclassify_summary(reply: &ReclassifyOtherReply) -> String {
     if reply.jev_calls == 0 && reply.deferred == 0 {
         return "TypeSafe unavailable, nothing changed".to_string();
     }
-    let mut text = format!("{} reclassified, {} unchanged", reply.reclassified, reply.unchanged);
+    let mut parts = vec![format!("{} reclassified", reply.reclassified)];
+    if reply.confirmed_other > 0 {
+        parts.push(format!("{} remained Other", reply.confirmed_other));
+    }
+    if reply.inconclusive > 0 {
+        parts.push(format!("{} inconclusive", reply.inconclusive));
+    }
+    if reply.failed > 0 {
+        parts.push(format!("{} failed", reply.failed));
+    }
+    // Compatibility with an older engine that only returns `unchanged`.
+    let detailed = reply.confirmed_other + reply.inconclusive + reply.failed;
+    let legacy_unchanged = reply.unchanged.saturating_sub(detailed);
+    if legacy_unchanged > 0 {
+        parts.push(format!("{legacy_unchanged} unchanged"));
+    }
+    let mut text = parts.join(", ");
     if reply.deferred > 0 {
         text.push_str(" (more remaining \u{2014} run again)");
     }
@@ -799,14 +878,20 @@ fn reclassify_button_view(other_count: usize, state: &ReclassifyState) -> Option
     match state {
         ReclassifyState::Running => Some(("Reclassifying\u{2026}".to_string(), false)),
         ReclassifyState::Done { text, .. } => Some((text.clone(), false)),
-        ReclassifyState::Idle if other_count > 0 => Some((format!("Reclassify 'other' ({other_count})"), true)),
+        // The engine action is global (including archived/filtered chats),
+        // while `other_count` is derived from the currently loaded overview.
+        // Keep it as the visibility gate, but do not present it as the exact
+        // RPC target count.
+        ReclassifyState::Idle if other_count > 0 => Some(("Reclassify 'other'".to_string(), true)),
         ReclassifyState::Idle => None,
     }
 }
 
 /// Chats currently filed under `other` (the action's targets).
 fn count_other_rows<'a>(categories: impl Iterator<Item = Option<&'a str>>) -> usize {
-    categories.filter(|category| *category == Some("other")).count()
+    categories
+        .filter(|category| *category == Some("other"))
+        .count()
 }
 
 /// Whether a PR-sidebar section renders its rows. An active search query
@@ -821,11 +906,18 @@ fn pr_section_expanded(collapsed: &BTreeSet<String>, section_key: &str, searchin
 /// readable) but never out from the user's current zoom unless the tile
 /// wouldn't fit otherwise. `viewport` is the canvas container's own measured
 /// size, which already excludes both side panels.
-fn focus_view_on_rect(rect: (f32, f32, f32, f32), viewport: (f32, f32), current_zoom: f32) -> (f32, (f32, f32)) {
+fn focus_view_on_rect(
+    rect: (f32, f32, f32, f32),
+    viewport: (f32, f32),
+    current_zoom: f32,
+) -> (f32, (f32, f32)) {
     let (x, y, w, h) = rect;
     let fit_zoom = (viewport.0 / (w + FIT_PADDING * 2.0).max(1.0))
         .min(viewport.1 / (h + FIT_PADDING * 2.0).max(1.0));
-    let zoom = current_zoom.max(1.0).min(fit_zoom).clamp(ZOOM_MIN, ZOOM_MAX);
+    let zoom = current_zoom
+        .max(1.0)
+        .min(fit_zoom)
+        .clamp(ZOOM_MIN, ZOOM_MAX);
     let pan = (
         viewport.0 / 2.0 - (x + w / 2.0) * zoom,
         viewport.1 / 2.0 - (y + h / 2.0) * zoom,
@@ -838,7 +930,10 @@ fn focus_view_on_rect(rect: (f32, f32, f32, f32), viewport: (f32, f32), current_
 /// them with `FIT_PADDING` on every side, zoom clamped to
 /// `[ZOOM_MIN, ZOOM_MAX]`, centered on the bbox midpoint. `None` for no
 /// rects.
-fn fit_view_to_rects(rects: &[(f32, f32, f32, f32)], viewport: (f32, f32)) -> Option<(f32, (f32, f32))> {
+fn fit_view_to_rects(
+    rects: &[(f32, f32, f32, f32)],
+    viewport: (f32, f32),
+) -> Option<(f32, (f32, f32))> {
     if rects.is_empty() {
         return None;
     }
@@ -955,7 +1050,13 @@ fn category_badge(row: &OverviewRow, zoom: f32) -> Option<gpui::AnyElement> {
             .flex()
             .items_center()
             .gap(px(3.0 * zoom))
-            .child(div().flex_none().size(px(5.0 * zoom)).rounded_full().bg(color))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(5.0 * zoom))
+                    .rounded_full()
+                    .bg(color),
+            )
             .child(
                 div()
                     .text_size(crate::typography::ui_rems(9.0 * zoom))
@@ -965,6 +1066,43 @@ fn category_badge(row: &OverviewRow, zoom: f32) -> Option<gpui::AnyElement> {
             )
             .into_any_element(),
     )
+}
+
+/// Compact, always-visible model metadata for chat cards. A missing explicit
+/// id means the harness chose its configured default; say that plainly
+/// instead of omitting the field and making the card look unfinished.
+fn chat_model_label(chat: &Chat) -> &str {
+    chat.config
+        .as_ref()
+        .and_then(|config| config.model.as_deref())
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or("default model")
+}
+
+fn model_badge(chat: &Chat, theme: &Theme, zoom: f32) -> gpui::AnyElement {
+    let model = chat_model_label(chat);
+    let label: SharedString = model.to_string().into();
+    let tooltip: SharedString = if model == "default model" {
+        "Model: harness default".to_string()
+    } else {
+        format!("Model: {model}")
+    }
+    .into();
+    div()
+        .id(SharedString::from(format!("overview-model-{}", chat.id)))
+        .debug_selector(|| "overview-card-model".into())
+        .flex_none()
+        .max_w(px(112.0 * zoom))
+        .px(px(5.0 * zoom))
+        .py(px(1.0 * zoom))
+        .rounded(px(4.0 * zoom))
+        .bg(theme.element_hover.opacity(0.7))
+        .truncate()
+        .text_size(crate::typography::ui_rems(9.0 * zoom))
+        .text_color(theme.text_muted.opacity(0.85))
+        .tooltip(move |_, cx| cx.new(|_| LinkSourceTooltip(tooltip.clone())).into())
+        .child(label)
+        .into_any_element()
 }
 
 /// `session_canvas.html`'s fixed `ORIGIN_META` colors (`~874-881`), keyed by
@@ -1059,7 +1197,12 @@ fn count_rows<T>(partition: &Partition<T>) -> usize {
 /// header (label/nesting-depth/leaf-count) or a row, in the depth-first order
 /// [`flatten_partition`] visits the tree.
 enum ListItem<'a> {
-    Header { label: String, color: gpui::Hsla, depth: usize, count: usize },
+    Header {
+        label: String,
+        color: gpui::Hsla,
+        depth: usize,
+        count: usize,
+    },
     Row(&'a OverviewRow),
 }
 
@@ -1166,7 +1309,11 @@ fn layout_partition(partition: &Partition<&OverviewRow>, depth: usize) -> LaidOu
             let mut cross = 0.0f32;
             for g in groups {
                 let child = layout_partition(&g.items, depth + 1);
-                let (label_x, label_y) = if horizontal { (cursor, 0.0) } else { (0.0, cursor) };
+                let (label_x, label_y) = if horizontal {
+                    (cursor, 0.0)
+                } else {
+                    (0.0, cursor)
+                };
                 let (content_x, content_y) = if horizontal {
                     (cursor, GROUP_LABEL_H)
                 } else {
@@ -1174,7 +1321,11 @@ fn layout_partition(partition: &Partition<&OverviewRow>, depth: usize) -> LaidOu
                 };
                 // `makeLaneHeader`'s `${meta.label} (${count})`.
                 labels.push((
-                    format!("{} ({})", group_label(*dimension, &g.key), count_rows(&g.items)),
+                    format!(
+                        "{} ({})",
+                        group_label(*dimension, &g.key),
+                        count_rows(&g.items)
+                    ),
                     group_color(*dimension, &g.key),
                     label_x,
                     label_y,
@@ -1202,14 +1353,24 @@ fn layout_partition(partition: &Partition<&OverviewRow>, depth: usize) -> LaidOu
                     cross = cross.max(child_w);
                 }
             }
-            let (width, height) = if horizontal { (cursor, cross) } else { (cross, cursor) };
-            LaidOutPartition { positions, labels, group_boxes, width, height }
+            let (width, height) = if horizontal {
+                (cursor, cross)
+            } else {
+                (cross, cursor)
+            };
+            LaidOutPartition {
+                positions,
+                labels,
+                group_boxes,
+                width,
+                height,
+            }
         }
     }
 }
 
 struct LinkStatusEntry {
-    status: ChatLinkStatus,
+    status: OverviewLinkStatus,
     /// Uncommitted diff stat, if the engine's `CHAT_LINK_STATUS` response
     /// carries a `diffStat` object (`{filesChanged, linesAdded,
     /// linesRemoved}`, the reference's `diff_stat`). Read off the raw JSON
@@ -1220,6 +1381,38 @@ struct LinkStatusEntry {
     /// falls back to [`cwd_is_worktree`].
     is_worktree: Option<bool>,
     fetched_at: Instant,
+}
+
+/// UI-owned decode of `CHAT_LINK_STATUS`. Keeping the wire shape local lets
+/// the overview accept the additive `prLinks` field while remaining
+/// compatible with engines that only return the legacy singular `pr` /
+/// `prSource` pair.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverviewLinkStatus {
+    #[serde(default)]
+    pr: Option<PrStatus>,
+    #[serde(default)]
+    ticket: Option<TicketStatus>,
+    #[serde(default)]
+    pr_source: Option<ChatLinkSource>,
+    #[serde(default)]
+    ticket_source: Option<ChatLinkSource>,
+    #[serde(default)]
+    pr_links: Vec<OverviewPrLink>,
+}
+
+/// One PR associated with a chat. `detail` can be absent while the engine's
+/// background GitHub lookup is still pending; `url` remains enough to show a
+/// stable placeholder and to remove this exact link.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverviewPrLink {
+    url: String,
+    #[serde(default)]
+    source: Option<ChatLinkSource>,
+    #[serde(default)]
+    detail: Option<PrStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -1238,11 +1431,23 @@ struct DiffStat {
 /// reasons can flip the badge row's presence (e.g. checks start failing)
 /// without the ticket identifier/PR number/PR title changing at all, and a
 /// stale `has_badge_row` would mean stale packing.
-fn link_fingerprint(status: &ChatLinkStatus) -> (Option<String>, Option<u64>, Option<String>, bool) {
+fn link_fingerprint(
+    status: &OverviewLinkStatus,
+) -> (Option<String>, Vec<(String, u64, Option<String>)>, bool) {
+    let prs = effective_pr_links(status)
+        .into_iter()
+        .map(|link| {
+            let number = link
+                .detail
+                .as_ref()
+                .map_or_else(|| pr_number_from_url(&link.url), |pr| pr.number);
+            let title = link.detail.as_ref().and_then(|pr| pr.title.clone());
+            (link.url, number, title)
+        })
+        .collect();
     (
         status.ticket.as_ref().map(|t| t.identifier.clone()),
-        status.pr.as_ref().map(|p| p.number),
-        status.pr.as_ref().and_then(|p| p.title.clone()),
+        prs,
         link_has_badge_row(status),
     )
 }
@@ -1252,8 +1457,8 @@ fn link_fingerprint(status: &ChatLinkStatus) -> (Option<String>, Option<u64>, Op
 /// between `badges_for` (what to draw) and `rows()`/`link_fingerprint`
 /// (baking presence into `OverviewRow::has_badge_row`, which feeds
 /// `tile_size`) so the two can never disagree about whether a row exists.
-fn link_has_badge_row(status: &ChatLinkStatus) -> bool {
-    status.ticket.is_some() || status.pr.as_ref().is_some_and(|pr| !pr.action_reasons().is_empty())
+fn link_has_badge_row(status: &OverviewLinkStatus) -> bool {
+    status.ticket.is_some() || !effective_pr_links(status).is_empty()
 }
 
 /// Which durable link slot a `SET_CHAT_LINK` write targets — the RPC's
@@ -1262,6 +1467,23 @@ fn link_has_badge_row(status: &ChatLinkStatus) -> bool {
 enum LinkKind {
     Pr,
     Ticket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkOperation {
+    Add,
+    Remove,
+    Clear,
+}
+
+impl LinkOperation {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Clear => "clear",
+        }
+    }
 }
 
 impl LinkKind {
@@ -1273,7 +1495,7 @@ impl LinkKind {
     }
 }
 
-/// What the "Link PR / ticket…" input parsed to: the RPC `kind` plus the
+/// What the "Add PR / ticket…" input parsed to: the RPC `kind` plus the
 /// normalized value to store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedLink {
@@ -1282,7 +1504,8 @@ struct ParsedLink {
 }
 
 /// Error text shown under the link input when nothing parses.
-const LINK_PARSE_ERROR: &str = "Paste a GitHub PR URL (github.com/owner/repo/pull/123) or a ticket id like ENG-1234.";
+const LINK_PARSE_ERROR: &str =
+    "Paste a GitHub PR URL (github.com/owner/repo/pull/123) or a ticket id like ENG-1234.";
 
 /// The link input's one-box smart parse:
 /// - a `github.com/<owner>/<repo>/pull/<n>` URL (scheme and `www.`
@@ -1304,11 +1527,17 @@ fn parse_link_input(raw: &str) -> Result<ParsedLink, &'static str> {
         .strip_prefix("https://")
         .or_else(|| input.strip_prefix("http://"))
         .unwrap_or(input);
-    let without_www = without_scheme.strip_prefix("www.").unwrap_or(without_scheme);
+    let without_www = without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme);
     // Drop `?query` / `#fragment` before splitting into path segments.
     let path = without_www.split(['?', '#']).next().unwrap_or_default();
     let segments: Vec<&str> = path.split('/').collect();
-    match segments.first().map(|host| host.to_ascii_lowercase()).as_deref() {
+    match segments
+        .first()
+        .map(|host| host.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("github.com") => {
             if let [_, owner, repo, "pull", number, ..] = segments.as_slice()
                 && !owner.is_empty()
@@ -1325,12 +1554,18 @@ fn parse_link_input(raw: &str) -> Result<ParsedLink, &'static str> {
         }
         Some("linear.app") => match segments.as_slice() {
             [_, _, "issue", id, ..] => ticket_id_shape(id)
-                .map(|value| ParsedLink { kind: LinkKind::Ticket, value })
+                .map(|value| ParsedLink {
+                    kind: LinkKind::Ticket,
+                    value,
+                })
                 .ok_or(LINK_PARSE_ERROR),
             _ => Err(LINK_PARSE_ERROR),
         },
         _ => ticket_id_shape(input)
-            .map(|value| ParsedLink { kind: LinkKind::Ticket, value })
+            .map(|value| ParsedLink {
+                kind: LinkKind::Ticket,
+                value,
+            })
             .ok_or(LINK_PARSE_ERROR),
     }
 }
@@ -1364,10 +1599,23 @@ fn link_source_label(kind: LinkKind, source: Option<ChatLinkSource>) -> &'static
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetChatLinkReply {
+    #[serde(default)]
     linked_pr_url: Option<String>,
+    #[serde(default)]
     linked_pr_source: Option<ChatLinkSource>,
+    #[serde(default)]
+    linked_pr_links: Option<Vec<StoredPrLink>>,
+    #[serde(default)]
     linked_ticket_id: Option<String>,
+    #[serde(default)]
     linked_ticket_source: Option<ChatLinkSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPrLink {
+    url: String,
+    source: ChatLinkSource,
 }
 
 /// PR number off a `.../pull/<n>` URL (`0` if it has none).
@@ -1405,20 +1653,90 @@ fn placeholder_pr(url: &str) -> PrStatus {
 /// value already matches what's shown keeps the real detail; a different
 /// value gets a placeholder; a clear drops the slot (the follow-up refetch
 /// brings back whatever inference finds).
-fn apply_link_reply(status: &mut ChatLinkStatus, kind: LinkKind, reply: &SetChatLinkReply) {
+fn effective_pr_links(status: &OverviewLinkStatus) -> Vec<OverviewPrLink> {
+    if !status.pr_links.is_empty() {
+        return status.pr_links.clone();
+    }
+    status
+        .pr
+        .as_ref()
+        .map(|pr| OverviewPrLink {
+            url: pr.url.clone().unwrap_or_default(),
+            source: status.pr_source,
+            detail: Some(pr.clone()),
+        })
+        .into_iter()
+        .collect()
+}
+
+fn header_links(status: &OverviewLinkStatus) -> crate::chat_metadata::HeaderLinks {
+    crate::chat_metadata::HeaderLinks {
+        prs: effective_pr_links(status)
+            .into_iter()
+            .map(|link| crate::chat_metadata::HeaderPr {
+                number: link
+                    .detail
+                    .as_ref()
+                    .map_or_else(|| pr_number_from_url(&link.url), |pr| pr.number),
+                title: link.detail.as_ref().and_then(|pr| pr.title.clone()),
+                url: link.url,
+                source: link.source,
+            })
+            .collect(),
+        ticket: status
+            .ticket
+            .as_ref()
+            .map(|ticket| crate::chat_metadata::HeaderTicket {
+                identifier: ticket.identifier.clone(),
+                title: ticket.title.clone(),
+                url: ticket.url.clone(),
+            }),
+    }
+}
+
+fn status_has_pr_url(status: &OverviewLinkStatus, url: &str) -> bool {
+    effective_pr_links(status)
+        .iter()
+        .any(|link| link.url == url)
+}
+
+fn apply_link_reply(status: &mut OverviewLinkStatus, kind: LinkKind, reply: &SetChatLinkReply) {
     match kind {
-        LinkKind::Pr => match reply.linked_pr_url.as_deref() {
-            Some(url) => {
-                if status.pr.as_ref().and_then(|p| p.url.as_deref()) != Some(url) {
-                    status.pr = Some(placeholder_pr(url));
+        LinkKind::Pr => {
+            if let Some(links) = &reply.linked_pr_links {
+                let previous = effective_pr_links(status);
+                status.pr_links = links
+                    .iter()
+                    .map(|link| {
+                        let detail = previous
+                            .iter()
+                            .find(|old| old.url == link.url)
+                            .and_then(|old| old.detail.clone())
+                            .or_else(|| Some(placeholder_pr(&link.url)));
+                        OverviewPrLink {
+                            url: link.url.clone(),
+                            source: Some(link.source),
+                            detail,
+                        }
+                    })
+                    .collect();
+                status.pr = status.pr_links.first().and_then(|link| link.detail.clone());
+                status.pr_source = status.pr_links.first().and_then(|link| link.source);
+            } else {
+                match reply.linked_pr_url.as_deref() {
+                    Some(url) => {
+                        if status.pr.as_ref().and_then(|p| p.url.as_deref()) != Some(url) {
+                            status.pr = Some(placeholder_pr(url));
+                        }
+                        status.pr_source = reply.linked_pr_source;
+                    }
+                    None => {
+                        status.pr = None;
+                        status.pr_source = None;
+                    }
                 }
-                status.pr_source = reply.linked_pr_source;
             }
-            None => {
-                status.pr = None;
-                status.pr_source = None;
-            }
-        },
+        }
         LinkKind::Ticket => match reply.linked_ticket_id.as_deref() {
             Some(id) => {
                 if status.ticket.as_ref().map(|t| t.identifier.as_str()) != Some(id) {
@@ -1444,8 +1762,19 @@ fn apply_link_reply(status: &mut ChatLinkStatus, kind: LinkKind, reply: &SetChat
 /// its detail yet (`pr`/`ticket` null), keep the previous value (typically
 /// [`apply_link_reply`]'s placeholder) instead of blanking the badge until
 /// the sweep catches up.
-fn merge_refetched_link(previous: Option<&ChatLinkStatus>, mut next: ChatLinkStatus) -> ChatLinkStatus {
+fn merge_refetched_link(
+    previous: Option<&OverviewLinkStatus>,
+    mut next: OverviewLinkStatus,
+) -> OverviewLinkStatus {
     if let Some(prev) = previous {
+        for link in &mut next.pr_links {
+            if link.detail.is_none() {
+                link.detail = effective_pr_links(prev)
+                    .into_iter()
+                    .find(|old| old.url == link.url)
+                    .and_then(|old| old.detail);
+            }
+        }
         if next.pr.is_none() && next.pr_source.is_some() && prev.pr_source.is_some() {
             next.pr = prev.pr.clone();
         }
@@ -1501,7 +1830,10 @@ fn manual_link_pin(color: gpui::Hsla, zoom: f32) -> gpui::Svg {
 /// currently doing anything"), not its literal cursor-liveness mechanism —
 /// see `STALE_AFTER`'s doc comment.
 fn is_stale(chat: &Chat, status: ChatIndicator, now: chrono::DateTime<Utc>) -> bool {
-    if matches!(status, ChatIndicator::Working | ChatIndicator::AwaitingInput) {
+    if matches!(
+        status,
+        ChatIndicator::Working | ChatIndicator::AwaitingInput
+    ) {
         return false;
     }
     let last_activity = chat.last_message_at.unwrap_or(chat.created_at);
@@ -1726,15 +2058,15 @@ const BADGE_ROW_ADDED_H: f32 = 18.0 + TILE_ROW_GAP;
 const SUBAGENT_TILE_H: f32 = 26.0;
 /// `.subagents { gap: 6px }` — between adjacent compact subagent tiles.
 const SUBAGENT_TILE_GAP: f32 = 6.0;
+/// Keep cards scannable at rest. A fourth compact row communicates the
+/// remainder; hovering the card swaps the preview for the complete stack.
+const SUBAGENT_PREVIEW_LIMIT: usize = 3;
 /// `.connector { margin-top: 10px }` — the space between the parent card's
 /// own face and its subagent stack. `tile_body`'s flex-column gap already
 /// supplies [`TILE_ROW_GAP`] of it; the stack adds the rest as a top margin.
 const SUBAGENT_STACK_TOP: f32 = 10.0;
-/// How many subagent tiles the flat canvas's fixed default-slot stride
-/// ([`tile_max_size`] / [`flat_grid_stride`]) budgets for. Subagent tiles
-/// are uncapped, so no fixed stride can absorb every tile (36 subagents is a
-/// ~1.3k-px card); see [`tile_max_size`] for what happens past this bound.
-const FLAT_STRIDE_SUBAGENT_TILES: usize = 4;
+/// Three previews plus the "+N more" row is the largest resting stack.
+const FLAT_STRIDE_SUBAGENT_TILES: usize = SUBAGENT_PREVIEW_LIMIT + 1;
 
 /// Port of `tileSize(pct, 160, 260)` (`session_canvas.html:1040-1043`):
 /// `round(min + pct * (max - min))`, null → 0. Clamped to `0.0..=1.0` (and a
@@ -1765,10 +2097,8 @@ fn tile_size_for_pct(pct: Option<f32>) -> (f32, f32) {
 /// exactly what varies per row, matching what `tile_body` conditionally
 /// renders:
 /// - a PR/ticket badge row (`badges_for`), when `has_badge_row`
-/// - the subagent stack (`subagent_tiles_for`): EVERY subagent as its own
-///   fixed-height compact tile ([`SUBAGENT_TILE_H`], [`SUBAGENT_TILE_GAP`]
-///   apart, [`SUBAGENT_STACK_TOP`] below the face) — uncapped, like the web
-///   reference, so the card grows to fit all of them.
+/// - the resting subagent preview (`subagent_tiles_for`): up to three
+///   fixed-height compact tiles plus a "+N more" row when needed.
 ///
 /// Monotonic in both `subagent_count` and `has_badge_row`: more content
 /// never produces a smaller estimate. Must be kept in lockstep with
@@ -1780,8 +2110,14 @@ fn tile_content_height_estimate(subagent_count: usize, has_badge_row: bool) -> f
     if has_badge_row {
         height += BADGE_ROW_ADDED_H;
     }
-    height += subagent_stack_height(subagent_count);
+    height += subagent_stack_height(subagent_preview_row_count(subagent_count));
     height
+}
+
+/// Number of compact rows shown before hover: at most three agents and one
+/// remainder indicator.
+fn subagent_preview_row_count(count: usize) -> usize {
+    count.min(SUBAGENT_PREVIEW_LIMIT) + usize::from(count > SUBAGENT_PREVIEW_LIMIT)
 }
 
 /// Height the subagent stack adds below the tile face (0 for none) — also
@@ -1799,16 +2135,10 @@ fn subagent_stack_height(count: usize) -> f32 {
 /// context-% width, and a height covering a badge row plus
 /// [`FLAT_STRIDE_SUBAGENT_TILES`] subagent tiles.
 ///
-/// Deliberately BOUNDED, not the true worst case: subagent tiles are
-/// uncapped, so the true worst-case height is unbounded (36 subagents ≈
-/// 1.3k px) and a stride sized for it would spread every ordinary tile
-/// kilometres apart. A default-slotted flat-mode tile with more subagents
-/// than the bound extends into the slot below it — the same tolerance the
-/// web reference's own flat mode has (`defaultPosition`'s fixed 420px row
-/// stride, no reflow). Flat mode has no overlap-repair pass (positions are
-/// user-placed/persisted, and a repair would fight dragging), so the user
-/// drags it clear; grouped mode is exact regardless, since `pack_rects` +
-/// `repair_overlaps` pack each tile's real `tile_size`.
+/// This is the exact largest resting card: the preview cannot exceed three
+/// agents plus its remainder row. A hovered card may temporarily extend
+/// beyond this stride, but paints above neighbors and collapses again on
+/// pointer leave, so it does not spread the entire board apart.
 fn tile_max_size() -> (f32, f32) {
     let (w, aspect_h) = tile_size_for_pct(Some(1.0));
     let bounded_content_h = tile_content_height_estimate(FLAT_STRIDE_SUBAGENT_TILES, true);
@@ -1925,7 +2255,9 @@ fn panel_chat_id(panel_open: bool, selected_chat: Option<&str>) -> Option<String
     if !panel_open {
         return None;
     }
-    selected_chat.filter(|id| !id.is_empty()).map(str::to_string)
+    selected_chat
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 pub struct Overview {
@@ -1985,6 +2317,10 @@ pub struct Overview {
     /// `SCAN_CHAT_SUBAGENTS`'s contract).
     subagents: HashMap<String, Vec<SubagentItem>>,
     subagent_pending: HashSet<String>,
+    /// Card whose compact subagent preview is temporarily showing the full
+    /// stack. Kept separate from `expanded`: hover must not acknowledge a
+    /// completed chat or open its detail panel.
+    hovered_subagents: Option<String>,
     /// Last attempt time per chat (success OR failure), so a chat with
     /// nothing to scan retries on `SUBAGENTS_REFRESH` instead of on every
     /// row rebuild.
@@ -2137,6 +2473,10 @@ pub struct Overview {
     /// chat stack only renders on `Route::Chat` (`render_main`'s early
     /// return), so the routes keep them exclusive.
     chat_panel_open: bool,
+    /// Chat whose overview-panel identity control is showing "Copied".
+    copied_panel_identity: Option<String>,
+    /// Invalidates an older feedback timer when the user copies again.
+    copied_panel_identity_seq: u64,
     /// The Shell's own conversation transcript (see `chat_panel_open`).
     transcript: Entity<Transcript>,
     /// The Shell's own composer (see `chat_panel_open`).
@@ -2145,7 +2485,7 @@ pub struct Overview {
     /// the top of `render` so `tile_body`/`render_list_row` can outline it
     /// without a `cx`.
     panel_highlight: Option<String>,
-    /// The chat whose expanded detail shows the inline "Link PR / ticket…"
+    /// The chat whose expanded detail shows the inline "Add PR / ticket…"
     /// input (at most one at a time — `link_input` is a single entity and
     /// must render in one place per frame).
     link_editor_chat: Option<String>,
@@ -2209,8 +2549,12 @@ impl Overview {
             // Must be `PALETTE_SEARCH_CONTEXT`: editing keys (backspace, ⌥⌫, ⌘⌫,
             // ⌘A/C/V/Z…) are bound only to the contexts `input_bindings`
             // registers; a bespoke context got typing but no deletion.
-            ComposerInput::with_context("Search chats…", crate::composer::PALETTE_SEARCH_CONTEXT, cx)
-                .with_accessibility_role(gpui::Role::SearchInput)
+            ComposerInput::with_context(
+                "Search chats…",
+                crate::composer::PALETTE_SEARCH_CONTEXT,
+                cx,
+            )
+            .with_accessibility_role(gpui::Role::SearchInput)
         });
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
@@ -2276,6 +2620,7 @@ impl Overview {
             link_status_pending: HashSet::new(),
             subagents: HashMap::new(),
             subagent_pending: HashSet::new(),
+            hovered_subagents: None,
             subagents_fetched_at: HashMap::new(),
             classification: HashMap::new(),
             classification_pending: HashSet::new(),
@@ -2319,6 +2664,8 @@ impl Overview {
             grouped_layout_cache: None,
             search,
             chat_panel_open: false,
+            copied_panel_identity: None,
+            copied_panel_identity_seq: 0,
             transcript,
             composer,
             panel_highlight: None,
@@ -2355,7 +2702,11 @@ impl Overview {
             .iter()
             .any(|r| r.chat.id == chat_id && r.status == ChatIndicator::Completed);
         if is_done && self.acknowledged_done.insert(chat_id.to_string()) {
-            self.save_string_set(overview_positions::ACKNOWLEDGED_DONE_FILE, &self.acknowledged_done, cx);
+            self.save_string_set(
+                overview_positions::ACKNOWLEDGED_DONE_FILE,
+                &self.acknowledged_done,
+                cx,
+            );
         }
     }
 
@@ -2370,7 +2721,8 @@ impl Overview {
             return;
         };
         self.prefs_loaded = true;
-        let flags = overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
+        let flags =
+            overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
         // Only ever turns it ON: a toggle before `data_dir` existed (engine
         // still bootstrapping) must not be overwritten by the older file.
         if pr_sidebar_open_from_flags(&flags) && !self.pr_sidebar_open {
@@ -2379,9 +2731,15 @@ impl Overview {
         self.pr_collapsed_sections
             .extend(pr_collapsed_sections_from_flags(&flags));
         self.acknowledged_done
-            .extend(overview_positions::load_string_set(&data_dir, overview_positions::ACKNOWLEDGED_DONE_FILE));
+            .extend(overview_positions::load_string_set(
+                &data_dir,
+                overview_positions::ACKNOWLEDGED_DONE_FILE,
+            ));
         self.hidden_repos
-            .extend(overview_positions::load_string_set(&data_dir, overview_positions::HIDDEN_REPOS_FILE));
+            .extend(overview_positions::load_string_set(
+                &data_dir,
+                overview_positions::HIDDEN_REPOS_FILE,
+            ));
         if !self.hidden_repos.is_empty() {
             self.repo_filter_needs_validation = true;
             self.rows_dirty = true;
@@ -2390,7 +2748,11 @@ impl Overview {
         // A toggle made before `data_dir` existed wins over the older file.
         if !self.view_prefs_touched {
             let prefs = view_prefs_from_flags(&flags);
-            self.view_mode = if prefs.canvas { ViewMode::Canvas } else { ViewMode::List };
+            self.view_mode = if prefs.canvas {
+                ViewMode::Canvas
+            } else {
+                ViewMode::List
+            };
             self.hide_stale = prefs.hide_stale;
             self.show_archived = prefs.show_archived;
             self.active_groups = prefs.groups;
@@ -2419,7 +2781,8 @@ impl Overview {
         let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
             return;
         };
-        let mut flags = overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
+        let mut flags =
+            overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
         apply_view_prefs_to_flags(&mut flags, &self.view_prefs());
         self.save_string_set(overview_positions::UI_FLAGS_FILE, &flags, cx);
     }
@@ -2446,6 +2809,16 @@ impl Overview {
         cx.notify();
     }
 
+    /// Shortcut entry point used when navigating here from another route.
+    pub(crate) fn open_pr_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.set_pr_sidebar_open(true, true, cx);
+    }
+
+    /// Shortcut/command-palette entry point while already on the overview.
+    pub(crate) fn toggle_pr_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.set_pr_sidebar_open(!self.pr_sidebar_open, true, cx);
+    }
+
     /// Fold/unfold one PR-sidebar section and persist the collapsed set.
     fn toggle_pr_section(&mut self, section_key: &str, cx: &mut Context<Self>) {
         let collapsed = if self.pr_collapsed_sections.remove(section_key) {
@@ -2464,7 +2837,8 @@ impl Overview {
         let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
             return;
         };
-        let mut flags = overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
+        let mut flags =
+            overview_positions::load_string_set(&data_dir, overview_positions::UI_FLAGS_FILE);
         if on {
             flags.insert(flag);
         } else {
@@ -2479,14 +2853,21 @@ impl Overview {
     /// framing waits a painted frame.
     fn jump_to_chat_from_pr(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.open_chat_panel(chat_id.clone(), cx);
-        self.pending_focus = Some(PendingFocus { chat_id, settle_frames: 1 });
+        self.pending_focus = Some(PendingFocus {
+            chat_id,
+            settle_frames: 1,
+        });
         cx.notify();
     }
 
     /// Any repo-filter change: persist, and re-derive rows + grouped layout
     /// (web `reflowLayout`).
     fn repo_filter_changed(&mut self, cx: &mut Context<Self>) {
-        self.save_string_set(overview_positions::HIDDEN_REPOS_FILE, &self.hidden_repos, cx);
+        self.save_string_set(
+            overview_positions::HIDDEN_REPOS_FILE,
+            &self.hidden_repos,
+            cx,
+        );
         self.rows_dirty = true;
         self.grouped_layout_cache = None;
         cx.notify();
@@ -2517,7 +2898,10 @@ impl Overview {
             self.ensure_row_fetches(chat_id, imported, cx);
         }
         self.ensure_my_prs(cx);
-        if self.refresh_ticks.is_multiple_of(STALENESS_REDERIVE_EVERY_TICKS) {
+        if self
+            .refresh_ticks
+            .is_multiple_of(STALENESS_REDERIVE_EVERY_TICKS)
+        {
             self.rows_dirty = true;
         }
         cx.notify();
@@ -2529,7 +2913,12 @@ impl Overview {
     /// scan, per `SCAN_CHAT_SUBAGENTS`/`CHAT_CLASSIFICATION`'s contract).
     /// Context usage applies to every chat: its live source is the engine's
     /// own doc store, not an import cursor.
-    fn ensure_row_fetches(&mut self, chat_id: String, has_harness_session: bool, cx: &mut Context<Self>) {
+    fn ensure_row_fetches(
+        &mut self,
+        chat_id: String,
+        has_harness_session: bool,
+        cx: &mut Context<Self>,
+    ) {
         if has_harness_session {
             self.ensure_subagents(chat_id.clone(), cx);
             self.ensure_classification(chat_id.clone(), cx);
@@ -2570,13 +2959,21 @@ impl Overview {
         }
 
         let now = Utc::now();
-        let raw: Vec<(ChatIndicator, Chat)> = self
-            .state
-            .read(cx)
-            .overview_chats_with_archived(now, self.show_archived)
-            .into_iter()
-            .map(|(status, chat)| (status, chat.clone()))
-            .collect();
+        let (raw, spaces): (Vec<(ChatIndicator, Chat)>, HashMap<String, Space>) = {
+            let state = self.state.read(cx);
+            (
+                state
+                    .overview_chats_with_archived(now, self.show_archived)
+                    .into_iter()
+                    .map(|(status, chat)| (status, chat.clone()))
+                    .collect(),
+                state
+                    .spaces
+                    .iter()
+                    .map(|space| (space.id.clone(), space.clone()))
+                    .collect(),
+            )
+        };
         self.unfiltered_count = raw.len();
         let hide_stale = self.hide_stale;
         let query = self.search.read(cx).text().trim().to_lowercase();
@@ -2590,8 +2987,30 @@ impl Overview {
             let ticket = link
                 .and_then(|s| s.ticket.as_ref())
                 .map(|t| t.identifier.clone());
-            let pr_number = link.and_then(|s| s.pr.as_ref()).map(|p| p.number);
-            let pr_title = link.and_then(|s| s.pr.as_ref()).and_then(|p| p.title.clone());
+            let prs = link.map(effective_pr_links).unwrap_or_default();
+            let pr_number = prs.first().map(|link| {
+                link.detail
+                    .as_ref()
+                    .map_or_else(|| pr_number_from_url(&link.url), |pr| pr.number)
+            });
+            let pr_title = prs
+                .first()
+                .and_then(|link| link.detail.as_ref()?.title.clone());
+            let pr_search_values = prs
+                .iter()
+                .flat_map(|link| {
+                    let number = link
+                        .detail
+                        .as_ref()
+                        .map_or_else(|| pr_number_from_url(&link.url), |pr| pr.number);
+                    let mut values =
+                        vec![number.to_string(), format!("#{number}"), link.url.clone()];
+                    if let Some(title) = link.detail.as_ref().and_then(|pr| pr.title.clone()) {
+                        values.push(title);
+                    }
+                    values
+                })
+                .collect();
             // Feeds `OverviewRow::tile_size` — see `has_badge_row`/
             // `subagent_count`'s own doc comments for why these are copied
             // in here rather than read off `self` inside `tile_size`.
@@ -2608,7 +3027,11 @@ impl Overview {
                 &chat.id,
                 status == ChatIndicator::Completed,
             );
-            let repo = repo_key(chat.cwd.as_deref());
+            let space = chat
+                .space_id
+                .as_deref()
+                .and_then(|space_id| spaces.get(space_id));
+            let repo = repo_key_for_chat(&chat, space);
             let closeable = crate::chat_closeout::has_workspace_root(chat.cwd.as_deref());
             known_repos.insert(repo.clone());
             all.push(OverviewRow {
@@ -2621,6 +3044,7 @@ impl Overview {
                 repo,
                 pr_number,
                 pr_title,
+                pr_search_values,
                 context_pct,
                 subagent_count,
                 has_badge_row,
@@ -2634,11 +3058,19 @@ impl Overview {
             if restored_repo_filter_hides_everything(&self.hidden_repos, &self.known_repos) {
                 tracing::info!("restored repo filter hid every chat; resetting it");
                 self.hidden_repos.clear();
-                self.save_string_set(overview_positions::HIDDEN_REPOS_FILE, &self.hidden_repos, cx);
+                self.save_string_set(
+                    overview_positions::HIDDEN_REPOS_FILE,
+                    &self.hidden_repos,
+                    cx,
+                );
             }
         }
         if acknowledged_changed {
-            self.save_string_set(overview_positions::ACKNOWLEDGED_DONE_FILE, &self.acknowledged_done, cx);
+            self.save_string_set(
+                overview_positions::ACKNOWLEDGED_DONE_FILE,
+                &self.acknowledged_done,
+                cx,
+            );
         }
         let hidden_repos = &self.hidden_repos;
         let rows: Vec<OverviewRow> = all
@@ -2649,17 +3081,16 @@ impl Overview {
                 // Web `sessionMatchesSearch` fields that exist here: name
                 // (title), branch, last message (preview), cwd, ticket id,
                 // PR title. Zeron has no separate `summary` field.
-                matches_search(
-                    &query,
-                    &[
-                        row.chat.title.as_deref(),
-                        row.chat.branch.as_deref(),
-                        row.chat.last_message_preview.as_deref(),
-                        row.chat.cwd.as_deref(),
-                        row.ticket.as_deref(),
-                        row.pr_title.as_deref(),
-                    ],
-                )
+                let mut fields = vec![
+                    row.chat.title.as_deref(),
+                    row.chat.branch.as_deref(),
+                    row.chat.last_message_preview.as_deref(),
+                    row.chat.cwd.as_deref(),
+                    row.ticket.as_deref(),
+                    row.pr_title.as_deref(),
+                ];
+                fields.extend(row.pr_search_values.iter().map(String::as_str).map(Some));
+                matches_search(&query, &fields)
             })
             .collect();
         self.rows_cache = rows.clone();
@@ -2697,7 +3128,13 @@ impl Overview {
     /// fresh `READ_SUBAGENT_TRANSCRIPT` under a new request id every time
     /// (re-clicking the same subagent reloads it), so a slower earlier reply
     /// can never overwrite a newer peek ([`peek_reply_is_current`]).
-    fn open_subagent_peek(&mut self, chat_id: String, sub: &SubagentItem, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_subagent_peek(
+        &mut self,
+        chat_id: String,
+        sub: &SubagentItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.peek_request_seq += 1;
         let request_id = self.peek_request_seq;
         self.chat_panel_open = false;
@@ -2728,15 +3165,22 @@ impl Overview {
             let decoded = result
                 .ok()
                 .and_then(|value| serde_json::from_value::<SubagentTranscript>(value).ok());
-            this.update(cx, |this, cx| this.apply_peek_reply(request_id, decoded, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.apply_peek_reply(request_id, decoded, cx)
+            })
+            .ok();
         })
         .detach();
     }
 
     /// Land a peek fetch (`None` = RPC or decode failure) — dropped unless
     /// it's still the current peek's request.
-    fn apply_peek_reply(&mut self, request_id: u64, reply: Option<SubagentTranscript>, cx: &mut Context<Self>) {
+    fn apply_peek_reply(
+        &mut self,
+        request_id: u64,
+        reply: Option<SubagentTranscript>,
+        cx: &mut Context<Self>,
+    ) {
         if !peek_reply_is_current(self.subagent_peek.as_ref(), request_id) {
             return;
         }
@@ -2769,10 +3213,46 @@ impl Overview {
         }
     }
 
+    /// Copy the same debugging identity exposed by the full-chat header and
+    /// sidebar menu, but from the overview's embedded live-chat panel.
+    fn copy_panel_chat_identity(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(crate::shell::chat_identity_for)
+        else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.copied_panel_identity = Some(chat_id.clone());
+        self.copied_panel_identity_seq = self.copied_panel_identity_seq.wrapping_add(1);
+        let seq = self.copied_panel_identity_seq;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.copied_panel_identity_seq == seq {
+                    this.copied_panel_identity = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The chat the panel currently shows — `Some` only while it's open and
     /// something is selected (see [`panel_chat_id`]).
     fn panel_chat_id(&self, cx: &Context<Self>) -> Option<String> {
-        panel_chat_id(self.chat_panel_open, self.state.read(cx).selected_chat.as_deref())
+        panel_chat_id(
+            self.chat_panel_open,
+            self.state.read(cx).selected_chat.as_deref(),
+        )
     }
 
     /// "Close out worktree…": the confirmation dialog is Shell-owned (it's a
@@ -2812,7 +3292,7 @@ impl Overview {
             this.update(cx, |this, cx| {
                 this.link_status_pending.remove(&chat_id);
                 if let Ok(value) = result
-                    && let Ok(status) = serde_json::from_value::<ChatLinkStatus>(value.clone())
+                    && let Ok(status) = serde_json::from_value::<OverviewLinkStatus>(value.clone())
                 {
                     let diff_stat = value
                         .get("diffStat")
@@ -2859,9 +3339,9 @@ impl Overview {
         .detach();
     }
 
-    /// Open the inline "Link PR / ticket…" editor in `chat_id`'s expanded
+    /// Open the inline "Add PR / ticket…" editor in `chat_id`'s expanded
     /// detail (expanding it if needed), focused and empty. Also the entry
-    /// point for the sidebar chat menu's "Link PR / ticket…", which switches
+    /// point for the sidebar chat menu's "Add PR / ticket…", which switches
     /// to the overview first; `reveal` then brings the row/tile into view
     /// the same way a PR-sidebar jump does.
     pub(crate) fn open_link_editor(
@@ -2877,17 +3357,28 @@ impl Overview {
         self.link_editor_chat = Some(chat_id.clone());
         self.link_submitting = false;
         self.link_error = None;
-        self.link_input.update(cx, |input, cx| input.set_text("", cx));
-        window.focus(&gpui::Focusable::focus_handle(self.link_input.read(cx), cx), cx);
+        self.link_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        window.focus(
+            &gpui::Focusable::focus_handle(self.link_input.read(cx), cx),
+            cx,
+        );
         if reveal {
-            self.pending_focus = Some(PendingFocus { chat_id, settle_frames: 1 });
+            self.pending_focus = Some(PendingFocus {
+                chat_id,
+                settle_frames: 1,
+            });
         }
         cx.notify();
     }
 
     fn close_link_editor(&mut self, cx: &mut Context<Self>) {
         if let Some(chat_id) = self.link_editor_chat.take() {
-            if self.link_error.as_ref().is_some_and(|(id, _)| *id == chat_id) {
+            if self
+                .link_error
+                .as_ref()
+                .is_some_and(|(id, _)| *id == chat_id)
+            {
                 self.link_error = None;
             }
             self.link_submitting = false;
@@ -2913,7 +3404,13 @@ impl Overview {
             Ok(parsed) => {
                 self.link_submitting = true;
                 self.link_error = None;
-                self.set_chat_link(chat_id, parsed.kind, Some(parsed.value), cx);
+                self.set_chat_link(
+                    chat_id,
+                    parsed.kind,
+                    Some(parsed.value),
+                    LinkOperation::Add,
+                    cx,
+                );
             }
         }
     }
@@ -2925,7 +3422,14 @@ impl Overview {
     /// kicked (which [`merge_refetched_link`] keeps from blanking the
     /// placeholder). Closes the editor if it was this chat's. On failure:
     /// inline error in the chat's detail.
-    fn set_chat_link(&mut self, chat_id: String, kind: LinkKind, value: Option<String>, cx: &mut Context<Self>) {
+    fn set_chat_link(
+        &mut self,
+        chat_id: String,
+        kind: LinkKind,
+        value: Option<String>,
+        operation: LinkOperation,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.link_submitting = false;
             self.link_error = Some((chat_id, "Engine not connected".to_string()));
@@ -2938,11 +3442,17 @@ impl Overview {
                 .client()
                 .call(
                     methods::SET_CHAT_LINK,
-                    serde_json::json!({ "chatId": chat_id, "kind": kind.wire(), "value": value }),
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "kind": kind.wire(),
+                        "value": value,
+                        "operation": operation.wire(),
+                    }),
                 )
                 .await;
             this.update(cx, |this, cx| {
-                let editor_was_this_chat = this.link_editor_chat.as_deref() == Some(chat_id.as_str());
+                let editor_was_this_chat =
+                    this.link_editor_chat.as_deref() == Some(chat_id.as_str());
                 if editor_was_this_chat {
                     this.link_submitting = false;
                 }
@@ -2951,24 +3461,38 @@ impl Overview {
                 });
                 match reply {
                     Ok(reply) => {
+                        let _ = this.shell.update(cx, |shell, _| {
+                            shell.invalidate_chat_header_links(&chat_id);
+                        });
                         let expired = Instant::now()
                             .checked_sub(LINK_STATUS_REFRESH)
                             .unwrap_or_else(Instant::now);
-                        let entry = this.link_status.entry(chat_id.clone()).or_insert_with(|| LinkStatusEntry {
-                            status: ChatLinkStatus::default(),
-                            diff_stat: None,
-                            is_worktree: None,
-                            fetched_at: expired,
+                        let entry = this.link_status.entry(chat_id.clone()).or_insert_with(|| {
+                            LinkStatusEntry {
+                                status: OverviewLinkStatus::default(),
+                                diff_stat: None,
+                                is_worktree: None,
+                                fetched_at: expired,
+                            }
                         });
                         apply_link_reply(&mut entry.status, kind, &reply);
                         entry.fetched_at = expired;
                         this.rows_dirty = true;
                         this.grouped_layout_cache = None;
-                        if this.link_error.as_ref().is_some_and(|(id, _)| *id == chat_id) {
+                        if this
+                            .link_error
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == chat_id)
+                        {
                             this.link_error = None;
                         }
-                        if editor_was_this_chat && value.is_some() {
-                            this.link_editor_chat = None;
+                        if editor_was_this_chat && operation == LinkOperation::Add {
+                            if kind == LinkKind::Pr {
+                                this.link_input
+                                    .update(cx, |input, cx| input.set_text("", cx));
+                            } else {
+                                this.link_editor_chat = None;
+                            }
                         }
                         this.ensure_link_status(chat_id, cx);
                     }
@@ -3015,7 +3539,8 @@ impl Overview {
                 .await;
             this.update(cx, |this, cx| {
                 this.subagent_pending.remove(&chat_id);
-                this.subagents_fetched_at.insert(chat_id.clone(), Instant::now());
+                this.subagents_fetched_at
+                    .insert(chat_id.clone(), Instant::now());
                 if let Ok(value) = result
                     && let Ok(subagents) = serde_json::from_value::<Vec<SubagentItem>>(value)
                 {
@@ -3063,7 +3588,8 @@ impl Overview {
                 .await;
             this.update(cx, |this, cx| {
                 this.classification_pending.remove(&chat_id);
-                this.classification_fetched_at.insert(chat_id.clone(), Instant::now());
+                this.classification_fetched_at
+                    .insert(chat_id.clone(), Instant::now());
                 if let Ok(value) = result
                     && let Some(category) = value.get("category").and_then(|v| v.as_str())
                     && let Some(origin) = value.get("origin").and_then(|v| v.as_str())
@@ -3089,7 +3615,8 @@ impl Overview {
                     // used as grouping keys — only a CHANGE invalidates rows
                     // + the grouped layout (tool/skill chips read
                     // `classification` live at render).
-                    let changed = previous.is_none_or(|old| old.category != category || old.origin != origin);
+                    let changed =
+                        previous.is_none_or(|old| old.category != category || old.origin != origin);
                     if changed {
                         this.rows_dirty = true;
                         this.grouped_layout_cache = None;
@@ -3146,12 +3673,22 @@ impl Overview {
     }
 
     /// The toolbar's reclassify button (see [`reclassify_button_view`]).
-    fn render_reclassify_button(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_reclassify_button(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let (label, clickable) = reclassify_button_view(self.other_count, &self.reclassify)?;
         let running = self.reclassify == ReclassifyState::Running;
         let spinner = running.then(|| {
-            crate::loaders::mini_glyph_spinner("overview-reclassify-spinner", 1.75, theme.glyph, cx.entity_id(), cx)
-                .into_any_element()
+            crate::loaders::mini_glyph_spinner(
+                "overview-reclassify-spinner",
+                1.75,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element()
         });
         Some(
             div()
@@ -3166,7 +3703,11 @@ impl Overview {
                 .border_1()
                 .border_color(theme.border)
                 .text_size(crate::typography::ui_rems(10.5))
-                .text_color(if clickable { theme.text } else { theme.text_muted })
+                .text_color(if clickable {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
                 .when(clickable, |el| {
                     el.cursor_pointer().hover(|el| el.bg(theme.element_hover))
                 })
@@ -3212,7 +3753,8 @@ impl Overview {
                 .await;
             this.update(cx, |this, cx| {
                 this.context_usage_pending.remove(&chat_id);
-                this.context_usage_fetched_at.insert(chat_id.clone(), Instant::now());
+                this.context_usage_fetched_at
+                    .insert(chat_id.clone(), Instant::now());
                 if let Ok(value) = result {
                     let pct = value
                         .get("contextPct")
@@ -3312,13 +3854,17 @@ impl Overview {
     fn chat_for_pr_url(&self, rows: &[OverviewRow], url: Option<&str>) -> Option<(String, String)> {
         let url = url?;
         let chat_id = self.link_status.iter().find_map(|(chat_id, entry)| {
-            let pr_url = entry.status.pr.as_ref()?.url.as_deref()?;
-            (pr_url == url).then(|| chat_id.clone())
+            status_has_pr_url(&entry.status, url).then(|| chat_id.clone())
         })?;
         let title = rows
             .iter()
             .find(|r| r.chat.id == chat_id)
-            .map(|r| r.chat.title.clone().unwrap_or_else(|| "New session".to_string()))
+            .map(|r| {
+                r.chat
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "New session".to_string())
+            })
             .unwrap_or_else(|| "chat".to_string());
         Some((chat_id, title))
     }
@@ -3331,10 +3877,6 @@ impl Overview {
     /// the reference's actual visual nesting instead of a summary count.
     fn badges_for(&self, chat_id: &str, theme: &Theme, zoom: f32) -> Option<gpui::AnyElement> {
         let link = self.link_status.get(chat_id).map(|e| &e.status);
-        let pr_badge = link
-            .and_then(|s| s.pr.as_ref())
-            .and_then(|pr| pr.action_reasons().into_iter().next())
-            .map(pr_action_badge);
         let ticket_label = link
             .and_then(|s| s.ticket.as_ref())
             .map(|t| t.identifier.clone());
@@ -3345,14 +3887,29 @@ impl Overview {
         if !link.is_some_and(link_has_badge_row) {
             return None;
         }
-        let pr_source = link.and_then(|s| s.pr_source);
         let ticket_source = link.and_then(|s| s.ticket_source);
         let mut row = div().flex().items_center().gap(px(6.0 * zoom)).flex_wrap();
-        if let Some((label, color)) = pr_badge {
+        for (index, pr_link) in link.into_iter().flat_map(effective_pr_links).enumerate() {
+            let pr = pr_link
+                .detail
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| placeholder_pr(&pr_link.url));
+            let (action, color) = pr
+                .action_reasons()
+                .into_iter()
+                .next()
+                .map(pr_action_badge)
+                .map(|(label, color)| (label.to_string(), color))
+                .unwrap_or_else(|| (pr.state.clone(), theme.text_muted));
+            let label = format!("#{} {action}", pr.number);
+            let pr_source = pr_link.source;
             row = row.child(
                 link_source_hover(
                     div()
-                        .id(SharedString::from(format!("overview-badge-pr-{chat_id}")))
+                        .id(SharedString::from(format!(
+                            "overview-badge-pr-{chat_id}-{index}"
+                        )))
                         .flex()
                         .items_center()
                         .gap(px(3.0 * zoom))
@@ -3365,7 +3922,9 @@ impl Overview {
                     LinkKind::Pr,
                     pr_source,
                 )
-                .when(pr_source == Some(ChatLinkSource::Manual), |el| el.child(manual_link_pin(color, zoom)))
+                .when(pr_source == Some(ChatLinkSource::Manual), |el| {
+                    el.child(manual_link_pin(color, zoom))
+                })
                 .child(SharedString::from(label)),
             );
         }
@@ -3373,7 +3932,9 @@ impl Overview {
             row = row.child(
                 link_source_hover(
                     div()
-                        .id(SharedString::from(format!("overview-badge-ticket-{chat_id}")))
+                        .id(SharedString::from(format!(
+                            "overview-badge-ticket-{chat_id}"
+                        )))
                         .flex()
                         .items_center()
                         .gap(px(3.0 * zoom))
@@ -3395,11 +3956,11 @@ impl Overview {
         Some(row.into_any_element())
     }
 
-    /// One compact nested tile per subagent — `session_canvas.html`'s
+    /// Compact nested tiles for a chat's subagents — `session_canvas.html`'s
     /// `.tile.compact` sub-agent tiles (`~441-517`, `renderTile`'s compact
-    /// branch `~1150-1160`, the stack itself `~1864-1906`). ALL of them, no
-    /// cap: the parent card grows to fit (`tile_content_height_estimate`
-    /// budgets every one). Each is a single fixed-height row — status dot
+    /// branch `~1150-1160`, the stack itself `~1864-1906`). At rest this
+    /// returns three agents plus a "+N more" row; `show_all` returns the full
+    /// stack while the parent card is hovered. Each agent is a single fixed-height row — status dot
     /// (running = accent, done = green), truncated name, muted agent type,
     /// and a "⋯" affordance — with the full name in a hover tooltip (gpui's
     /// deferred tooltip layer: floats above everything, never reflows or
@@ -3423,13 +3984,20 @@ impl Overview {
         chat_id: &str,
         theme: &Theme,
         zoom: f32,
+        show_all: bool,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let Some(subagents) = self.subagents.get(chat_id) else {
             return Vec::new();
         };
-        subagents
+        let visible_count = if show_all {
+            subagents.len()
+        } else {
+            subagents.len().min(SUBAGENT_PREVIEW_LIMIT)
+        };
+        let mut tiles: Vec<gpui::AnyElement> = subagents
             .iter()
+            .take(visible_count)
             .map(|sub| {
                 let color = sub.status.color();
                 let name = sub.display_name();
@@ -3445,7 +4013,10 @@ impl Overview {
                 let click_chat = chat_id.to_string();
                 let click_sub = sub.clone();
                 div()
-                    .id(SharedString::from(format!("overview-subagent-{chat_id}-{}", sub.agent_id)))
+                    .id(SharedString::from(format!(
+                        "overview-subagent-{chat_id}-{}",
+                        sub.agent_id
+                    )))
                     .debug_selector(|| "overview-subagent-tile".into())
                     .flex_none()
                     .w_full()
@@ -3469,7 +4040,13 @@ impl Overview {
                         this.open_subagent_peek(click_chat.clone(), &click_sub, window, cx);
                     }))
                     .tooltip(move |_, cx| cx.new(|_| LinkSourceTooltip(tooltip.clone())).into())
-                    .child(div().flex_none().size(px(8.0 * zoom)).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(8.0 * zoom))
+                            .rounded_full()
+                            .bg(color),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -3480,18 +4057,21 @@ impl Overview {
                             .text_color(theme.text)
                             .child(SharedString::from(name)),
                     )
-                    .when_some(sub.agent_type.clone().filter(|t| !t.is_empty()), |el, agent_type| {
-                        el.child(
-                            div()
-                                .flex_shrink(1.0)
-                                .min_w_0()
-                                .max_w(px(120.0 * zoom))
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(9.0 * zoom))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(agent_type)),
-                        )
-                    })
+                    .when_some(
+                        sub.agent_type.clone().filter(|t| !t.is_empty()),
+                        |el, agent_type| {
+                            el.child(
+                                div()
+                                    .flex_shrink(1.0)
+                                    .min_w_0()
+                                    .max_w(px(120.0 * zoom))
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(9.0 * zoom))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(agent_type)),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .flex_none()
@@ -3506,7 +4086,33 @@ impl Overview {
                     )
                     .into_any_element()
             })
-            .collect()
+            .collect();
+
+        if !show_all && subagents.len() > SUBAGENT_PREVIEW_LIMIT {
+            let remaining = subagents.len() - SUBAGENT_PREVIEW_LIMIT;
+            tiles.push(
+                div()
+                    .debug_selector(|| "overview-subagent-more".into())
+                    .flex_none()
+                    .w_full()
+                    .h(px(SUBAGENT_TILE_H * zoom))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0 * zoom))
+                    .border_1()
+                    .border_color(theme.border.opacity(0.65))
+                    .bg(theme.surface_raised.opacity(0.6))
+                    .text_size(crate::typography::ui_rems(9.5 * zoom))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "+{remaining} more · hover to expand"
+                    )))
+                    .into_any_element(),
+            );
+        }
+        tiles
     }
 
     /// Small archive affordance — reused by both the list row and the tile.
@@ -3516,7 +4122,13 @@ impl Overview {
     /// List mode, which has no zoom concept) so it shrinks/grows with the
     /// tile instead of staying a fixed pixel size while everything around it
     /// scales.
-    fn archive_button(&self, chat_id: String, theme: &Theme, cx: &mut Context<Self>, zoom: f32) -> gpui::AnyElement {
+    fn archive_button(
+        &self,
+        chat_id: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        zoom: f32,
+    ) -> gpui::AnyElement {
         div()
             .id(SharedString::from(format!("overview-archive-{chat_id}")))
             .flex_none()
@@ -3544,7 +4156,13 @@ impl Overview {
     /// the panel's "Open full chat →" actually leaves the overview.
     /// Tile/row body clicks toggle expand in place instead — see
     /// `toggle_expanded`.
-    fn open_chat_button(&self, chat_id: String, theme: &Theme, cx: &mut Context<Self>, zoom: f32) -> gpui::AnyElement {
+    fn open_chat_button(
+        &self,
+        chat_id: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        zoom: f32,
+    ) -> gpui::AnyElement {
         div()
             .id(SharedString::from(format!("overview-open-{chat_id}")))
             .flex_none()
@@ -3570,22 +4188,48 @@ impl Overview {
     /// a flex column (not overlaid, unlike the chat route — so the
     /// transcript's bottom clearance is zero here; `Shell::render` sets that
     /// per frame on this route).
-    fn render_chat_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_chat_panel(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let Some(chat_id) = self.panel_chat_id(cx) else {
             // Selection cleared under the open panel (chat deleted/archived,
             // new-session): nothing to show, so the panel closes itself.
             self.chat_panel_open = false;
             return None;
         };
-        let title: SharedString = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|c| c.id == chat_id)
-            .and_then(|c| c.title.clone())
+        self.ensure_link_status(chat_id.clone(), cx);
+        self.ensure_classification(chat_id.clone(), cx);
+        let (chat, space) = {
+            let state = self.state.read(cx);
+            let chat = state.chats.iter().find(|chat| chat.id == chat_id)?.clone();
+            let space = chat
+                .space_id
+                .as_deref()
+                .and_then(|id| state.space_row(id))
+                .cloned();
+            (chat, space)
+        };
+        let title: SharedString = chat
+            .title
+            .clone()
             .unwrap_or_else(|| "Chat".to_string())
             .into();
+        let links = self
+            .link_status
+            .get(&chat_id)
+            .map(|entry| header_links(&entry.status));
+        let classification = self.classification.get(&chat_id);
+        let category = classification.map(|info| category_label(&info.category).to_string());
+        let origin = classification.map(|info| origin_label(&info.origin).to_string());
+        let metadata = crate::chat_metadata::metadata_items(
+            &chat,
+            space.as_ref(),
+            links.as_ref(),
+            category.as_deref(),
+            origin.as_deref(),
+        );
         // The chat route drives these per frame (`render_main`); it doesn't
         // run on this route, so the panel does. Without the settled-docked
         // frame, arriving from the blank new-session screen would leave the
@@ -3627,6 +4271,8 @@ impl Overview {
                 )
         });
         let full_chat_id = chat_id.clone();
+        let copy_chat_id = chat_id.clone();
+        let copied = self.copied_panel_identity.as_deref() == Some(chat_id.as_str());
         Some(
             div()
                 .id("overview-chat-panel")
@@ -3649,49 +4295,101 @@ impl Overview {
                     div()
                         .flex_none()
                         .flex()
-                        .items_center()
-                        .justify_between()
+                        .flex_col()
+                        .gap(px(6.0))
                         .px(px(12.0))
-                        .py(px(10.0))
+                        .py(px(8.0))
                         .border_b_1()
                         .border_color(theme.border)
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(12.0))
-                                .text_color(theme.text)
-                                .child(title),
-                        )
-                        .child(
-                            div()
                                 .flex()
                                 .items_center()
-                                .gap(px(10.0))
+                                .justify_between()
                                 .child(
                                     div()
-                                        .id("overview-chat-panel-open-full")
-                                        .cursor_pointer()
-                                        .text_size(crate::typography::ui_rems(10.5))
-                                        .text_color(theme.accent)
-                                        .child(SharedString::from("Open full chat →"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.close_chat_panel(cx);
-                                            this.open(full_chat_id.clone(), cx);
-                                        })),
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(12.0))
+                                        .text_color(theme.text)
+                                        .child(title),
                                 )
                                 .child(
                                     div()
-                                        .id("overview-chat-panel-close")
-                                        .cursor_pointer()
-                                        .text_color(theme.text_muted)
-                                        .child(SharedString::from("×"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.close_chat_panel(cx);
-                                        })),
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .id("overview-chat-panel-copy")
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(4.0))
+                                                .px(px(6.0))
+                                                .py(px(2.0))
+                                                .rounded(px(4.0))
+                                                .cursor_pointer()
+                                                .text_size(crate::typography::ui_rems(10.5))
+                                                .text_color(if copied {
+                                                    theme.success
+                                                } else {
+                                                    theme.text_muted
+                                                })
+                                                .hover(|el| {
+                                                    el.bg(theme.element_hover)
+                                                        .text_color(theme.text)
+                                                })
+                                                .child(
+                                                    crate::icons::icon(if copied {
+                                                        crate::icons::CHECK
+                                                    } else {
+                                                        crate::icons::COPY
+                                                    })
+                                                    .size(px(11.0)),
+                                                )
+                                                .child(SharedString::from(if copied {
+                                                    "Copied"
+                                                } else {
+                                                    "Copy name + IDs"
+                                                }))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.copy_panel_chat_identity(
+                                                        copy_chat_id.clone(),
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("overview-chat-panel-open-full")
+                                                .cursor_pointer()
+                                                .text_size(crate::typography::ui_rems(10.5))
+                                                .text_color(theme.accent)
+                                                .child(SharedString::from("Open full chat →"))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.close_chat_panel(cx);
+                                                    this.open(full_chat_id.clone(), cx);
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("overview-chat-panel-close")
+                                                .cursor_pointer()
+                                                .text_color(theme.text_muted)
+                                                .child(SharedString::from("×"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.close_chat_panel(cx);
+                                                })),
+                                        ),
                                 ),
-                        ),
+                        )
+                        .child(crate::chat_metadata::metadata_strip(
+                            "overview-chat-panel",
+                            metadata,
+                            theme,
+                        )),
                 )
                 .child(
                     div()
@@ -3720,7 +4418,11 @@ impl Overview {
     /// chips), scrolled to the end on load. No composer: a subagent can't be
     /// continued. Same width/chrome as the live chat panel so switching
     /// between the two modes doesn't jump the canvas.
-    fn render_subagent_peek(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_subagent_peek(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let peek = self.subagent_peek.as_ref()?;
         let code_family = crate::typography::code_effective_family_name(cx);
         let mut subtitle = String::from("sub-agent transcript");
@@ -3740,12 +4442,16 @@ impl Overview {
         let body: Vec<gpui::AnyElement> = match &peek.load {
             PeekLoad::Loading => vec![hint("Loading…")],
             PeekLoad::Failed => vec![hint("Failed to load transcript.")],
-            PeekLoad::Loaded(t) if t.turns.is_empty() => vec![hint("No turns found in this transcript.")],
+            PeekLoad::Loaded(t) if t.turns.is_empty() => {
+                vec![hint("No turns found in this transcript.")]
+            }
             PeekLoad::Loaded(t) => t
                 .turns
                 .iter()
                 .enumerate()
-                .map(|(ti, turn)| self.render_peek_turn(ti, turn, &peek.open_tools, theme, &code_family, cx))
+                .map(|(ti, turn)| {
+                    self.render_peek_turn(ti, turn, &peek.open_tools, theme, &code_family, cx)
+                })
                 .collect(),
         };
         let name: SharedString = peek.name.clone().into();
@@ -3906,7 +4612,10 @@ impl Overview {
             .enumerate()
             .map(|(tj, tool)| {
                 let open = open_tools.contains(&(ti, tj));
-                let has_result = tool.result_preview.as_deref().is_some_and(|r| !r.is_empty());
+                let has_result = tool
+                    .result_preview
+                    .as_deref()
+                    .is_some_and(|r| !r.is_empty());
                 let summary = if tool.input_preview.is_empty() {
                     tool.name.clone()
                 } else {
@@ -3940,7 +4649,12 @@ impl Overview {
                                 cx.notify();
                             }))
                     })
-                    .child(div().min_w_0().truncate().child(SharedString::from(summary)));
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(summary)),
+                    );
                 div()
                     .flex()
                     .flex_col()
@@ -3979,7 +4693,11 @@ impl Overview {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(if is_user { theme.accent } else { theme.text_muted })
+                            .text_color(if is_user {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })
                             .child(SharedString::from(turn_role_label(&turn.role))),
                     )
                     .when(!time.is_empty(), |el| {
@@ -4040,7 +4758,13 @@ impl Overview {
                 .gap(px(6.0 * zoom))
                 .text_size(crate::typography::ui_rems(10.0 * zoom))
                 .child(label_el(label))
-                .child(div().flex_1().min_w_0().text_color(theme.text_muted).child(value))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.text_muted)
+                        .child(value),
+                )
                 .into_any_element()
         };
         let text = |value: String| SharedString::from(value).into_any_element();
@@ -4057,7 +4781,11 @@ impl Overview {
         // `renderChips`/`renderToolChips`: an empty list renders a single
         // "none" chip rather than hiding the row.
         let chip_row = |chips: Vec<String>| {
-            let chips = if chips.is_empty() { vec!["none".to_string()] } else { chips };
+            let chips = if chips.is_empty() {
+                vec!["none".to_string()]
+            } else {
+                chips
+            };
             div()
                 .flex()
                 .flex_wrap()
@@ -4082,7 +4810,11 @@ impl Overview {
                 .gap(px(5.0 * zoom))
                 .child(SharedString::from(format!("⎇ {branch}")))
                 .when(is_worktree, |el| {
-                    el.child(chip("worktree".into(), theme.text_muted, theme.element_hover))
+                    el.child(chip(
+                        "worktree".into(),
+                        theme.text_muted,
+                        theme.element_hover,
+                    ))
                 })
                 .into_any_element(),
             None => text("—".into()),
@@ -4091,7 +4823,11 @@ impl Overview {
 
         // changes
         if let Some(diff) = entry.and_then(|e| e.diff_stat) {
-            let files = if diff.files_changed == 1 { "file" } else { "files" };
+            let files = if diff.files_changed == 1 {
+                "file"
+            } else {
+                "files"
+            };
             rows.push(detail_row(
                 "changes",
                 div()
@@ -4107,7 +4843,10 @@ impl Overview {
                             .text_color(gpui::rgb(0xd03b3b))
                             .child(SharedString::from(format!("-{}", diff.lines_removed))),
                     )
-                    .child(SharedString::from(format!("· {} {files}", diff.files_changed)))
+                    .child(SharedString::from(format!(
+                        "· {} {files}",
+                        diff.files_changed
+                    )))
                     .into_any_element(),
             ));
         }
@@ -4116,62 +4855,95 @@ impl Overview {
             rows.push(detail_row("launched via", text(origin_label(origin))));
         }
 
-        if let Some(pr) = link.and_then(|s| s.pr.as_ref()) {
-            let mut summary = format!("#{} {}", pr.number, pr.title.clone().unwrap_or_default());
-            summary.push_str(" — ");
-            summary.push_str(if pr.is_draft { "draft" } else { &pr.state });
-            if let Some(decision) = &pr.review_decision {
-                summary.push_str(", ");
-                summary.push_str(&decision.to_lowercase().replace('_', " "));
-            }
-            let checks = pr.checks.map(checks_style);
-            if let Some((_, _, checks_label)) = checks {
-                summary.push_str(&format!(", checks {checks_label}"));
-            }
-            let url = pr.url.clone();
-            let pr_source = link.and_then(|s| s.pr_source);
-            let value = div()
-                .flex()
-                .flex_col()
-                .gap(px(4.0 * zoom))
-                .child(
+        if let Some(link) = link {
+            let prs = effective_pr_links(link);
+            if !prs.is_empty() {
+                let values = prs.into_iter().enumerate().map(|(index, pr_link)| {
+                    let pr = pr_link
+                        .detail
+                        .clone()
+                        .unwrap_or_else(|| placeholder_pr(&pr_link.url));
+                    let mut summary =
+                        format!("#{} {}", pr.number, pr.title.clone().unwrap_or_default());
+                    summary.push_str(" — ");
+                    summary.push_str(if pr.is_draft { "draft" } else { &pr.state });
+                    if let Some(decision) = &pr.review_decision {
+                        summary.push_str(", ");
+                        summary.push_str(&decision.to_lowercase().replace('_', " "));
+                    }
+                    let checks = pr.checks.map(checks_style);
+                    if let Some((_, _, checks_label)) = checks {
+                        summary.push_str(&format!(", checks {checks_label}"));
+                    }
+                    let url = pr_link.url.clone();
+                    let open_url = url.clone();
+                    let pr_source = pr_link.source;
                     div()
                         .flex()
-                        .items_center()
+                        .flex_col()
                         .gap(px(4.0 * zoom))
-                        .when(pr_source == Some(ChatLinkSource::Manual), |el| {
-                            el.child(manual_link_pin(theme.text_muted, zoom))
-                        })
                         .child(
-                            link_source_hover(
-                                div()
-                                    .id(SharedString::from(format!("overview-detail-pr-{chat_id}")))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap(px(4.0 * zoom)),
-                                LinkKind::Pr,
-                                pr_source,
-                            )
-                            .when(url.is_some(), |el| {
-                                el.cursor_pointer().text_color(theme.accent).hover(|el| el.underline())
-                            })
-                            .child(SharedString::from(summary))
-                            .when_some(checks, |el, (color, icon, _)| {
-                                el.child(div().text_color(color).child(SharedString::from(icon)))
-                            })
-                            .when_some(url, |el, url| {
-                                el.on_click(move |_, _, cx| cx.open_url(&url))
-                            }),
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0 * zoom))
+                                .when(pr_source == Some(ChatLinkSource::Manual), |el| {
+                                    el.child(manual_link_pin(theme.text_muted, zoom))
+                                })
+                                .child(
+                                    link_source_hover(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "overview-detail-pr-{chat_id}-{index}"
+                                            )))
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(px(4.0 * zoom)),
+                                        LinkKind::Pr,
+                                        pr_source,
+                                    )
+                                    .cursor_pointer()
+                                    .text_color(theme.accent)
+                                    .hover(|el| el.underline())
+                                    .child(SharedString::from(summary))
+                                    .when_some(checks, |el, (color, icon, _)| {
+                                        el.child(
+                                            div().text_color(color).child(SharedString::from(icon)),
+                                        )
+                                    })
+                                    .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                                )
+                                .when(pr_source.is_some(), |el| {
+                                    el.child(self.unlink_button(
+                                        chat_id.clone(),
+                                        LinkKind::Pr,
+                                        Some(url.clone()),
+                                        theme,
+                                        zoom,
+                                        cx,
+                                    ))
+                                }),
                         )
-                        .when(pr_source.is_some(), |el| {
-                            el.child(self.unlink_button(chat_id.clone(), LinkKind::Pr, theme, zoom, cx))
-                        }),
-                )
-                .when(!pr.reviewers.is_empty(), |el| el.child(chip_row(pr.reviewers.clone())))
-                .into_any_element();
-            rows.push(detail_row("pull request", value));
+                        .when(!pr.reviewers.is_empty(), |el| {
+                            el.child(chip_row(pr.reviewers.clone()))
+                        })
+                });
+                rows.push(detail_row(
+                    if link.pr_links.len() > 1 {
+                        "pull requests"
+                    } else {
+                        "pull request"
+                    },
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0 * zoom))
+                        .children(values)
+                        .into_any_element(),
+                ));
+            }
         }
 
         if let Some(ticket) = link.and_then(|s| s.ticket.as_ref()) {
@@ -4196,20 +4968,33 @@ impl Overview {
                     .child(
                         link_source_hover(
                             div()
-                                .id(SharedString::from(format!("overview-detail-ticket-{chat_id}")))
+                                .id(SharedString::from(format!(
+                                    "overview-detail-ticket-{chat_id}"
+                                )))
                                 .flex_1()
                                 .min_w_0(),
                             LinkKind::Ticket,
                             ticket_source,
                         )
                         .when(url.is_some(), |el| {
-                            el.cursor_pointer().text_color(theme.accent).hover(|el| el.underline())
+                            el.cursor_pointer()
+                                .text_color(theme.accent)
+                                .hover(|el| el.underline())
                         })
                         .child(SharedString::from(summary))
-                        .when_some(url, |el, url| el.on_click(move |_, _, cx| cx.open_url(&url))),
+                        .when_some(url, |el, url| {
+                            el.on_click(move |_, _, cx| cx.open_url(&url))
+                        }),
                     )
                     .when(ticket_source.is_some(), |el| {
-                        el.child(self.unlink_button(chat_id.clone(), LinkKind::Ticket, theme, zoom, cx))
+                        el.child(self.unlink_button(
+                            chat_id.clone(),
+                            LinkKind::Ticket,
+                            None,
+                            theme,
+                            zoom,
+                            cx,
+                        ))
                     })
                     .into_any_element(),
             ));
@@ -4230,13 +5015,18 @@ impl Overview {
                 .map(|(name, count)| format!("{name}×{count}"))
                 .collect();
             rows.push(detail_row("tools used", chip_row(tool_chips)));
-            rows.push(detail_row("skills loaded", chip_row(info.skills_loaded.clone())));
+            rows.push(detail_row(
+                "skills loaded",
+                chip_row(info.skills_loaded.clone()),
+            ));
         }
 
         let archived = row.chat.archived;
         let archive_id = chat_id.clone();
         let archive_toggle = div()
-            .id(SharedString::from(format!("overview-detail-archive-{chat_id}")))
+            .id(SharedString::from(format!(
+                "overview-detail-archive-{chat_id}"
+            )))
             .flex_none()
             .px(px(8.0 * zoom))
             .py(px(2.0 * zoom))
@@ -4251,12 +5041,18 @@ impl Overview {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.set_archived(archive_id.clone(), !archived, cx);
             }))
-            .child(SharedString::from(if archived { "Unarchive" } else { "Archive" }));
+            .child(SharedString::from(if archived {
+                "Unarchive"
+            } else {
+                "Archive"
+            }));
 
         let closeout_id = chat_id.clone();
         let closeout = row.closeable.then(|| {
             div()
-                .id(SharedString::from(format!("overview-detail-closeout-{chat_id}")))
+                .id(SharedString::from(format!(
+                    "overview-detail-closeout-{chat_id}"
+                )))
                 .flex_none()
                 .px(px(8.0 * zoom))
                 .py(px(2.0 * zoom))
@@ -4277,7 +5073,9 @@ impl Overview {
         let editor_open = self.link_editor_chat.as_deref() == Some(chat_id.as_str());
         let link_toggle_id = chat_id.clone();
         let link_toggle = div()
-            .id(SharedString::from(format!("overview-detail-link-{chat_id}")))
+            .id(SharedString::from(format!(
+                "overview-detail-link-{chat_id}"
+            )))
             .flex_none()
             .px(px(8.0 * zoom))
             .py(px(2.0 * zoom))
@@ -4287,7 +5085,9 @@ impl Overview {
             .text_color(theme.text_muted)
             .border_1()
             .border_color(theme.border)
-            .when(editor_open, |el| el.bg(theme.element_active).text_color(theme.text))
+            .when(editor_open, |el| {
+                el.bg(theme.element_active).text_color(theme.text)
+            })
             .hover(|el| el.bg(theme.element_hover).text_color(theme.text))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -4297,7 +5097,11 @@ impl Overview {
                     this.open_link_editor(link_toggle_id.clone(), false, window, cx);
                 }
             }))
-            .child(SharedString::from(if editor_open { "Cancel link" } else { "Link PR / ticket…" }));
+            .child(SharedString::from(if editor_open {
+                "Cancel"
+            } else {
+                "Add PR / ticket…"
+            }));
 
         let link_error = self
             .link_error
@@ -4308,7 +5112,7 @@ impl Overview {
             let hint = if self.link_submitting {
                 "Linking…".to_string()
             } else {
-                "Enter to link · Esc to cancel".to_string()
+                "Enter to add · Esc to cancel".to_string()
             };
             div()
                 .flex()
@@ -4325,7 +5129,10 @@ impl Overview {
                             cx.stop_propagation();
                             window.prevent_default();
                         }))
-                        .child(popover::search_input_frame(theme, self.link_input.clone().into_any_element())),
+                        .child(popover::search_input_frame(
+                            theme,
+                            self.link_input.clone().into_any_element(),
+                        )),
                 )
                 .child(
                     div()
@@ -4381,6 +5188,7 @@ impl Overview {
         &self,
         chat_id: String,
         kind: LinkKind,
+        value: Option<String>,
         theme: &Theme,
         zoom: f32,
         cx: &mut Context<Self>,
@@ -4390,7 +5198,10 @@ impl Overview {
             LinkKind::Ticket => "Unlink this ticket",
         });
         div()
-            .id(SharedString::from(format!("overview-unlink-{}-{chat_id}", kind.wire())))
+            .id(SharedString::from(format!(
+                "overview-unlink-{}-{chat_id}",
+                kind.wire()
+            )))
             .flex_none()
             .px(px(4.0 * zoom))
             .rounded(px(3.0 * zoom))
@@ -4400,7 +5211,12 @@ impl Overview {
             .hover(|el| el.bg(theme.element_hover).text_color(theme.text))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_chat_link(chat_id.clone(), kind, None, cx);
+                let operation = if kind == LinkKind::Pr {
+                    LinkOperation::Remove
+                } else {
+                    LinkOperation::Clear
+                };
+                this.set_chat_link(chat_id.clone(), kind, value.clone(), operation, cx);
             }))
             .tooltip(move |_, cx| cx.new(|_| LinkSourceTooltip(tooltip.clone())).into())
             .child(SharedString::from("✕"))
@@ -4621,7 +5437,10 @@ impl Overview {
         count: usize,
         rects: Vec<(f32, f32, f32, f32)>,
     ) -> gpui::AnyElement {
-        let label = format!("{count} card{} off-screen — Fit view", if count == 1 { "" } else { "s" });
+        let label = format!(
+            "{count} card{} off-screen — Fit view",
+            if count == 1 { "" } else { "s" }
+        );
         div()
             .id("overview-rescue-wrap")
             .absolute()
@@ -4687,7 +5506,13 @@ impl Overview {
     /// `plan_tile_motion`. Called for every present tile (culled or not)
     /// before viewport culling, so culling sees the interpolated position
     /// and an off-screen tile's move still tracks its target.
-    fn animated_tile_pos(&mut self, chat_id: &str, target: TilePos, now: Instant, reduced: bool) -> TilePos {
+    fn animated_tile_pos(
+        &mut self,
+        chat_id: &str,
+        target: TilePos,
+        now: Instant,
+        reduced: bool,
+    ) -> TilePos {
         let live_drag = self
             .dragging_tile
             .as_ref()
@@ -4695,7 +5520,8 @@ impl Overview {
         let duration = TILE_MOVE_DURATION.mul_f32(crate::motion::speed_scale());
         let prev = self.tile_targets.insert(chat_id.to_string(), target);
         let current = self.tile_moves.get(chat_id).copied();
-        let (next, pos) = plan_tile_motion(prev, current, target, live_drag, reduced, now, duration);
+        let (next, pos) =
+            plan_tile_motion(prev, current, target, live_drag, reduced, now, duration);
         match next {
             Some(m) => {
                 self.tile_moves.insert(chat_id.to_string(), m);
@@ -4710,8 +5536,10 @@ impl Overview {
     /// End of a canvas pass: forget tiles that weren't present, so their
     /// next appearance counts as a first appearance (no fly-in).
     fn prune_tile_motion(&mut self, present: &HashSet<&str>) {
-        self.tile_targets.retain(|id, _| present.contains(id.as_str()));
-        self.tile_moves.retain(|id, _| present.contains(id.as_str()));
+        self.tile_targets
+            .retain(|id, _| present.contains(id.as_str()));
+        self.tile_moves
+            .retain(|id, _| present.contains(id.as_str()));
     }
 
     fn clear_tile_motion(&mut self) {
@@ -4797,16 +5625,23 @@ impl Render for Overview {
                 .rounded(px(4.0))
                 .cursor_pointer()
                 .text_size(crate::typography::ui_rems(11.0))
-                .when(active, |el| el.bg(theme.element_active).text_color(theme.text))
+                .when(active, |el| {
+                    el.bg(theme.element_active).text_color(theme.text)
+                })
                 .when(!active, |el| el.text_color(theme.text_muted))
                 .child(SharedString::from(label))
         };
 
         // `updateMyPrsButtonBadge`: count + critical styling, except when
         // every actionable PR is only "ready to merge".
-        let pr_action_count = actionable_pr_count(self.my_prs.iter().filter_map(|item| {
-            item.detail.as_ref().map(|d| d.action_reasons())
-        }).collect::<Vec<_>>().iter().map(Vec::as_slice));
+        let pr_action_count = actionable_pr_count(
+            self.my_prs
+                .iter()
+                .filter_map(|item| item.detail.as_ref().map(|d| d.action_reasons()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(Vec::as_slice),
+        );
         // Review requests are "needs you" too, so they fold into the same
         // single count (and the same critical styling) rather than adding a
         // second number to the toolbar.
@@ -4816,8 +5651,33 @@ impl Render for Overview {
         } else {
             "My PRs".to_string()
         };
+        let my_prs_shortcut = self
+            .shell
+            .upgrade()
+            .map(|shell| shell.read(cx).my_prs_shortcut_label());
         let critical: gpui::Hsla = gpui::rgb(0xd03b3b).into();
         let new_chat_button = self.render_new_chat_button(&theme, cx);
+        let repository_map_button = div()
+            .id("overview-repository-map")
+            .h(px(28.0))
+            .px(px(9.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(11.0))
+            .text_color(theme.text_muted)
+            .hover(|element| element.bg(theme.element_hover).text_color(theme.text))
+            .child(crate::icons::icon(crate::icons::FILE_TREE).size(px(12.0)))
+            .child("Repository map")
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(shell) = this.shell.upgrade() {
+                    shell.update(cx, |shell, cx| shell.open_repository_topology(cx));
+                }
+            }));
 
         let title_row = div()
             .flex()
@@ -4841,11 +5701,10 @@ impl Render for Overview {
                             .text_color(theme.text_muted)
                             .child(SharedString::from(format!("{} chats", rows.len()))),
                     )
-                    .child(
-                        div()
-                            .w(px(260.0))
-                            .child(popover::search_input_frame(&theme, self.search.clone().into_any_element())),
-                    ),
+                    .child(div().w(px(260.0)).child(popover::search_input_frame(
+                        &theme,
+                        self.search.clone().into_any_element(),
+                    ))),
             )
             .child(
                 div()
@@ -4855,6 +5714,7 @@ impl Render for Overview {
                     // Leftmost of the header's action cluster — the overview's
                     // one clearly-primary button (see `render_new_chat_button`).
                     .child(new_chat_button)
+                    .child(repository_map_button)
                     .child(
                         div()
                             .flex()
@@ -4874,14 +5734,15 @@ impl Render for Overview {
                                 ),
                             )
                             .child(
-                                toggle(ViewMode::Canvas, "Canvas".into(), self.view_mode).on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.view_mode = ViewMode::Canvas;
-                                        this.view_prefs_changed(cx);
-                                        cx.notify();
-                                    }),
-                                ),
+                                toggle(ViewMode::Canvas, "Canvas".into(), self.view_mode)
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.view_mode = ViewMode::Canvas;
+                                            this.view_prefs_changed(cx);
+                                            cx.notify();
+                                        }),
+                                    ),
                             ),
                     )
                     .child(
@@ -4899,8 +5760,12 @@ impl Render for Overview {
                                     .rounded(px(4.0))
                                     .cursor_pointer()
                                     .text_size(crate::typography::ui_rems(11.0))
-                                    .when(self.pr_sidebar_open, |el| el.bg(theme.element_active).text_color(theme.text))
-                                    .when(!self.pr_sidebar_open, |el| el.text_color(theme.text_muted))
+                                    .when(self.pr_sidebar_open, |el| {
+                                        el.bg(theme.element_active).text_color(theme.text)
+                                    })
+                                    .when(!self.pr_sidebar_open, |el| {
+                                        el.text_color(theme.text_muted)
+                                    })
                                     // `#my-prs-btn.has-action`: critical color +
                                     // border + bold (regardless of open state).
                                     .when(pr_badge_count > 0, |el| {
@@ -4909,7 +5774,16 @@ impl Render for Overview {
                                             .border_1()
                                             .border_color(critical)
                                     })
-                                    .child(SharedString::from(my_prs_label))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .child(SharedString::from(my_prs_label))
+                                            .when_some(my_prs_shortcut, |row, shortcut| {
+                                                row.child(popover::kbd_hint(&theme, &shortcut))
+                                            }),
+                                    )
                                     .on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -4929,7 +5803,9 @@ impl Render for Overview {
                 .rounded(px(4.0))
                 .cursor_pointer()
                 .text_size(crate::typography::ui_rems(11.0))
-                .when(active, |el| el.bg(theme.element_active).text_color(theme.text))
+                .when(active, |el| {
+                    el.bg(theme.element_active).text_color(theme.text)
+                })
                 .when(!active, |el| el.text_color(theme.text_muted))
                 .hover(|el| el.text_color(theme.text))
                 .child(SharedString::from(label))
@@ -4944,35 +5820,45 @@ impl Render for Overview {
             .p(px(2.0))
             .rounded(px(6.0))
             .bg(theme.element_hover.opacity(0.5))
-            .child(pill("overview-hide-stale", "Hide stale".into(), self.hide_stale).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.hide_stale = !this.hide_stale;
-                    this.view_prefs_changed(cx);
-                    this.rows_dirty = true;
-                    this.grouped_layout_cache = None;
-                    cx.notify();
-                }),
-            ))
-            .child(pill("overview-show-archived", "Show archived".into(), self.show_archived).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.show_archived = !this.show_archived;
-                    this.view_prefs_changed(cx);
-                    this.rows_dirty = true;
-                    this.grouped_layout_cache = None;
-                    cx.notify();
-                }),
-            ));
+            .child(
+                pill("overview-hide-stale", "Hide stale".into(), self.hide_stale).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.hide_stale = !this.hide_stale;
+                        this.view_prefs_changed(cx);
+                        this.rows_dirty = true;
+                        this.grouped_layout_cache = None;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                pill(
+                    "overview-show-archived",
+                    "Show archived".into(),
+                    self.show_archived,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.show_archived = !this.show_archived;
+                        this.view_prefs_changed(cx);
+                        this.rows_dirty = true;
+                        this.grouped_layout_cache = None;
+                        cx.notify();
+                    }),
+                ),
+            );
 
         let repo_filter = self.render_repo_filter(&theme, cx);
-        let key_toggle = pill("overview-legend-toggle", "Key".into(), self.legend_open).on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|this, _, _, cx| {
-                this.legend_open = !this.legend_open;
-                cx.notify();
-            }),
-        );
+        let key_toggle = pill("overview-legend-toggle", "Key".into(), self.legend_open)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.legend_open = !this.legend_open;
+                    cx.notify();
+                }),
+            );
 
         let mut toolbar = div()
             .flex()
@@ -5007,7 +5893,9 @@ impl Render for Overview {
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .text_size(crate::typography::ui_rems(10.5))
-                    .when(active, |el| el.bg(theme.element_active).text_color(theme.text))
+                    .when(active, |el| {
+                        el.bg(theme.element_active).text_color(theme.text)
+                    })
                     .when(!active, |el| el.text_color(theme.text_muted))
                     .child(SharedString::from(text))
                     .on_mouse_up(
@@ -5177,10 +6065,15 @@ impl Overview {
             .cursor_pointer()
             .text_size(crate::typography::ui_rems(11.0))
             .bg(theme.element_hover.opacity(0.5))
-            .when(active, |el| el.bg(theme.element_active).text_color(theme.text))
+            .when(active, |el| {
+                el.bg(theme.element_active).text_color(theme.text)
+            })
             .when(!active, |el| el.text_color(theme.text_muted))
             .hover(|el| el.text_color(theme.text))
-            .child(SharedString::from(format!("{} ▾", repo_filter_label(hidden))))
+            .child(SharedString::from(format!(
+                "{} ▾",
+                repo_filter_label(hidden)
+            )))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.repo_filter.note_trigger_press()),
@@ -5215,13 +6108,15 @@ impl Overview {
         };
         let keys = sorted_repo_keys(&self.known_repos);
         let list: Vec<gpui::AnyElement> = if keys.is_empty() {
-            vec![div()
-                .px(px(6.0))
-                .py(px(4.0))
-                .text_size(crate::typography::ui_rems(11.0))
-                .text_color(popup.text_muted)
-                .child(SharedString::from("No chats yet"))
-                .into_any_element()]
+            vec![
+                div()
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(popup.text_muted)
+                    .child(SharedString::from("No chats yet"))
+                    .into_any_element(),
+            ]
         } else {
             keys.into_iter()
                 .enumerate()
@@ -5250,7 +6145,10 @@ impl Overview {
                                 .justify_center()
                                 .text_size(crate::typography::ui_rems(9.0))
                                 .when(checked, |el| {
-                                    el.bg(popup.accent).border_color(popup.accent).text_color(gpui::white()).child("✓")
+                                    el.bg(popup.accent)
+                                        .border_color(popup.accent)
+                                        .text_color(gpui::white())
+                                        .child("✓")
                                 })
                                 .when(!checked, |el| el.border_color(popup.border_strong)),
                         )
@@ -5261,7 +6159,11 @@ impl Overview {
                                 .min_w_0()
                                 .truncate()
                                 .text_size(crate::typography::ui_rems(11.0))
-                                .text_color(if checked { popup.text } else { popup.text_muted })
+                                .text_color(if checked {
+                                    popup.text
+                                } else {
+                                    popup.text_muted
+                                })
                                 .child(SharedString::from(label)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -5284,15 +6186,23 @@ impl Overview {
                     .flex()
                     .gap(px(6.0))
                     .pb(px(4.0))
-                    .child(bulk("overview-repo-filter-all", "All").on_click(cx.listener(|this, _, _, cx| {
-                        this.hidden_repos.clear();
-                        this.repo_filter_changed(cx);
-                    })))
-                    .child(bulk("overview-repo-filter-none", "None").on_click(cx.listener(|this, _, _, cx| {
-                        let known = this.known_repos.clone();
-                        this.hidden_repos.extend(known);
-                        this.repo_filter_changed(cx);
-                    }))),
+                    .child(
+                        bulk("overview-repo-filter-all", "All").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.hidden_repos.clear();
+                                this.repo_filter_changed(cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        bulk("overview-repo-filter-none", "None").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                let known = this.known_repos.clone();
+                                this.hidden_repos.extend(known);
+                                this.repo_filter_changed(cx);
+                            },
+                        )),
+                    ),
             )
             .child(
                 div()
@@ -5304,7 +6214,11 @@ impl Overview {
                     .children(list),
             );
         trigger
-            .child(popover::anchored_menu_below("overview-repo-filter-menu", card.into_any_element(), closing))
+            .child(popover::anchored_menu_below(
+                "overview-repo-filter-menu",
+                card.into_any_element(),
+                closing,
+            ))
             .into_any_element()
     }
 
@@ -5381,7 +6295,9 @@ impl Overview {
                         .bg(theme.surface_raised)
                         .child(unread_done_ribbon(0.5)),
                 )
-                .child(SharedString::from("white left-edge ribbon: done, not looked at yet"))
+                .child(SharedString::from(
+                    "white left-edge ribbon: done, not looked at yet",
+                ))
                 .into_any_element(),
         );
         let category_rows = overview_grouping::CATEGORY_ORDER
@@ -5396,15 +6312,15 @@ impl Overview {
         let notes = [
             "Tile background tint = status color (same as the status dot) — a tinted tile scans faster than the dot alone.",
             "White left-edge ribbon = the chat finished and you haven't looked yet. Expanding the tile or opening its chat clears it; the next completion re-adds the ribbon.",
-            "Dimmed tile = stale: no activity for 24h and not working / waiting on you. \"Hide stale\" filters them out.",
+            "Dimmed tile = stale: no activity for 7 days and not working / waiting on you. \"Hide stale\" filters them out.",
             "\"not running\" = an imported Claude Code session with no live run in Zeron right now. Its transcript is intact; sending a message resumes it.",
             "Badge row = linked Linear ticket and/or GitHub PR; a PR badge shows its most urgent action (CI failing, merge conflict, changes requested, needs reviewer, ready to merge).",
-            "Links come from the branch (inferred), a PR created or mentioned in the chat, or you: \"Link PR / ticket…\" in the expanded detail (or the sidebar chat menu) takes a GitHub PR URL or a ticket id like ENG-1234. Hover a PR/ticket for its source; a pin marks manual links, and ✕ in the detail unlinks a stored one.",
+            "Links come from the branch (inferred), PRs created or mentioned in the chat, or you: \"Add PR / ticket…\" in the expanded detail (or the sidebar chat menu) takes a GitHub PR URL or a ticket id like ENG-1234. Add as many PRs as the chat needs. Hover a PR/ticket for its source; a pin marks manual links, and ✕ in the detail unlinks one stored link.",
             "\"Group by\" toggles combine — the first becomes columns, each further one subdivides into rows. Turn all off to return to your own layout.",
             "Click a tile or row = expand for branch/worktree, PR (reviewers, checks, review decision), ticket, last message, tools used, skills loaded, archive.",
             "Drag a tile (ungrouped canvas) = move it; positions are remembered across restarts.",
             "\"View full chat →\" = live chat side panel: read and reply without leaving the overview (the chat becomes the selected one). \"Open full chat →\" there jumps to the chat itself.",
-            "Small tiles under a card = its subagents, all of them (dot: blue running, green done). Hover for the full name; click one to peek at its transcript in a read-only side panel (a subagent can't be continued). ✕ or Escape closes it.",
+            "Small tiles under a card = its subagents (dot: blue running, green done). Cards show three plus a remainder count; hover the card to reveal the full stack. Hover a row for its full name; click one to peek at its transcript in a read-only side panel (a subagent can't be continued). ✕ or Escape closes it.",
             "Archive hides a chat from the default view (same as the sidebar's archive). \"Show archived\" brings archived chats back, dimmed.",
             "\"Repos\" hides whole repos everywhere (canvas, list, grouping, search). Search matches title, branch, last message, folder, ticket id and PR title, and zooms the canvas to 1-8 matches.",
             "\"My PRs\" opens a left sidebar of every open PR you authored (\u{26a1} actionable first, then by repo) beside the list or canvas, with PRs awaiting your review in a \"Needs my review\" section on top. Its count lights red when something needs you — CI failing, changes requested, a merge conflict, no reviewer ever requested (ready-to-merge alone doesn't count), or a review requested from you. The sidebar has its own search box that filters PRs by repo, title, number (123 or #123), branch and author (the toolbar search only filters chats). Click a section header to fold it; a PR search shows matches even inside folded sections. Clicking a PR with a linked chat opens that chat in the side panel and brings its tile/row into view; otherwise it opens the PR on GitHub.",
@@ -5459,7 +6375,11 @@ impl Overview {
         let truly_empty = self.unfiltered_count == 0;
         let (headline, detail) = if truly_empty {
             (
-                if self.show_archived { "No chats yet." } else { "No active chats." },
+                if self.show_archived {
+                    "No chats yet."
+                } else {
+                    "No active chats."
+                },
                 None,
             )
         } else {
@@ -5473,7 +6393,8 @@ impl Overview {
             if self.hide_stale {
                 active.push("hide stale".into());
             }
-            let detail = (!active.is_empty()).then(|| format!("Active filters: {}.", active.join(", ")));
+            let detail =
+                (!active.is_empty()).then(|| format!("Active filters: {}.", active.join(", ")));
             ("Every chat is hidden by the current filters.", detail)
         };
         let new_chat_button = truly_empty.then(|| self.render_new_chat_button(theme, cx));
@@ -5593,7 +6514,11 @@ fn lane_header(text: String, color: gpui::Hsla, depth: usize, zoom: f32) -> gpui
                 .pb(px(3.0 * zoom))
                 .border_b_1()
         })
-        .child(SharedString::from(if top { text.to_uppercase() } else { text }))
+        .child(SharedString::from(if top {
+            text.to_uppercase()
+        } else {
+            text
+        }))
 }
 
 impl Overview {
@@ -5623,7 +6548,11 @@ impl Overview {
         } else {
             let mut items: Vec<ListItem<'_>> = Vec::new();
             let refs: Vec<&OverviewRow> = rows.iter().collect();
-            flatten_partition(&overview_grouping::partition(refs, &self.active_groups), 0, &mut items);
+            flatten_partition(
+                &overview_grouping::partition(refs, &self.active_groups),
+                0,
+                &mut items,
+            );
             let mut out = Vec::new();
             let mut ix = 0usize;
             for item in items {
@@ -5632,19 +6561,19 @@ impl Overview {
                     // (`.lane-header` / `.lane-header.nested`): colored,
                     // underlined in its own color, uppercase+bold at the top
                     // level, smaller/thinner nested.
-                    ListItem::Header { label, color, depth, count } => out.push(
+                    ListItem::Header {
+                        label,
+                        color,
+                        depth,
+                        count,
+                    } => out.push(
                         div()
                             .flex()
                             .pl(px(10.0 + depth as f32 * 14.0))
                             .pr(px(10.0))
                             .pt(px(if depth == 0 { 14.0 } else { 8.0 }))
                             .pb(px(2.0))
-                            .child(lane_header(
-                                format!("{label} ({count})"),
-                                color,
-                                depth,
-                                1.0,
-                            ))
+                            .child(lane_header(format!("{label} ({count})"), color, depth, 1.0))
                             .into_any_element(),
                     ),
                     ListItem::Row(row) => {
@@ -5711,16 +6640,27 @@ impl Overview {
             .into();
         let dot = reference_status_color(row.status);
         let (icon, label) = status_style(row.status, row.origin.is_some());
-        let unread = is_unread_done(&self.acknowledged_done, &chat_id, row.status == ChatIndicator::Completed);
+        let unread = is_unread_done(
+            &self.acknowledged_done,
+            &chat_id,
+            row.status == ChatIndicator::Completed,
+        );
         let (dim, ribbon) = card_dimming(row.chat.archived, row.stale, unread);
         let is_expanded = self.expanded.contains(&chat_id);
         let category_badge = category_badge(row, 1.0);
+        let model = model_badge(&row.chat, theme, 1.0);
         let badges = self.badges_for(&chat_id, theme, 1.0);
-        let archive = (!row.chat.archived).then(|| self.archive_button(chat_id.clone(), theme, cx, 1.0));
+        let archive =
+            (!row.chat.archived).then(|| self.archive_button(chat_id.clone(), theme, cx, 1.0));
         let open_button = self.open_chat_button(chat_id.clone(), theme, cx, 1.0);
-        let subagent_tiles = self.subagent_tiles_for(&chat_id, theme, 1.0, cx);
-        let detail = is_expanded.then(|| self.expanded_detail_for(row, theme, chat_id.clone(), 1.0, cx));
+        let has_subagent_overflow = row.subagent_count > SUBAGENT_PREVIEW_LIMIT;
+        let show_all_subagents =
+            has_subagent_overflow && self.hovered_subagents.as_deref() == Some(chat_id.as_str());
+        let subagent_tiles = self.subagent_tiles_for(&chat_id, theme, 1.0, show_all_subagents, cx);
+        let detail =
+            is_expanded.then(|| self.expanded_detail_for(row, theme, chat_id.clone(), 1.0, cx));
         let toggle_id = chat_id.clone();
+        let hover_id = chat_id.clone();
         div()
             .id(("overview-row", ix))
             .debug_selector(|| "overview-list-row".into())
@@ -5744,12 +6684,26 @@ impl Overview {
             .border_1()
             .border_color(gpui::transparent_black())
             // The chat open in the side panel.
-            .when(self.panel_highlight.as_deref() == Some(chat_id.as_str()), |el| {
-                el.border_color(theme.accent)
-            })
+            .when(
+                self.panel_highlight.as_deref() == Some(chat_id.as_str()),
+                |el| el.border_color(theme.accent),
+            )
             .when(is_expanded, |el| el.bg(theme.element_hover.opacity(0.5)))
             .when_some(dim, |el, opacity| el.opacity(opacity))
             .hover(|el| el.bg(theme.element_hover))
+            .when(has_subagent_overflow, |el| {
+                el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        if this.hovered_subagents.as_deref() != Some(hover_id.as_str()) {
+                            this.hovered_subagents = Some(hover_id.clone());
+                            cx.notify();
+                        }
+                    } else if this.hovered_subagents.as_deref() == Some(hover_id.as_str()) {
+                        this.hovered_subagents = None;
+                        cx.notify();
+                    }
+                }))
+            })
             .when(ribbon, |el| el.child(unread_done_ribbon(1.0)))
             .child(
                 div()
@@ -5787,6 +6741,7 @@ impl Overview {
                                             .text_color(theme.text_muted.opacity(0.7))
                                             .child(cwd),
                                     )
+                                    .child(model)
                                     .child(
                                         div()
                                             .flex_none()
@@ -5800,7 +6755,11 @@ impl Overview {
                     )
                     // Same bar + label as the tile face, at a fixed width so
                     // the column lines up down the list.
-                    .child(div().flex_none().w(px(76.0)).child(context_meter(row.context_pct, theme, 1.0)))
+                    .child(div().flex_none().w(px(76.0)).child(context_meter(
+                        row.context_pct,
+                        theme,
+                        1.0,
+                    )))
                     .child(
                         div()
                             .flex_none()
@@ -5824,7 +6783,9 @@ impl Overview {
                         .children(subagent_tiles),
                 )
             })
-            .when_some(detail, |el, detail| el.child(div().px(px(10.0)).pb(px(8.0)).child(detail)))
+            .when_some(detail, |el, detail| {
+                el.child(div().px(px(10.0)).pb(px(8.0)).child(detail))
+            })
             .into_any_element()
     }
 
@@ -5896,6 +6857,7 @@ impl Overview {
         let tinted_border = theme.border.blend(dot.opacity(0.30));
         let badges = self.badges_for(&row.chat.id, theme, zoom);
         let category_badge = category_badge(row, zoom);
+        let model = model_badge(&row.chat, theme, zoom);
         let is_expanded = self.expanded.contains(&row.chat.id);
         div()
             .debug_selector(|| "overview-tile-body".into())
@@ -5915,9 +6877,10 @@ impl Overview {
             .border_1()
             .border_color(tinted_border)
             // The chat open in the side panel.
-            .when(self.panel_highlight.as_deref() == Some(row.chat.id.as_str()), |el| {
-                el.border_color(theme.accent)
-            })
+            .when(
+                self.panel_highlight.as_deref() == Some(row.chat.id.as_str()),
+                |el| el.border_color(theme.accent),
+            )
             .bg(tinted_bg)
             .shadow_sm()
             .hover(|el| el.border_color(dot.opacity(0.6)))
@@ -5934,7 +6897,13 @@ impl Overview {
                     .flex()
                     .items_center()
                     .gap(px(6.0 * zoom))
-                    .child(div().flex_none().size(px(7.0 * zoom)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(7.0 * zoom))
+                            .rounded_full()
+                            .bg(dot),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -5948,10 +6917,19 @@ impl Overview {
             )
             .child(
                 div()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(10.5 * zoom))
-                    .text_color(theme.text_muted.opacity(0.7))
-                    .child(cwd),
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0 * zoom))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(10.5 * zoom))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(cwd),
+                    )
+                    .child(model),
             )
             // `.fill-bar` + `.pct-label`, right under the title block like
             // the web's tile face.
@@ -6092,8 +7070,8 @@ impl Overview {
         // overlapping its neighbors by bumping its DOM z-index
         // (`session_canvas.html`'s `makeCard`, `card.style.zIndex = ++zTop`)
         // — the gpui equivalent of "paint on top" is "render last", so this
-        // collects `(is_expanded, element)` and stable-sorts expanded tiles
-        // to the end of the child list right before the previously-reported
+        // collects `(paint_on_top, element)` and stable-sorts expanded or
+        // subagent-hovered tiles to the end of the child list before the previously-reported
         // "expanded content hidden behind the tile below it" bug.
         let anim_now = Instant::now();
         let reduced = cx.reduce_motion();
@@ -6114,7 +7092,14 @@ impl Overview {
                 let pos = self.animated_tile_pos(&chat_id, target, anim_now, reduced);
                 let screen_x = pos.x * zoom + pan_x;
                 let screen_y = pos.y * zoom + pan_y;
-                let (board_w, board_h) = row.tile_size();
+                let has_subagent_overflow = row.subagent_count > SUBAGENT_PREVIEW_LIMIT;
+                let show_all_subagents = has_subagent_overflow
+                    && self.hovered_subagents.as_deref() == Some(chat_id.as_str());
+                let (board_w, board_h) = if show_all_subagents {
+                    row.hovered_tile_size()
+                } else {
+                    row.tile_size()
+                };
                 let (tile_w, tile_h) = (board_w * zoom, board_h * zoom);
                 // Skip building this tile's element at all when off-screen —
                 // see `tile_in_viewport`'s doc comment for why this has to
@@ -6130,23 +7115,36 @@ impl Overview {
                     return None;
                 }
                 let open_button = self.open_chat_button(chat_id.clone(), theme, cx, zoom);
-                let subagent_tiles = self.subagent_tiles_for(&chat_id, theme, zoom, cx);
+                let subagent_tiles =
+                    self.subagent_tiles_for(&chat_id, theme, zoom, show_all_subagents, cx);
                 let content = self.tile_body(&row, theme, now, zoom, open_button, subagent_tiles);
                 let archive = (!row.chat.archived)
                     .then(|| self.archive_button(chat_id.clone(), theme, cx, zoom));
                 let is_expanded = self.expanded.contains(&chat_id);
-                let detail = is_expanded.then(|| {
-                    self.expanded_detail_for(&row, theme, chat_id.clone(), zoom, cx)
-                });
+                let detail = is_expanded
+                    .then(|| self.expanded_detail_for(&row, theme, chat_id.clone(), zoom, cx));
                 let drag_id = chat_id.clone();
-                let element =
-                div()
+                let hover_id = chat_id.clone();
+                let element = div()
                     .id(("overview-tile", slot))
                     .absolute()
                     .left(px(screen_x))
                     .top(px(screen_y))
                     .w(px(tile_w))
                     .cursor_pointer()
+                    .when(has_subagent_overflow, |el| {
+                        el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                if this.hovered_subagents.as_deref() != Some(hover_id.as_str()) {
+                                    this.hovered_subagents = Some(hover_id.clone());
+                                    cx.notify();
+                                }
+                            } else if this.hovered_subagents.as_deref() == Some(hover_id.as_str()) {
+                                this.hovered_subagents = None;
+                                cx.notify();
+                            }
+                        }))
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -6175,7 +7173,7 @@ impl Overview {
                         el.child(div().absolute().top(px(4.0)).right(px(4.0)).child(archive))
                     })
                     .when_some(detail, |el, detail| el.child(detail));
-                Some((is_expanded, element))
+                Some((is_expanded || show_all_subagents, element))
             })
             .collect();
         self.prune_tile_motion(&present_ids.iter().map(String::as_str).collect());
@@ -6216,7 +7214,8 @@ impl Overview {
                     let moved_x = (cursor.0 - drag.down_cursor.0) / zoom;
                     let moved_y = (cursor.1 - drag.down_cursor.1) / zoom;
                     if !drag.committed
-                        && (moved_x.abs() >= DRAG_THRESHOLD_PX || moved_y.abs() >= DRAG_THRESHOLD_PX)
+                        && (moved_x.abs() >= DRAG_THRESHOLD_PX
+                            || moved_y.abs() >= DRAG_THRESHOLD_PX)
                     {
                         drag.committed = true;
                     }
@@ -6471,8 +7470,16 @@ impl Overview {
                     .w(px((*w + GROUP_BOX_PADDING * 2.0) * zoom))
                     .h(px((*h + GROUP_BOX_PADDING * 2.0) * zoom))
                     .rounded(px(if top { 14.0 } else { 8.0 } * zoom))
-                    .when(top, |el| el.border_2().border_color(color.opacity(0.32)).bg(color.opacity(0.06)))
-                    .when(!top, |el| el.border_1().border_color(color.opacity(0.26)).bg(color.opacity(0.05)))
+                    .when(top, |el| {
+                        el.border_2()
+                            .border_color(color.opacity(0.32))
+                            .bg(color.opacity(0.06))
+                    })
+                    .when(!top, |el| {
+                        el.border_1()
+                            .border_color(color.opacity(0.26))
+                            .bg(color.opacity(0.05))
+                    })
                     .into_any_element(),
             );
         }
@@ -6491,8 +7498,8 @@ impl Overview {
             );
         }
         // Same paint-order fix as flat mode (see that function's comment):
-        // gpui has no z-index primitive, so an expanded tile's extra height
-        // is rendered last among the tiles instead, so it paints over
+        // gpui has no z-index primitive, so an expanded or subagent-hovered
+        // tile's extra height is rendered last among the tiles, so it paints over
         // whichever neighbor its packed position happens to overlap. Real
         // height-aware repacking (feeding the expanded tile's actual taller
         // box into `pack_rects` so neighbors get pushed instead of
@@ -6524,7 +7531,14 @@ impl Overview {
                 reduced,
             );
             let (screen_x, screen_y) = to_screen(pos.x, pos.y);
-            let (board_w, board_h) = row.tile_size();
+            let has_subagent_overflow = row.subagent_count > SUBAGENT_PREVIEW_LIMIT;
+            let show_all_subagents = has_subagent_overflow
+                && self.hovered_subagents.as_deref() == Some(chat_id.as_str());
+            let (board_w, board_h) = if show_all_subagents {
+                row.hovered_tile_size()
+            } else {
+                row.tile_size()
+            };
             let (tile_w, tile_h) = (board_w * zoom, board_h * zoom);
             // Same viewport culling as flat mode — see `tile_in_viewport`'s
             // doc comment.
@@ -6536,14 +7550,18 @@ impl Overview {
                 continue;
             }
             let open_button = self.open_chat_button(chat_id.clone(), theme, cx, zoom);
-            let subagent_tiles = self.subagent_tiles_for(chat_id, theme, zoom, cx);
+            let subagent_tiles =
+                self.subagent_tiles_for(chat_id, theme, zoom, show_all_subagents, cx);
             let content = self.tile_body(row, theme, now, zoom, open_button, subagent_tiles);
-            let archive = (!row.chat.archived).then(|| self.archive_button(chat_id.clone(), theme, cx, zoom));
+            let archive =
+                (!row.chat.archived).then(|| self.archive_button(chat_id.clone(), theme, cx, zoom));
             let is_expanded = self.expanded.contains(chat_id);
-            let detail = is_expanded.then(|| self.expanded_detail_for(row, theme, chat_id.clone(), zoom, cx));
+            let detail = is_expanded
+                .then(|| self.expanded_detail_for(row, theme, chat_id.clone(), zoom, cx));
             let toggle_id = chat_id.clone();
+            let hover_id = chat_id.clone();
             tiles.push((
-                is_expanded,
+                is_expanded || show_all_subagents,
                 div()
                     .id(("overview-grouped-tile", slot))
                     .absolute()
@@ -6551,6 +7569,19 @@ impl Overview {
                     .top(px(screen_y))
                     .w(px(tile_w))
                     .cursor_pointer()
+                    .when(has_subagent_overflow, |el| {
+                        el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                if this.hovered_subagents.as_deref() != Some(hover_id.as_str()) {
+                                    this.hovered_subagents = Some(hover_id.clone());
+                                    cx.notify();
+                                }
+                            } else if this.hovered_subagents.as_deref() == Some(hover_id.as_str()) {
+                                this.hovered_subagents = None;
+                                cx.notify();
+                            }
+                        }))
+                    })
                     // No drag here (positions are algorithm-computed, not
                     // user-placed — see this fn's own doc comment), so a
                     // plain click always toggles expand; no threshold needed.
@@ -6727,11 +7758,15 @@ impl Overview {
                     })),
             );
 
-        let search_bar = div()
-            .flex_none()
-            .px(px(8.0))
-            .pt(px(8.0))
-            .child(popover::search_input_frame(theme, self.pr_search.clone().into_any_element()));
+        let search_bar =
+            div()
+                .flex_none()
+                .px(px(8.0))
+                .pt(px(8.0))
+                .child(popover::search_input_frame(
+                    theme,
+                    self.pr_search.clone().into_any_element(),
+                ));
 
         let body: gpui::AnyElement = if shown == 0 {
             let message = if total == 0 {
@@ -6773,7 +7808,12 @@ impl Overview {
                 std::collections::BTreeMap::new();
             for item in &all_items {
                 by_repo
-                    .entry(item.summary.repo.clone().unwrap_or_else(|| "unknown".to_string()))
+                    .entry(
+                        item.summary
+                            .repo
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )
                     .or_default()
                     .push(item.clone());
             }
@@ -6809,7 +7849,11 @@ impl Overview {
                 ));
             }
             for (repo, items) in &by_repo {
-                let label = format!("{} ({})", repo.rsplit('/').next().unwrap_or(repo), items.len());
+                let label = format!(
+                    "{} ({})",
+                    repo.rsplit('/').next().unwrap_or(repo),
+                    items.len()
+                );
                 sections.push(self.render_pr_section(
                     pr_repo_section_key(repo),
                     searching,
@@ -6899,7 +7943,9 @@ impl Overview {
             .flex_col()
             .child(
                 div()
-                    .id(SharedString::from(format!("overview-pr-section-{section_key}")))
+                    .id(SharedString::from(format!(
+                        "overview-pr-section-{section_key}"
+                    )))
                     .flex()
                     .items_center()
                     .gap(px(4.0))
@@ -6956,7 +8002,12 @@ impl Overview {
                 .map(pr_action_badge)
         };
         let author_label = review
-            .then(|| item.summary.author.as_deref().map(|login| format!("by {login}")))
+            .then(|| {
+                item.summary
+                    .author
+                    .as_deref()
+                    .map(|login| format!("by {login}"))
+            })
             .flatten();
         let jump = self.chat_for_pr_url(rows, item.summary.url.as_deref());
         let url = item.summary.url.clone();
@@ -6976,7 +8027,14 @@ impl Overview {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(div().flex_1().min_w_0().truncate().text_color(theme.text).child(title))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text)
+                            .child(title),
+                    )
                     .when_some(action_badge, |el, (label, color)| {
                         el.child(
                             div()
@@ -7002,12 +8060,16 @@ impl Overview {
                     .child(SharedString::from("·"))
                     .child(SharedString::from(state_label))
                     .when_some(author_label, |el, label| {
-                        el.child(SharedString::from("·")).child(SharedString::from(label))
+                        el.child(SharedString::from("·"))
+                            .child(SharedString::from(label))
                     }),
             );
 
         if let Some((chat_id, chat_title)) = jump {
-            let pr_source = self.link_status.get(&chat_id).and_then(|e| e.status.pr_source);
+            let pr_source = self
+                .link_status
+                .get(&chat_id)
+                .and_then(|e| e.status.pr_source);
             row = row.child(
                 link_source_hover(
                     div()
@@ -7020,7 +8082,9 @@ impl Overview {
                     LinkKind::Pr,
                     pr_source,
                 )
-                .when(pr_source == Some(ChatLinkSource::Manual), |el| el.child(manual_link_pin(theme.accent, 1.0)))
+                .when(pr_source == Some(ChatLinkSource::Manual), |el| {
+                    el.child(manual_link_pin(theme.accent, 1.0))
+                })
                 .child(SharedString::from(format!("→ {chat_title}"))),
             );
             // Jump in place: chat panel on the right + bring its tile/row
@@ -7033,7 +8097,9 @@ impl Overview {
                 div()
                     .text_size(crate::typography::ui_rems(10.0))
                     .text_color(theme.text_muted.opacity(0.5))
-                    .child(SharedString::from("No open chat for this PR — click to open on GitHub")),
+                    .child(SharedString::from(
+                        "No open chat for this PR — click to open on GitHub",
+                    )),
             );
             row = row.on_click(move |_, _, cx| {
                 cx.open_url(&url);
@@ -7059,11 +8125,17 @@ mod logic_tests {
     use super::*;
 
     fn pr(url: &str) -> ParsedLink {
-        ParsedLink { kind: LinkKind::Pr, value: url.to_string() }
+        ParsedLink {
+            kind: LinkKind::Pr,
+            value: url.to_string(),
+        }
     }
 
     fn ticket(id: &str) -> ParsedLink {
-        ParsedLink { kind: LinkKind::Ticket, value: id.to_string() }
+        ParsedLink {
+            kind: LinkKind::Ticket,
+            value: id.to_string(),
+        }
     }
 
     #[test]
@@ -7105,8 +8177,8 @@ mod logic_tests {
             "hello world",
             "ENG-",
             "ENG1234",
-            "E-1",              // one letter
-            "ABCDEFG-1",        // seven letters
+            "E-1",       // one letter
+            "ABCDEFG-1", // seven letters
             "ENG-12a",
             "ENG-1234 extra",
             "https://github.com/cofactr/zeron",
@@ -7123,13 +8195,34 @@ mod logic_tests {
     #[test]
     fn link_source_labels_cover_every_provenance() {
         use ChatLinkSource::*;
-        assert_eq!(link_source_label(LinkKind::Pr, Some(Manual)), "Linked manually");
-        assert_eq!(link_source_label(LinkKind::Ticket, Some(Manual)), "Linked manually");
-        assert_eq!(link_source_label(LinkKind::Pr, Some(CreatedInChat)), "PR created in this chat");
-        assert_eq!(link_source_label(LinkKind::Pr, Some(Mentioned)), "Mentioned in conversation");
-        assert_eq!(link_source_label(LinkKind::Ticket, Some(Mentioned)), "Mentioned in conversation");
-        assert_eq!(link_source_label(LinkKind::Pr, None), "Inferred from branch");
-        assert_eq!(link_source_label(LinkKind::Ticket, None), "Inferred from branch");
+        assert_eq!(
+            link_source_label(LinkKind::Pr, Some(Manual)),
+            "Linked manually"
+        );
+        assert_eq!(
+            link_source_label(LinkKind::Ticket, Some(Manual)),
+            "Linked manually"
+        );
+        assert_eq!(
+            link_source_label(LinkKind::Pr, Some(CreatedInChat)),
+            "PR created in this chat"
+        );
+        assert_eq!(
+            link_source_label(LinkKind::Pr, Some(Mentioned)),
+            "Mentioned in conversation"
+        );
+        assert_eq!(
+            link_source_label(LinkKind::Ticket, Some(Mentioned)),
+            "Mentioned in conversation"
+        );
+        assert_eq!(
+            link_source_label(LinkKind::Pr, None),
+            "Inferred from branch"
+        );
+        assert_eq!(
+            link_source_label(LinkKind::Ticket, None),
+            "Inferred from branch"
+        );
     }
 
     /// `CHAT_LINK_STATUS` wire shape with the new source fields — decoded
@@ -7138,19 +8231,100 @@ mod logic_tests {
     /// still decodes.
     #[test]
     fn chat_link_status_decodes_source_fields() {
-        let status: ChatLinkStatus = serde_json::from_value(serde_json::json!({
+        let status: OverviewLinkStatus = serde_json::from_value(serde_json::json!({
             "pr": null, "ticket": null, "isWorktree": false, "diffStat": null,
             "prSource": "created_in_chat", "ticketSource": "manual"
         }))
         .unwrap();
         assert_eq!(status.pr_source, Some(ChatLinkSource::CreatedInChat));
         assert_eq!(status.ticket_source, Some(ChatLinkSource::Manual));
-        let legacy: ChatLinkStatus = serde_json::from_value(serde_json::json!({
+        let legacy: OverviewLinkStatus = serde_json::from_value(serde_json::json!({
             "pr": null, "ticket": null, "isWorktree": false, "diffStat": null
         }))
         .unwrap();
         assert_eq!(legacy.pr_source, None);
         assert_eq!(legacy.ticket_source, None);
+    }
+
+    #[test]
+    fn chat_link_status_prefers_multi_pr_links_and_matches_every_url() {
+        let status: OverviewLinkStatus = serde_json::from_value(serde_json::json!({
+            "pr": null,
+            "ticket": null,
+            "prLinks": [
+                {
+                    "url": "https://github.com/a/b/pull/7",
+                    "source": "manual",
+                    "detail": null
+                },
+                {
+                    "url": "https://github.com/a/b/pull/8",
+                    "source": "mentioned",
+                    "detail": null
+                }
+            ]
+        }))
+        .unwrap();
+
+        let links = effective_pr_links(&status);
+        assert_eq!(links.len(), 2);
+        assert!(status_has_pr_url(&status, "https://github.com/a/b/pull/7"));
+        assert!(status_has_pr_url(&status, "https://github.com/a/b/pull/8"));
+        assert_eq!(link_fingerprint(&status).1.len(), 2);
+    }
+
+    #[test]
+    fn multi_pr_reply_appends_optimistically_and_removes_only_target() {
+        let mut status = OverviewLinkStatus::default();
+        let two: SetChatLinkReply = serde_json::from_value(serde_json::json!({
+            "linkedPrLinks": [
+                {"url": "https://github.com/a/b/pull/7", "source": "manual"},
+                {"url": "https://github.com/a/b/pull/8", "source": "manual"}
+            ]
+        }))
+        .unwrap();
+        apply_link_reply(&mut status, LinkKind::Pr, &two);
+        assert_eq!(effective_pr_links(&status).len(), 2);
+        assert_eq!(
+            status.pr_links[0].detail.as_ref().map(|pr| pr.number),
+            Some(7)
+        );
+
+        let one: SetChatLinkReply = serde_json::from_value(serde_json::json!({
+            "linkedPrLinks": [
+                {"url": "https://github.com/a/b/pull/8", "source": "manual"}
+            ]
+        }))
+        .unwrap();
+        apply_link_reply(&mut status, LinkKind::Pr, &one);
+        assert_eq!(effective_pr_links(&status).len(), 1);
+        assert!(!status_has_pr_url(&status, "https://github.com/a/b/pull/7"));
+        assert!(status_has_pr_url(&status, "https://github.com/a/b/pull/8"));
+    }
+
+    #[test]
+    fn multi_pr_refetch_keeps_each_pending_placeholder_by_url() {
+        let previous = OverviewLinkStatus {
+            pr_links: vec![OverviewPrLink {
+                url: "https://github.com/a/b/pull/8".into(),
+                source: Some(ChatLinkSource::Manual),
+                detail: Some(placeholder_pr("https://github.com/a/b/pull/8")),
+            }],
+            ..Default::default()
+        };
+        let next = OverviewLinkStatus {
+            pr_links: vec![OverviewPrLink {
+                url: "https://github.com/a/b/pull/8".into(),
+                source: Some(ChatLinkSource::Manual),
+                detail: None,
+            }],
+            ..Default::default()
+        };
+        let merged = merge_refetched_link(Some(&previous), next);
+        assert_eq!(
+            merged.pr_links[0].detail.as_ref().map(|pr| pr.number),
+            Some(8)
+        );
     }
 
     #[test]
@@ -7160,15 +8334,21 @@ mod logic_tests {
             "linkedTicketId": null, "linkedTicketSource": null
         }))
         .unwrap();
-        let mut status = ChatLinkStatus::default();
+        let mut status = OverviewLinkStatus::default();
         apply_link_reply(&mut status, LinkKind::Pr, &reply);
         let placeholder = status.pr.as_ref().unwrap();
         assert_eq!(placeholder.number, 7);
-        assert!(placeholder.action_reasons().is_empty(), "placeholder must not badge");
+        assert!(
+            placeholder.action_reasons().is_empty(),
+            "placeholder must not badge"
+        );
         assert_eq!(status.pr_source, Some(ChatLinkSource::Manual));
 
         // Refetch lands before the engine cached the PR detail: keep ours.
-        let refetched = ChatLinkStatus { pr_source: Some(ChatLinkSource::Manual), ..Default::default() };
+        let refetched = OverviewLinkStatus {
+            pr_source: Some(ChatLinkSource::Manual),
+            ..Default::default()
+        };
         let merged = merge_refetched_link(Some(&status), refetched);
         assert_eq!(merged.pr.as_ref().map(|p| p.number), Some(7));
 
@@ -7179,13 +8359,16 @@ mod logic_tests {
             ..Default::default()
         };
         apply_link_reply(&mut status, LinkKind::Ticket, &set);
-        assert_eq!(status.ticket.as_ref().map(|t| t.identifier.as_str()), Some("ENG-9"));
+        assert_eq!(
+            status.ticket.as_ref().map(|t| t.identifier.as_str()),
+            Some("ENG-9")
+        );
         apply_link_reply(&mut status, LinkKind::Ticket, &SetChatLinkReply::default());
         assert!(status.ticket.is_none());
         assert_eq!(status.ticket_source, None);
 
         // Cleared (no source) refetch never resurrects the old value.
-        let merged = merge_refetched_link(Some(&status), ChatLinkStatus::default());
+        let merged = merge_refetched_link(Some(&status), OverviewLinkStatus::default());
         assert!(merged.pr.is_none());
     }
 
@@ -7222,7 +8405,10 @@ mod logic_tests {
         assert_eq!(decoded[0].agent_id, "a21f1650e0d5284f6");
         assert_eq!(decoded[0].agent_type.as_deref(), Some("fork"));
         assert_eq!(decoded[0].status, SubagentStatus::Running);
-        assert_eq!(decoded[0].display_name(), "Research slash and @ mention semantics");
+        assert_eq!(
+            decoded[0].display_name(),
+            "Research slash and @ mention semantics"
+        );
         assert_eq!(decoded[1].description, None);
         assert_eq!(decoded[1].status, SubagentStatus::Done);
         // Web name fallback: description || agent_type || id.
@@ -7230,8 +8416,14 @@ mod logic_tests {
         assert_eq!(decoded[2].display_name(), "Explore");
         assert_eq!(decoded[2].status, SubagentStatus::Done);
         assert_eq!(decoded[3].status, SubagentStatus::Done);
-        assert_eq!(SubagentStatus::Running.color(), reference_status_color(ChatIndicator::Working));
-        assert_eq!(SubagentStatus::Done.color(), reference_status_color(ChatIndicator::Completed));
+        assert_eq!(
+            SubagentStatus::Running.color(),
+            reference_status_color(ChatIndicator::Working)
+        );
+        assert_eq!(
+            SubagentStatus::Done.color(),
+            reference_status_color(ChatIndicator::Completed)
+        );
     }
 
     /// The pinned `READ_SUBAGENT_TRANSCRIPT` reply shape decodes, with the
@@ -7255,7 +8447,10 @@ mod logic_tests {
         assert_eq!(t.turns.len(), 3);
         assert_eq!(t.turns[0].role, "user");
         assert_eq!(t.turns[0].text.as_deref(), Some("Find the bug\nin foo.rs"));
-        assert_eq!(t.turns[0].timestamp.as_deref(), Some("2026-09-29T10:15:00Z"));
+        assert_eq!(
+            t.turns[0].timestamp.as_deref(),
+            Some("2026-09-29T10:15:00Z")
+        );
         assert!(!format_turn_time(t.turns[0].timestamp.as_deref()).is_empty());
         assert_eq!(t.turns[1].timestamp, None);
         assert_eq!(format_turn_time(None), "");
@@ -7263,12 +8458,21 @@ mod logic_tests {
         assert_eq!(
             t.turns[1].tools,
             vec![
-                TranscriptTool { name: "Read".into(), input_preview: "foo.rs".into(), result_preview: Some("fn foo() {}".into()) },
-                TranscriptTool { name: "Bash".into(), input_preview: "cargo test".into(), result_preview: None },
+                TranscriptTool {
+                    name: "Read".into(),
+                    input_preview: "foo.rs".into(),
+                    result_preview: Some("fn foo() {}".into())
+                },
+                TranscriptTool {
+                    name: "Bash".into(),
+                    input_preview: "cargo test".into(),
+                    result_preview: None
+                },
             ]
         );
         // `model: null` and an empty object both decode.
-        let t: SubagentTranscript = serde_json::from_value(serde_json::json!({"turns": [], "model": null})).unwrap();
+        let t: SubagentTranscript =
+            serde_json::from_value(serde_json::json!({"turns": [], "model": null})).unwrap();
         assert_eq!(t, SubagentTranscript::default());
         let t: SubagentTranscript = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(t.turns.is_empty());
@@ -7297,7 +8501,10 @@ mod logic_tests {
 
     #[test]
     fn fenced_code_splits_out_of_plain_text() {
-        assert_eq!(split_fenced_code("just text\nline 2"), vec![(false, "just text\nline 2".to_string())]);
+        assert_eq!(
+            split_fenced_code("just text\nline 2"),
+            vec![(false, "just text\nline 2".to_string())]
+        );
         assert_eq!(
             split_fenced_code("before\n```rust\nfn a() {}\n```\nafter"),
             vec![
@@ -7307,7 +8514,10 @@ mod logic_tests {
             ]
         );
         // Unterminated fence runs to the end.
-        assert_eq!(split_fenced_code("```\nx\ny"), vec![(true, "x\ny".to_string())]);
+        assert_eq!(
+            split_fenced_code("```\nx\ny"),
+            vec![(true, "x\ny".to_string())]
+        );
         assert!(split_fenced_code("").is_empty());
     }
 
@@ -7334,7 +8544,11 @@ mod logic_tests {
         assert_eq!(repo_key(Some(cwd)), "agent-mode-tools");
 
         // Trailing slash on the recorded root is stripped like a cwd's.
-        std::fs::write(dir.path().join(".workspace-root"), "/Users/m/Projects/zeron/\n").unwrap();
+        std::fs::write(
+            dir.path().join(".workspace-root"),
+            "/Users/m/Projects/zeron/\n",
+        )
+        .unwrap();
         assert_eq!(repo_key(Some(cwd)), "zeron");
     }
 
@@ -7357,6 +8571,51 @@ mod logic_tests {
         std::fs::remove_file(dir.path().join(".workspace-root")).unwrap();
         std::fs::create_dir(dir.path().join(".workspace-root")).unwrap();
         assert_eq!(repo_key(Some(cwd)), basename);
+    }
+
+    #[test]
+    fn worktree_repo_key_uses_owning_space_without_workspace_root_marker() {
+        use chrono::TimeZone;
+
+        let space = Space {
+            id: "workspace-space".into(),
+            device_id: "device".into(),
+            path: "/Users/mikey/Projects/cofactr/workspace".into(),
+            name: None,
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: Some("main-checkout".into()),
+            created_at: Utc.timestamp_opt(0, 0).unwrap(),
+        };
+        let mut chat = row(
+            "chat",
+            "/Users/mikey/.zeron/worktrees/workspace/swift-otter",
+            None,
+        )
+        .chat;
+        chat.space_id = Some(space.id.clone());
+
+        assert_eq!(repo_key_for_chat(&chat, Some(&space)), "workspace");
+    }
+
+    #[test]
+    fn owning_space_does_not_change_ordinary_cwd_repo_key() {
+        use chrono::TimeZone;
+
+        let space = Space {
+            id: "workspace-space".into(),
+            device_id: "device".into(),
+            path: "/Users/mikey/Projects/cofactr/workspace/".into(),
+            name: Some("Custom project name".into()),
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: Some("main-checkout".into()),
+            created_at: Utc.timestamp_opt(0, 0).unwrap(),
+        };
+        let chat = row("chat", "/Users/mikey/Projects/cofactr/workspace", None).chat;
+
+        assert_eq!(repo_key_for_chat(&chat, Some(&space)), "workspace");
+        assert_eq!(repo_key_for_chat(&chat, None), "workspace");
     }
 
     #[test]
@@ -7390,19 +8649,34 @@ mod logic_tests {
 
     #[test]
     fn repo_list_is_alphabetical_with_none_last() {
-        let known: BTreeSet<String> = [overview_grouping::NONE_KEY, "zeron", "agent-mode-tools", "ui"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let known: BTreeSet<String> = [
+            overview_grouping::NONE_KEY,
+            "zeron",
+            "agent-mode-tools",
+            "ui",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         assert_eq!(
             sorted_repo_keys(&known),
-            vec!["agent-mode-tools", "ui", "zeron", overview_grouping::NONE_KEY]
+            vec![
+                "agent-mode-tools",
+                "ui",
+                "zeron",
+                overview_grouping::NONE_KEY
+            ]
         );
     }
 
     #[test]
     fn search_is_case_insensitive_substring_over_present_fields() {
-        let fields = [Some("Fix Login Bug"), None, Some("/Users/m/ui"), Some("ENG-42")];
+        let fields = [
+            Some("Fix Login Bug"),
+            None,
+            Some("/Users/m/ui"),
+            Some("ENG-42"),
+        ];
         assert!(matches_search("", &fields));
         assert!(matches_search("login", &fields));
         assert!(matches_search("eng-42", &fields));
@@ -7428,7 +8702,8 @@ mod logic_tests {
     #[test]
     fn fit_view_frames_bbox_with_padding_and_centers() {
         // One 260x118 tile at (100, 50) in a 1000x800 viewport.
-        let (zoom, pan) = fit_view_to_rects(&[(100.0, 50.0, 260.0, 118.0)], (1000.0, 800.0)).unwrap();
+        let (zoom, pan) =
+            fit_view_to_rects(&[(100.0, 50.0, 260.0, 118.0)], (1000.0, 800.0)).unwrap();
         // content = 260+160 x 118+160 = 420 x 278 → min(1000/420, 800/278)
         // = 2.38 → clamped to ZOOM_MAX.
         assert_eq!(zoom, ZOOM_MAX);
@@ -7469,7 +8744,9 @@ mod logic_tests {
         let (min_x, min_y, max_x, max_y) = (0.0_f32, 0.0_f32, 740.0_f32, 390.0_f32);
         let content_w = max_x - min_x + FIT_PADDING * 2.0;
         let content_h = max_y - min_y + FIT_PADDING * 2.0;
-        let expected_zoom = (viewport.0 / content_w).min(viewport.1 / content_h).clamp(ZOOM_MIN, ZOOM_MAX);
+        let expected_zoom = (viewport.0 / content_w)
+            .min(viewport.1 / content_h)
+            .clamp(ZOOM_MIN, ZOOM_MAX);
         assert!((zoom - expected_zoom).abs() < 1e-4);
         // The bbox midpoint lands on the (narrowed) viewport's own center.
         let (cx, cy) = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
@@ -7521,7 +8798,12 @@ mod logic_tests {
 
     #[test]
     fn pr_search_matches_repo_title_number_and_branch() {
-        let pr = pr_item(1234, "cofactr/Zeron", "Fix Login Redirect", Some("mikey/login-fix"));
+        let pr = pr_item(
+            1234,
+            "cofactr/Zeron",
+            "Fix Login Redirect",
+            Some("mikey/login-fix"),
+        );
         // Empty query = everything.
         assert!(pr_matches_search("", &pr));
         // Repo, either half, case-insensitive (query arrives lowercased).
@@ -7576,17 +8858,31 @@ mod logic_tests {
     #[test]
     fn pr_section_search_overrides_collapsed_state() {
         let collapsed = BTreeSet::from([PR_SECTION_NEEDS_ACTION.to_string()]);
-        assert!(!pr_section_expanded(&collapsed, PR_SECTION_NEEDS_ACTION, false));
-        assert!(pr_section_expanded(&collapsed, PR_SECTION_NEEDS_ACTION, true));
-        assert!(pr_section_expanded(&collapsed, PR_SECTION_NEEDS_REVIEW, false));
+        assert!(!pr_section_expanded(
+            &collapsed,
+            PR_SECTION_NEEDS_ACTION,
+            false
+        ));
+        assert!(pr_section_expanded(
+            &collapsed,
+            PR_SECTION_NEEDS_ACTION,
+            true
+        ));
+        assert!(pr_section_expanded(
+            &collapsed,
+            PR_SECTION_NEEDS_REVIEW,
+            false
+        ));
     }
 
     #[test]
     fn pr_sidebar_flag_restores_and_ignores_unknown_entries() {
         assert!(!pr_sidebar_open_from_flags(&BTreeSet::new()));
-        let junk: BTreeSet<String> = ["viewMode:myPrs".to_string(), "somethingElse".to_string()].into();
+        let junk: BTreeSet<String> =
+            ["viewMode:myPrs".to_string(), "somethingElse".to_string()].into();
         assert!(!pr_sidebar_open_from_flags(&junk));
-        let on: BTreeSet<String> = [PR_SIDEBAR_FLAG.to_string(), "somethingElse".to_string()].into();
+        let on: BTreeSet<String> =
+            [PR_SIDEBAR_FLAG.to_string(), "somethingElse".to_string()].into();
         assert!(pr_sidebar_open_from_flags(&on));
     }
 
@@ -7608,13 +8904,46 @@ mod logic_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[gpui::test]
+    fn pr_sidebar_shortcut_opens_then_toggles_closed(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let overview = cx.new(|cx| {
+            Overview::new(
+                state,
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            )
+        });
+
+        overview.update(cx, |overview, cx| {
+            overview.open_pr_sidebar(cx);
+            assert!(overview.pr_sidebar_open);
+            overview.toggle_pr_sidebar(cx);
+            assert!(!overview.pr_sidebar_open);
+            overview.toggle_pr_sidebar(cx);
+            assert!(overview.pr_sidebar_open);
+        });
+    }
+
     #[test]
     fn view_prefs_round_trip_through_the_flag_set_and_keep_other_flags() {
         let prefs = ViewPrefs {
             canvas: true,
             hide_stale: true,
             show_archived: true,
-            groups: vec![GroupDimension::Origin, GroupDimension::Repo, GroupDimension::Category],
+            groups: vec![
+                GroupDimension::Origin,
+                GroupDimension::Repo,
+                GroupDimension::Category,
+            ],
         };
         let mut flags: BTreeSet<String> = [
             PR_SIDEBAR_FLAG.to_string(),
@@ -7623,7 +8952,11 @@ mod logic_tests {
         ]
         .into();
         apply_view_prefs_to_flags(&mut flags, &prefs);
-        assert_eq!(view_prefs_from_flags(&flags), prefs, "activation order survives");
+        assert_eq!(
+            view_prefs_from_flags(&flags),
+            prefs,
+            "activation order survives"
+        );
         assert!(flags.contains("groupBy:origin,repo,category"));
         // Unrelated flags survive and don't read as view prefs.
         assert!(pr_sidebar_open_from_flags(&flags));
@@ -7637,29 +8970,59 @@ mod logic_tests {
         assert!(pr_sidebar_open_from_flags(&flags));
         // Changing the grouping replaces (never accumulates) the groupBy entry.
         let mut flags = BTreeSet::new();
-        apply_view_prefs_to_flags(&mut flags, &ViewPrefs { groups: vec![GroupDimension::Repo], ..Default::default() });
-        apply_view_prefs_to_flags(&mut flags, &ViewPrefs { groups: vec![GroupDimension::Ticket], ..Default::default() });
+        apply_view_prefs_to_flags(
+            &mut flags,
+            &ViewPrefs {
+                groups: vec![GroupDimension::Repo],
+                ..Default::default()
+            },
+        );
+        apply_view_prefs_to_flags(
+            &mut flags,
+            &ViewPrefs {
+                groups: vec![GroupDimension::Ticket],
+                ..Default::default()
+            },
+        );
         assert_eq!(flags, BTreeSet::from(["groupBy:ticket".to_string()]));
     }
 
     #[test]
     fn view_prefs_defaults_and_junk_degrade_gracefully() {
-        assert_eq!(view_prefs_from_flags(&BTreeSet::new()), ViewPrefs::default());
-        let junk: BTreeSet<String> =
-            ["groupBy:bogus,repo,repo,,Origin, ticket".to_string(), "viewMode:myPrs".to_string()].into();
+        assert_eq!(
+            view_prefs_from_flags(&BTreeSet::new()),
+            ViewPrefs::default()
+        );
+        let junk: BTreeSet<String> = [
+            "groupBy:bogus,repo,repo,,Origin, ticket".to_string(),
+            "viewMode:myPrs".to_string(),
+        ]
+        .into();
         let prefs = view_prefs_from_flags(&junk);
         // Unknown dropped, duplicate dropped, whitespace trimmed, case-sensitive keys.
-        assert_eq!(prefs.groups, vec![GroupDimension::Repo, GroupDimension::Ticket]);
+        assert_eq!(
+            prefs.groups,
+            vec![GroupDimension::Repo, GroupDimension::Ticket]
+        );
         assert!(!prefs.canvas);
         // Every dimension's key round-trips.
-        for dim in [GroupDimension::Category, GroupDimension::Origin, GroupDimension::Repo, GroupDimension::Ticket] {
-            assert_eq!(GroupDimension::from_persist_key(dim.persist_key()), Some(dim));
+        for dim in [
+            GroupDimension::Category,
+            GroupDimension::Origin,
+            GroupDimension::Repo,
+            GroupDimension::Ticket,
+        ] {
+            assert_eq!(
+                GroupDimension::from_persist_key(dim.persist_key()),
+                Some(dim)
+            );
         }
     }
 
     #[test]
     fn view_prefs_round_trip_through_the_string_set_file() {
-        let dir = std::env::temp_dir().join(format!("zeron-overview-viewprefs-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("zeron-overview-viewprefs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let prefs = ViewPrefs {
             canvas: true,
@@ -7667,9 +9030,11 @@ mod logic_tests {
             show_archived: true,
             groups: vec![GroupDimension::Ticket, GroupDimension::Category],
         };
-        let mut flags = overview_positions::load_string_set(&dir, overview_positions::UI_FLAGS_FILE);
+        let mut flags =
+            overview_positions::load_string_set(&dir, overview_positions::UI_FLAGS_FILE);
         apply_view_prefs_to_flags(&mut flags, &prefs);
-        overview_positions::save_string_set(&dir, overview_positions::UI_FLAGS_FILE, &flags).unwrap();
+        overview_positions::save_string_set(&dir, overview_positions::UI_FLAGS_FILE, &flags)
+            .unwrap();
         let loaded = overview_positions::load_string_set(&dir, overview_positions::UI_FLAGS_FILE);
         assert_eq!(view_prefs_from_flags(&loaded), prefs);
         let _ = std::fs::remove_dir_all(&dir);
@@ -7677,17 +9042,46 @@ mod logic_tests {
 
     #[test]
     fn stale_repo_filter_detection() {
-        let set = |keys: &[&str]| -> BTreeSet<String> { keys.iter().map(|k| k.to_string()).collect() };
+        let set =
+            |keys: &[&str]| -> BTreeSet<String> { keys.iter().map(|k| k.to_string()).collect() };
         // No chats known yet: says nothing.
-        assert!(!restored_repo_filter_hides_everything(&set(&["a"]), &set(&[])));
+        assert!(!restored_repo_filter_hides_everything(
+            &set(&["a"]),
+            &set(&[])
+        ));
         // Names only repos that no longer have chats: hides nothing.
-        assert!(!restored_repo_filter_hides_everything(&set(&["gone"]), &set(&["a", "b"])));
+        assert!(!restored_repo_filter_hides_everything(
+            &set(&["gone"]),
+            &set(&["a", "b"])
+        ));
         // Partial hide is a legitimate filter.
-        assert!(!restored_repo_filter_hides_everything(&set(&["a"]), &set(&["a", "b"])));
+        assert!(!restored_repo_filter_hides_everything(
+            &set(&["a"]),
+            &set(&["a", "b"])
+        ));
         // Hides every repo that has chats.
-        assert!(restored_repo_filter_hides_everything(&set(&["a", "b", "gone"]), &set(&["a", "b"])));
+        assert!(restored_repo_filter_hides_everything(
+            &set(&["a", "b", "gone"]),
+            &set(&["a", "b"])
+        ));
         // Nothing hidden.
-        assert!(!restored_repo_filter_hides_everything(&set(&[]), &set(&["a"])));
+        assert!(!restored_repo_filter_hides_everything(
+            &set(&[]),
+            &set(&["a"])
+        ));
+    }
+
+    #[test]
+    fn chats_become_stale_only_after_a_full_week_of_inactivity() {
+        let now = Utc::now();
+        let mut chat = row("chat", "/repo", None).chat;
+        chat.last_message_at = Some(now - chrono::Duration::days(7));
+        assert!(!is_stale(&chat, ChatIndicator::Idle, now));
+
+        chat.last_message_at = Some(now - chrono::Duration::days(7) - chrono::Duration::seconds(1));
+        assert!(is_stale(&chat, ChatIndicator::Idle, now));
+        assert!(!is_stale(&chat, ChatIndicator::Working, now));
+        assert!(!is_stale(&chat, ChatIndicator::AwaitingInput, now));
     }
 
     /// Build an `Overview` window over `state` (seeded with chats in the
@@ -7700,7 +9094,13 @@ mod logic_tests {
         let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
         let state = state.clone();
         let (overview, vcx) = cx.add_window_view(move |_, cx| {
-            Overview::new(state, gpui::WeakEntity::new_invalid(), transcript, composer, cx)
+            Overview::new(
+                state,
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            )
         });
         vcx.run_until_parked();
         (overview, vcx)
@@ -7762,7 +9162,10 @@ mod logic_tests {
             assert_eq!(o.view_mode, ViewMode::Canvas);
             assert!(o.hide_stale);
             assert!(o.show_archived);
-            assert_eq!(o.active_groups, vec![GroupDimension::Origin, GroupDimension::Category]);
+            assert_eq!(
+                o.active_groups,
+                vec![GroupDimension::Origin, GroupDimension::Category]
+            );
             assert_eq!(o.hidden_repos, BTreeSet::from(["beta".to_string()]));
         });
 
@@ -7791,7 +9194,8 @@ mod logic_tests {
     fn restored_stale_repo_filter_degrades_gracefully(cx: &mut gpui::TestAppContext) {
         let save = |dir: &std::path::Path, keys: &[&str]| {
             let set: BTreeSet<String> = keys.iter().map(|k| k.to_string()).collect();
-            overview_positions::save_string_set(dir, overview_positions::HIDDEN_REPOS_FILE, &set).unwrap();
+            overview_positions::save_string_set(dir, overview_positions::HIDDEN_REPOS_FILE, &set)
+                .unwrap();
         };
 
         // Hides every repo that has chats (plus one that vanished) -> reset.
@@ -7804,7 +9208,10 @@ mod logic_tests {
             assert_eq!(rows.len(), 2, "nothing is filtered out invisibly");
             assert!(o.hidden_repos.is_empty());
         });
-        assert!(overview_positions::load_string_set(dir.path(), overview_positions::HIDDEN_REPOS_FILE).is_empty());
+        assert!(
+            overview_positions::load_string_set(dir.path(), overview_positions::HIDDEN_REPOS_FILE)
+                .is_empty()
+        );
 
         // Only a vanished repo: no crash, nothing hidden, entry left alone.
         let dir = tempfile::tempdir().unwrap();
@@ -7846,7 +9253,13 @@ mod logic_tests {
         .unwrap();
         assert_eq!(
             reply,
-            ReclassifyOtherReply { examined: 17, reclassified: 5, unchanged: 12, jev_calls: 17, deferred: 0 }
+            ReclassifyOtherReply {
+                examined: 17,
+                reclassified: 5,
+                unchanged: 12,
+                jev_calls: 17,
+                ..Default::default()
+            }
         );
         // Missing fields degrade to 0 rather than failing the decode.
         let empty: ReclassifyOtherReply = serde_json::from_value(serde_json::json!({})).unwrap();
@@ -7855,13 +9268,53 @@ mod logic_tests {
 
     #[test]
     fn reclassify_summary_reports_counts_and_hints_when_more_remain() {
-        let reply = ReclassifyOtherReply { examined: 17, reclassified: 5, unchanged: 12, jev_calls: 17, deferred: 0 };
+        let reply = ReclassifyOtherReply {
+            examined: 17,
+            reclassified: 5,
+            unchanged: 12,
+            jev_calls: 17,
+            ..Default::default()
+        };
         assert_eq!(reclassify_summary(&reply), "5 reclassified, 12 unchanged");
-        let capped = ReclassifyOtherReply { examined: 60, reclassified: 40, unchanged: 10, jev_calls: 50, deferred: 10 };
-        assert_eq!(reclassify_summary(&capped), "40 reclassified, 10 unchanged (more remaining \u{2014} run again)");
-        assert_eq!(reclassify_summary(&ReclassifyOtherReply::default()), "Nothing to reclassify");
-        let offline = ReclassifyOtherReply { examined: 3, unchanged: 3, ..Default::default() };
-        assert_eq!(reclassify_summary(&offline), "TypeSafe unavailable, nothing changed");
+        let detailed = ReclassifyOtherReply {
+            examined: 5,
+            reclassified: 1,
+            unchanged: 4,
+            confirmed_other: 2,
+            inconclusive: 1,
+            failed: 1,
+            jev_calls: 5,
+            deferred: 0,
+        };
+        assert_eq!(
+            reclassify_summary(&detailed),
+            "1 reclassified, 2 remained Other, 1 inconclusive, 1 failed"
+        );
+        let capped = ReclassifyOtherReply {
+            examined: 60,
+            reclassified: 40,
+            unchanged: 10,
+            jev_calls: 50,
+            deferred: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            reclassify_summary(&capped),
+            "40 reclassified, 10 unchanged (more remaining \u{2014} run again)"
+        );
+        assert_eq!(
+            reclassify_summary(&ReclassifyOtherReply::default()),
+            "Nothing to reclassify"
+        );
+        let offline = ReclassifyOtherReply {
+            examined: 3,
+            unchanged: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            reclassify_summary(&offline),
+            "TypeSafe unavailable, nothing changed"
+        );
     }
 
     #[test]
@@ -7869,27 +9322,91 @@ mod logic_tests {
         assert_eq!(reclassify_button_view(0, &ReclassifyState::Idle), None);
         assert_eq!(
             reclassify_button_view(3, &ReclassifyState::Idle),
-            Some(("Reclassify 'other' (3)".to_string(), true))
+            Some(("Reclassify 'other'".to_string(), true))
         );
         assert_eq!(
             reclassify_button_view(3, &ReclassifyState::Running),
             Some(("Reclassifying\u{2026}".to_string(), false))
         );
         // The result stays visible even once the count drops to zero.
-        let done = ReclassifyState::Done { text: "2 reclassified, 1 unchanged".into(), until: Instant::now() };
+        let done = ReclassifyState::Done {
+            text: "2 reclassified, 1 unchanged".into(),
+            until: Instant::now(),
+        };
         assert_eq!(
             reclassify_button_view(0, &done),
             Some(("2 reclassified, 1 unchanged".to_string(), false))
         );
-        assert_eq!(count_other_rows([Some("other"), Some("debug"), None, Some("other")].into_iter()), 2);
+        assert_eq!(
+            count_other_rows([Some("other"), Some("debug"), None, Some("other")].into_iter()),
+            2
+        );
     }
 
-    /// End to end: the button counts `other` chats, a click issues
+    #[gpui::test]
+    fn embedded_chat_panel_exposes_and_copies_chat_identity(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            let mut chat = row_ex("chat-7", "/r", None, 0, false).chat;
+            chat.title = Some("Fix login".into());
+            chat.harness_session_id = Some("sess-9".into());
+            chat.last_message_at = Some(Utc::now());
+            state.chats = vec![chat];
+            state.selected_chat = Some("chat-7".into());
+        });
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let (overview, vcx) = cx.add_window_view(|_, cx| {
+            Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            )
+        });
+        overview.update(vcx, |overview, cx| {
+            overview.chat_panel_open = true;
+            let theme = Theme::of(cx).clone();
+            assert!(overview.render_chat_panel(&theme, cx).is_some());
+            overview.copy_panel_chat_identity("chat-7".into(), cx);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            vcx.debug_bounds("chat-header-metadata").is_some(),
+            "embedded chat panel mounts the shared metadata strip"
+        );
+        overview.read_with(vcx, |overview, cx| {
+            assert!(overview.chat_panel_open);
+            assert_eq!(
+                overview.state.read(cx).selected_chat.as_deref(),
+                Some("chat-7")
+            );
+            assert_eq!(overview.copied_panel_identity.as_deref(), Some("chat-7"));
+        });
+        assert_eq!(
+            vcx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Fix login \u{2014} chat chat-7 \u{2014} session sess-9")
+        );
+    }
+
+    /// End to end: the button appears when visible `other` chats exist, a click issues
     /// `RECLASSIFY_OTHER_CHATS` (no params), the button is disabled while it
     /// runs, shows the tally on completion, and classifications refetch.
     #[gpui::test]
     fn reclassify_button_counts_other_chats_and_runs_the_rpc(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
         let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
@@ -7915,20 +9432,32 @@ mod logic_tests {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
         let (overview, vcx) = cx.add_window_view(|_, cx| {
-            let mut overview =
-                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
             for (id, category) in [("c1", "other"), ("c2", "debug"), ("c3", "other")] {
                 overview.classification.insert(
                     id.to_string(),
-                    ClassificationInfo { category: category.into(), origin: "cli".into(), ..Default::default() },
+                    ClassificationInfo {
+                        category: category.into(),
+                        origin: "cli".into(),
+                        ..Default::default()
+                    },
                 );
-                overview.classification_fetched_at.insert(id.to_string(), Instant::now());
+                overview
+                    .classification_fetched_at
+                    .insert(id.to_string(), Instant::now());
             }
             overview
         });
         vcx.run_until_parked();
         // Drain the lookups rows() issued for the chats (all fail; irrelevant).
-        let answer_all = |requests: &mut tokio::sync::mpsc::Receiver<String>, reclassify: Option<serde_json::Value>| {
+        let answer_all = |requests: &mut tokio::sync::mpsc::Receiver<String>,
+                          reclassify: Option<serde_json::Value>| {
             let mut saw_reclassify = false;
             while let Ok(frame) = requests.try_recv() {
                 let request: serde_json::Value = serde_json::from_str(&frame).unwrap();
@@ -7955,16 +9484,24 @@ mod logic_tests {
             overview.rows(cx);
             assert_eq!(overview.other_count, 2);
         });
-        assert!(vcx.debug_bounds("overview-reclassify-other").is_some(), "button visible with n > 0");
+        assert!(
+            vcx.debug_bounds("overview-reclassify-other").is_some(),
+            "button visible with n > 0"
+        );
 
         overview.update(vcx, |overview, cx| overview.start_reclassify_other(cx));
-        assert_eq!(overview.read_with(vcx, |o, _| o.reclassify.clone()), ReclassifyState::Running);
+        assert_eq!(
+            overview.read_with(vcx, |o, _| o.reclassify.clone()),
+            ReclassifyState::Running
+        );
         // A second click while running is ignored.
         overview.update(vcx, |overview, cx| overview.start_reclassify_other(cx));
         vcx.run_until_parked();
         assert!(answer_all(
             &mut requests,
-            Some(serde_json::json!({"examined": 2, "reclassified": 1, "unchanged": 1, "jevCalls": 2, "deferred": 0}))
+            Some(
+                serde_json::json!({"examined": 2, "reclassified": 1, "unchanged": 1, "jevCalls": 2, "deferred": 0})
+            )
         ));
         vcx.run_until_parked();
         overview.update(vcx, |overview, _| {
@@ -7972,7 +9509,10 @@ mod logic_tests {
                 &overview.reclassify,
                 ReclassifyState::Done { text, .. } if text == "1 reclassified, 1 unchanged"
             ));
-            assert!(overview.classification_fetched_at.is_empty(), "classifications refetch");
+            assert!(
+                overview.classification_fetched_at.is_empty(),
+                "classifications refetch"
+            );
         });
     }
 
@@ -7992,13 +9532,24 @@ mod logic_tests {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
         let (overview, vcx) = cx.add_window_view(|_, cx| {
-            let mut overview =
-                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
             overview.classification.insert(
                 "c1".into(),
-                ClassificationInfo { category: "debug".into(), origin: "cli".into(), ..Default::default() },
+                ClassificationInfo {
+                    category: "debug".into(),
+                    origin: "cli".into(),
+                    ..Default::default()
+                },
             );
-            overview.classification_fetched_at.insert("c1".into(), Instant::now());
+            overview
+                .classification_fetched_at
+                .insert("c1".into(), Instant::now());
             overview
         });
         vcx.run_until_parked();
@@ -8044,10 +9595,16 @@ mod logic_tests {
 
     #[test]
     fn status_style_maps_zeron_indicators_to_reference_vocabulary() {
-        assert_eq!(status_style(ChatIndicator::AwaitingInput, false), ("●", "needs input"));
+        assert_eq!(
+            status_style(ChatIndicator::AwaitingInput, false),
+            ("●", "needs input")
+        );
         assert_eq!(status_style(ChatIndicator::Completed, true), ("✓", "done"));
         assert_eq!(status_style(ChatIndicator::Idle, false), ("–", "idle"));
-        assert_eq!(status_style(ChatIndicator::Idle, true), ("○", "not running"));
+        assert_eq!(
+            status_style(ChatIndicator::Idle, true),
+            ("○", "not running")
+        );
         // `not_running` only ever refines Idle.
         assert_eq!(status_style(ChatIndicator::Working, true), ("●", "working"));
     }
@@ -8064,10 +9621,22 @@ mod logic_tests {
 
     #[test]
     fn group_labels_use_reference_meta_tables() {
-        assert_eq!(group_label(GroupDimension::Category, "pr_review"), "PR review");
-        assert_eq!(group_label(GroupDimension::Origin, "agent_mode"), "agent-mode.sh");
-        assert_eq!(group_label(GroupDimension::Repo, overview_grouping::NONE_KEY), "No repo");
-        assert_eq!(group_label(GroupDimension::Ticket, overview_grouping::NONE_KEY), "No ticket / PR");
+        assert_eq!(
+            group_label(GroupDimension::Category, "pr_review"),
+            "PR review"
+        );
+        assert_eq!(
+            group_label(GroupDimension::Origin, "agent_mode"),
+            "agent-mode.sh"
+        );
+        assert_eq!(
+            group_label(GroupDimension::Repo, overview_grouping::NONE_KEY),
+            "No repo"
+        );
+        assert_eq!(
+            group_label(GroupDimension::Ticket, overview_grouping::NONE_KEY),
+            "No ticket / PR"
+        );
         assert_eq!(group_label(GroupDimension::Repo, "zeron"), "zeron");
     }
 
@@ -8105,39 +9674,49 @@ mod logic_tests {
         }
         // `tile_max_size` also accounts for CONTENT height — a badge row +
         // `FLAT_STRIDE_SUBAGENT_TILES` (4) subagent tiles: 140 + 21 + (10 +
-        // 4×26 + 3×6) — a deliberate bound, not the (unbounded) worst case;
-        // see its own doc comment.
+        // 4×26 + 3×6) — three agents plus the remainder indicator.
         assert_eq!(tile_max_size(), (260.0, 293.0));
     }
 
     #[test]
-    fn tile_content_height_estimate_counts_every_subagent_tile() {
+    fn tile_content_height_estimate_caps_the_resting_subagent_preview() {
         // No optional content: exactly the fixed-row floor.
         assert_eq!(tile_content_height_estimate(0, false), TILE_CONTENT_MIN_H);
         assert_eq!(subagent_stack_height(0), 0.0);
         // 1 subagent: the connector's 10px + one 26px tile, no gap.
         assert_eq!(tile_content_height_estimate(1, false), 176.0);
         // 2: two tiles + one 6px gap.
-        assert_eq!(tile_content_height_estimate(2, false), 140.0 + 10.0 + 52.0 + 6.0);
-        // 36: uncapped — every tile charged, no "+N more" collapse.
+        assert_eq!(
+            tile_content_height_estimate(2, false),
+            140.0 + 10.0 + 52.0 + 6.0
+        );
+        // 36: three agents plus one "+33 more" row.
         assert_eq!(subagent_stack_height(36), 10.0 + 36.0 * 26.0 + 35.0 * 6.0);
-        assert_eq!(tile_content_height_estimate(36, false), 140.0 + 1156.0);
-        // Distinct counts give distinct heights (no saturating bucket).
-        assert!(tile_content_height_estimate(6, false) > tile_content_height_estimate(5, false));
+        assert_eq!(subagent_preview_row_count(36), 4);
+        assert_eq!(tile_content_height_estimate(36, false), 272.0);
+        // Once the remainder row appears, higher counts do not inflate the
+        // resting canvas layout.
+        assert_eq!(
+            tile_content_height_estimate(6, false),
+            tile_content_height_estimate(5, false)
+        );
         // A badge row adds a flat amount on top, independent of subagents.
         assert_eq!(tile_content_height_estimate(0, true), 161.0);
-        assert_eq!(tile_content_height_estimate(36, true), 161.0 + 1156.0);
+        assert_eq!(tile_content_height_estimate(36, true), 293.0);
     }
 
     #[test]
     fn tile_content_height_estimate_is_monotonic_in_both_inputs() {
-        // More subagents never shrinks the estimate — strictly grows, in
-        // fact — holding badge presence fixed, in either state.
+        // More subagents never shrinks the estimate; after three, the
+        // remainder indicator keeps the resting height fixed.
         for has_badge in [false, true] {
             let mut last = tile_content_height_estimate(0, has_badge);
             for count in 1..=40 {
                 let h = tile_content_height_estimate(count, has_badge);
-                assert!(h > last, "height didn't grow going to {count} subagents (badge={has_badge})");
+                assert!(
+                    h >= last,
+                    "height shrank going to {count} subagents (badge={has_badge})"
+                );
                 last = h;
             }
         }
@@ -8145,7 +9724,8 @@ mod logic_tests {
         // count fixed.
         for count in [0, 1, 2, 5, 36] {
             assert!(
-                tile_content_height_estimate(count, true) >= tile_content_height_estimate(count, false),
+                tile_content_height_estimate(count, true)
+                    >= tile_content_height_estimate(count, false),
                 "badge row shrank the estimate at {count} subagents"
             );
         }
@@ -8190,7 +9770,13 @@ mod logic_tests {
     /// Like [`row`], but also setting the two content fields that now feed
     /// `tile_size` — for tests that need tiles whose height varies
     /// independent of their context-%-driven width.
-    fn row_ex(id: &str, cwd: &str, pct: Option<f32>, subagent_count: usize, has_badge_row: bool) -> OverviewRow {
+    fn row_ex(
+        id: &str,
+        cwd: &str,
+        pct: Option<f32>,
+        subagent_count: usize,
+        has_badge_row: bool,
+    ) -> OverviewRow {
         use chrono::TimeZone;
         let chat = Chat {
             id: id.into(),
@@ -8226,11 +9812,27 @@ mod logic_tests {
             origin: None,
             pr_number: None,
             pr_title: None,
+            pr_search_values: Vec::new(),
             context_pct: pct,
             subagent_count,
             has_badge_row,
             closeable: false,
         }
+    }
+
+    #[test]
+    fn card_model_label_uses_explicit_id_or_honest_default() {
+        let mut chat = row("c", "/r/zeron", None).chat;
+        assert_eq!(chat_model_label(&chat), "default model");
+        chat.config = Some(zeron_proto::ChatConfig {
+            harness: zeron_proto::HarnessId::Codex,
+            model: Some("gpt-6-codex".into()),
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+        });
+        assert_eq!(chat_model_label(&chat), "gpt-6-codex");
     }
 
     #[test]
@@ -8247,14 +9849,24 @@ mod logic_tests {
         // ...but even one subagent tile (176) outgrows it.
         let wide_sub = row_ex("c", "/r/zeron", Some(1.0), 1, false);
         assert_eq!(wide_sub.tile_size(), (260.0, 176.0));
-        // A 36-subagent parent grows to fit all of them.
+        // A 36-subagent parent rests at three rows plus the remainder row,
+        // then grows to the complete stack only while hovered.
         let huge = row_ex("c", "/r/zeron", Some(1.0), 36, true);
-        assert_eq!(huge.tile_size(), (260.0, 161.0 + 1156.0));
+        assert_eq!(huge.tile_size(), (260.0, 293.0));
+        assert_eq!(huge.hovered_tile_size(), (260.0, 161.0 + 1156.0));
     }
 
     #[test]
     fn grouped_layout_packs_variable_tile_sizes_without_overlap() {
-        let pcts = [None, Some(1.0), Some(0.2), Some(0.75), Some(0.5), None, Some(0.9)];
+        let pcts = [
+            None,
+            Some(1.0),
+            Some(0.2),
+            Some(0.75),
+            Some(0.5),
+            None,
+            Some(0.9),
+        ];
         let rows: Vec<OverviewRow> = pcts
             .iter()
             .enumerate()
@@ -8279,7 +9891,8 @@ mod logic_tests {
         for i in 0..rects.len() {
             for j in (i + 1)..rects.len() {
                 let (a, b) = (rects[i], rects[j]);
-                let overlap = a.0 < b.0 + b.2 && a.0 + a.2 > b.0 && a.1 < b.1 + b.3 && a.1 + a.3 > b.1;
+                let overlap =
+                    a.0 < b.0 + b.2 && a.0 + a.2 > b.0 && a.1 < b.1 + b.3 && a.1 + a.3 > b.1;
                 assert!(!overlap, "tiles {i} and {j} overlap: {a:?} vs {b:?}");
             }
         }
@@ -8323,9 +9936,17 @@ mod logic_tests {
         // differ in height only — the precondition this test exists to
         // exercise.
         let sizes: Vec<(f32, f32)> = rows.iter().map(|r| r.tile_size()).collect();
-        assert!(sizes.iter().all(|s| s.0 == sizes[0].0), "widths should all match: {sizes:?}");
         assert!(
-            sizes.iter().map(|s| s.1 as i64).collect::<BTreeSet<_>>().len() > 1,
+            sizes.iter().all(|s| s.0 == sizes[0].0),
+            "widths should all match: {sizes:?}"
+        );
+        assert!(
+            sizes
+                .iter()
+                .map(|s| s.1 as i64)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1,
             "heights should vary: {sizes:?}"
         );
 
@@ -8345,7 +9966,8 @@ mod logic_tests {
         for i in 0..rects.len() {
             for j in (i + 1)..rects.len() {
                 let (a, b) = (rects[i], rects[j]);
-                let overlap = a.0 < b.0 + b.2 && a.0 + a.2 > b.0 && a.1 < b.1 + b.3 && a.1 + a.3 > b.1;
+                let overlap =
+                    a.0 < b.0 + b.2 && a.0 + a.2 > b.0 && a.1 < b.1 + b.3 && a.1 + a.3 > b.1;
                 assert!(!overlap, "tiles {i} and {j} overlap: {a:?} vs {b:?}");
             }
         }
@@ -8376,13 +9998,26 @@ mod logic_tests {
         assert_eq!(tile_move_ease(1.0), 1.0);
         assert_eq!(tile_move_ease(-1.0), 0.0);
         assert_eq!(tile_move_ease(2.0), 1.0);
-        let samples: Vec<(f32, f32)> = (1..100).map(|i| i as f32 / 100.0).map(|x| (x, tile_move_ease(x))).collect();
-        let (peak_x, peak) = samples.iter().copied().fold((0.0, f32::MIN), |a, b| if b.1 > a.1 { b } else { a });
-        assert!(peak > 1.05, "overshoot peak {peak} should exceed 1 (web curve peaks ~1.1)");
+        let samples: Vec<(f32, f32)> = (1..100)
+            .map(|i| i as f32 / 100.0)
+            .map(|x| (x, tile_move_ease(x)))
+            .collect();
+        let (peak_x, peak) = samples
+            .iter()
+            .copied()
+            .fold((0.0, f32::MIN), |a, b| if b.1 > a.1 { b } else { a });
+        assert!(
+            peak > 1.05,
+            "overshoot peak {peak} should exceed 1 (web curve peaks ~1.1)"
+        );
         assert!(peak_x > 0.5 && peak_x < 1.0, "overshoot peak at x={peak_x}");
         // Ease-out: well past halfway by the midpoint, monotonic rise before the peak.
         assert!(tile_move_ease(0.5) > 0.9);
-        let rising: Vec<f32> = samples.iter().filter(|(x, _)| *x <= peak_x).map(|s| s.1).collect();
+        let rising: Vec<f32> = samples
+            .iter()
+            .filter(|(x, _)| *x <= peak_x)
+            .map(|s| s.1)
+            .collect();
         assert!(rising.windows(2).all(|w| w[1] >= w[0]));
         // Settles back toward 1 at the end.
         assert!((tile_move_ease(0.99) - 1.0).abs() < 0.01);
@@ -8462,7 +10097,10 @@ mod logic_tests {
         assert!(m4.is_none() && pos.approx_eq(new));
 
         // Sub-pixel repack jitter is not a move.
-        let jitter = TilePos { x: new.x + 0.2, y: new.y - 0.2 };
+        let jitter = TilePos {
+            x: new.x + 0.2,
+            y: new.y - 0.2,
+        };
         let (m5, _) = plan_tile_motion(Some(new), None, jitter, false, false, t0, dur);
         assert!(m5.is_none());
     }
@@ -8475,7 +10113,10 @@ mod logic_tests {
     /// fixed-height, `overflow_hidden` tile).
     #[gpui::test]
     fn canvas_tile_renders_scanned_subagent_rows_inside_its_bounds(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let (out, mut requests) = tokio::sync::mpsc::channel::<String>(64);
         let (replies, inbound) = tokio::sync::mpsc::channel::<String>(64);
@@ -8496,8 +10137,13 @@ mod logic_tests {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
         let (overview, vcx) = cx.add_window_view(|_, cx| {
-            let mut overview =
-                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
             overview.view_mode = ViewMode::Canvas;
             overview
         });
@@ -8525,32 +10171,44 @@ mod logic_tests {
                 }
             });
         }
-        assert!(scanned, "rows() must request SCAN_CHAT_SUBAGENTS for a chat with a harness session");
+        assert!(
+            scanned,
+            "rows() must request SCAN_CHAT_SUBAGENTS for a chat with a harness session"
+        );
         vcx.run_until_parked();
 
         overview.update(vcx, |overview, cx| {
             assert_eq!(overview.subagents.get("c1").map(Vec::len), Some(3));
             assert_eq!(overview.rows(cx)[0].subagent_count, 3);
         });
-        let tile = vcx.debug_bounds("overview-tile-body").expect("tile rendered");
-        let block = vcx.debug_bounds("overview-tile-subagents").expect("subagent rows rendered in the tile");
+        let tile = vcx
+            .debug_bounds("overview-tile-body")
+            .expect("tile rendered");
+        let block = vcx
+            .debug_bounds("overview-tile-subagents")
+            .expect("subagent rows rendered in the tile");
         assert!(
             block.top() >= tile.top() && block.bottom() <= tile.bottom(),
             "subagent block {block:?} must sit inside tile {tile:?}"
         );
-        // All three compact tiles, uncapped.
-        assert!(f32::from(block.size.height) >= 3.0 * SUBAGENT_TILE_H + 2.0 * SUBAGENT_TILE_GAP - 0.5);
+        // Exactly three agents need no remainder row.
+        assert!(
+            f32::from(block.size.height) >= 3.0 * SUBAGENT_TILE_H + 2.0 * SUBAGENT_TILE_GAP - 0.5
+        );
     }
 
-    /// Uncapped subagent stack + the peek, end to end on the canvas: a
-    /// 36-subagent parent lays out every compact tile inside its (grown)
-    /// bounds; clicking one opens the read-only transcript panel WITHOUT
+    /// Collapsed/hovered subagent stack + the peek, end to end on the canvas:
+    /// a 36-subagent parent rests at three rows plus an indicator, expands to
+    /// every compact tile on hover, and clicking one opens the read-only transcript panel WITHOUT
     /// toggling the parent's expand, issues `READ_SUBAGENT_TRANSCRIPT` for
     /// that `{chatId, agentId}`, shows a loading state until the reply
     /// lands, then renders the turns; Escape closes it back to the canvas.
     #[gpui::test]
     fn canvas_subagent_tile_click_opens_readonly_peek(cx: &mut gpui::TestAppContext) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let _guard = runtime.enter();
         let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
         let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
@@ -8571,8 +10229,13 @@ mod logic_tests {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
         let (overview, vcx) = cx.add_window_view(|_, cx| {
-            let mut overview =
-                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
             overview.view_mode = ViewMode::Canvas;
             overview
         });
@@ -8629,32 +10292,79 @@ mod logic_tests {
             assert_eq!(row.tile_size().1, tile_content_height_estimate(36, false));
         });
         vcx.run_until_parked();
-        let tile = vcx.debug_bounds("overview-tile-body").expect("tile rendered");
-        let block = vcx.debug_bounds("overview-tile-subagents").expect("subagent stack rendered");
+        let tile = vcx
+            .debug_bounds("overview-tile-body")
+            .expect("tile rendered");
         assert!(
-            block.top() >= tile.top() && block.bottom() <= tile.bottom() + px(0.5),
-            "36-tile stack {block:?} must fit inside the grown tile {tile:?}"
+            vcx.debug_bounds("overview-card-model").is_some(),
+            "card renders model metadata"
+        );
+        let block = vcx
+            .debug_bounds("overview-tile-subagents")
+            .expect("subagent stack rendered");
+        assert!(
+            vcx.debug_bounds("overview-subagent-more").is_some(),
+            "resting card shows remainder row"
         );
         assert!(
-            (f32::from(block.size.height) - (subagent_stack_height(36) - SUBAGENT_STACK_TOP)).abs() < 1.0,
-            "every tile laid out at its fixed height: {block:?}"
+            block.top() >= tile.top() && block.bottom() <= tile.bottom() + px(0.5),
+            "preview stack {block:?} must fit inside the resting tile {tile:?}"
+        );
+        assert!(
+            (f32::from(block.size.height)
+                - (subagent_stack_height(subagent_preview_row_count(36)) - SUBAGENT_STACK_TOP))
+                .abs()
+                < 1.0,
+            "preview rows laid out at their fixed height: {block:?}"
+        );
+
+        // Hovering anywhere on the card replaces the indicator with the full
+        // list and grows the visual card above its canvas neighbors.
+        vcx.simulate_mouse_move(tile.center(), None, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        overview.update(vcx, |overview, _| {
+            assert_eq!(overview.hovered_subagents.as_deref(), Some("c1"));
+        });
+        assert!(vcx.debug_bounds("overview-subagent-more").is_none());
+        let block = vcx
+            .debug_bounds("overview-tile-subagents")
+            .expect("expanded subagent stack rendered");
+        assert!(
+            (f32::from(block.size.height) - (subagent_stack_height(36) - SUBAGENT_STACK_TOP)).abs()
+                < 1.0,
+            "every hovered tile laid out at its fixed height: {block:?}"
         );
 
         // Click the first compact tile.
-        let first = gpui::point(block.left() + px(30.0), block.top() + px(SUBAGENT_TILE_H / 2.0));
+        let first = gpui::point(
+            block.left() + px(30.0),
+            block.top() + px(SUBAGENT_TILE_H / 2.0),
+        );
         vcx.simulate_click(first, gpui::Modifiers::none());
         vcx.run_until_parked();
         overview.update(vcx, |overview, _| {
             let peek = overview.subagent_peek.as_ref().expect("peek opened");
-            assert_eq!((peek.chat_id.as_str(), peek.agent_id.as_str()), ("c1", "a0"));
+            assert_eq!(
+                (peek.chat_id.as_str(), peek.agent_id.as_str()),
+                ("c1", "a0")
+            );
             assert_eq!(peek.load, PeekLoad::Loading);
             assert!(!overview.chat_panel_open);
-            assert!(!overview.expanded.contains("c1"), "subagent click must not toggle the parent");
+            assert!(
+                !overview.expanded.contains("c1"),
+                "subagent click must not toggle the parent"
+            );
         });
-        assert!(vcx.debug_bounds("overview-subagent-peek").is_some(), "peek panel rendered");
+        assert!(
+            vcx.debug_bounds("overview-subagent-peek").is_some(),
+            "peek panel rendered"
+        );
 
         let transcript_requests = answer(&mut requests);
-        assert_eq!(transcript_requests, vec![serde_json::json!({"chatId": "c1", "agentId": "a0"})]);
+        assert_eq!(
+            transcript_requests,
+            vec![serde_json::json!({"chatId": "c1", "agentId": "a0"})]
+        );
         vcx.run_until_parked();
         overview.update(vcx, |overview, _| {
             match &overview.subagent_peek.as_ref().expect("still open").load {
@@ -8697,8 +10407,13 @@ mod logic_tests {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
         let (_overview, vcx) = cx.add_window_view(|_, cx| {
-            let mut overview =
-                Overview::new(state.clone(), gpui::WeakEntity::new_invalid(), transcript, composer, cx);
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
             overview.view_mode = ViewMode::List;
             for id in &ids {
                 overview.subagents.insert(
@@ -8710,13 +10425,19 @@ mod logic_tests {
                     ]))
                     .unwrap(),
                 );
-                overview.subagents_fetched_at.insert(id.clone(), Instant::now());
+                overview
+                    .subagents_fetched_at
+                    .insert(id.clone(), Instant::now());
             }
             overview
         });
         vcx.run_until_parked();
-        let row = vcx.debug_bounds("overview-list-row").expect("list row rendered");
-        let block = vcx.debug_bounds("overview-list-subagents").expect("subagent rows rendered");
+        let row = vcx
+            .debug_bounds("overview-list-row")
+            .expect("list row rendered");
+        let block = vcx
+            .debug_bounds("overview-list-subagents")
+            .expect("subagent rows rendered");
         assert!(
             f32::from(block.size.height) >= 3.0 * SUBAGENT_TILE_H,
             "all three subagent rows laid out: {block:?}"

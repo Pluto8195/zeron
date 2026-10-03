@@ -63,29 +63,52 @@ async fn scan_and_bulk_import_skip_classifier_and_titlegen_throwaways_but_keep_r
         std::env::set_var("HOME", fake_home.path());
     }
 
-    let projects_dir = fake_home.path().join(".claude").join("projects").join("proj-1");
+    let projects_dir = fake_home
+        .path()
+        .join(".claude")
+        .join("projects")
+        .join("proj-1");
     std::fs::create_dir_all(&projects_dir).expect("projects dir");
 
     let sessions = [
-        ("sess-real", "/work/real", "please add a health check endpoint"),
+        (
+            "sess-real",
+            "/work/real",
+            "please add a health check endpoint",
+        ),
         ("sess-titlegen", "/work/titlegen", TITLEGEN_MESSAGE),
         ("sess-classify", "/work/classify", CLASSIFY_MESSAGE),
-        ("sess-zeron-title", "/private/var/folders/x/T/.tmpabc", ZERON_TITLE_MESSAGE),
+        (
+            "sess-zeron-title",
+            "/private/var/folders/x/T/.tmpabc",
+            ZERON_TITLE_MESSAGE,
+        ),
         ("sess-short-real", "/work/short", "hi"),
     ];
     for (id, cwd, msg) in sessions {
-        std::fs::write(projects_dir.join(format!("{id}.jsonl")), transcript_with_first_message(id, cwd, msg))
-            .expect("write transcript");
+        std::fs::write(
+            projects_dir.join(format!("{id}.jsonl")),
+            transcript_with_first_message(id, cwd, msg),
+        )
+        .expect("write transcript");
     }
 
     let data_dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(EngineProfile::development(data_dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        data_dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     // (a) scan() itself must exclude both throwaways, keeping only the real one.
     let candidates = core.external_import.scan().expect("scan");
     let mut ids: Vec<_> = candidates.iter().map(|c| c.session_id.as_str()).collect();
     ids.sort();
-    assert_eq!(ids, ["sess-real", "sess-short-real"], "only real sessions survive scan(): {candidates:#?}");
+    assert_eq!(
+        ids,
+        ["sess-real", "sess-short-real"],
+        "only real sessions survive scan(): {candidates:#?}"
+    );
 
     // (b) bulk_import_from_session_canvas calls scan() internally, so it must
     // import only the real one too.
@@ -94,7 +117,13 @@ async fn scan_and_bulk_import_skip_classifier_and_titlegen_throwaways_but_keep_r
         .external_import
         .bulk_import_from_session_canvas(|event| events.push(event))
         .expect("bulk import");
-    let BulkImportEvent::Summary { total, imported, failed, .. } = summary else {
+    let BulkImportEvent::Summary {
+        total,
+        imported,
+        failed,
+        ..
+    } = summary
+    else {
         panic!("expected a Summary event");
     };
     assert_eq!(total, 2);
@@ -102,7 +131,11 @@ async fn scan_and_bulk_import_skip_classifier_and_titlegen_throwaways_but_keep_r
     assert_eq!(failed, 0);
 
     let all_chats = core.workspace.read_chats().expect("read chats");
-    assert_eq!(all_chats.len(), 2, "only the real sessions should have been imported");
+    assert_eq!(
+        all_chats.len(),
+        2,
+        "only the real sessions should have been imported"
+    );
 
     core.shutdown().await;
 
@@ -116,16 +149,24 @@ async fn scan_and_bulk_import_skip_classifier_and_titlegen_throwaways_but_keep_r
 }
 
 #[tokio::test]
-async fn repair_junk_imports_hard_deletes_already_imported_throwaways_but_leaves_real_chats_idempotently() {
+async fn repair_junk_imports_hard_deletes_already_imported_throwaways_but_leaves_real_chats_idempotently()
+ {
     let dir = tempfile::tempdir().expect("tempdir");
-    let core = assemble(EngineProfile::development(dir.path(), "dev-org", "dev-user"));
+    let core = assemble(EngineProfile::development(
+        dir.path(),
+        "dev-org",
+        "dev-user",
+    ));
 
     // Simulate chats a PRE-fix bulk import already adopted: `import()` itself
     // (unlike `scan()`) never filtered synthetic transcripts, so this is
     // exactly what's sitting in an affected user's workspace today.
     let real_path = dir.path().join("real.jsonl");
-    std::fs::write(&real_path, transcript_with_first_message("sess-real", "/work/real", "add a health check endpoint"))
-        .expect("write real transcript");
+    std::fs::write(
+        &real_path,
+        transcript_with_first_message("sess-real", "/work/real", "add a health check endpoint"),
+    )
+    .expect("write real transcript");
     let titlegen_path = dir.path().join("titlegen.jsonl");
     std::fs::write(
         &titlegen_path,
@@ -146,8 +187,11 @@ async fn repair_junk_imports_hard_deletes_already_imported_throwaways_but_leaves
     )
     .expect("write zeron title transcript");
     let short_path = dir.path().join("short.jsonl");
-    std::fs::write(&short_path, transcript_with_first_message("sess-short", "/work/short", "hi"))
-        .expect("write short transcript");
+    std::fs::write(
+        &short_path,
+        transcript_with_first_message("sess-short", "/work/short", "hi"),
+    )
+    .expect("write short transcript");
 
     core.external_import
         .import("chat-real", "sess-real", &real_path)
@@ -168,18 +212,45 @@ async fn repair_junk_imports_hard_deletes_already_imported_throwaways_but_leaves
 
     assert_eq!(core.workspace.read_chats().expect("read chats").len(), 5);
 
-    let removed = core.external_import.repair_junk_imports().expect("repair_junk_imports");
+    let removed = core
+        .external_import
+        .repair_junk_imports()
+        .expect("repair_junk_imports");
     assert_eq!(removed, 3, "all three throwaway chats should be removed");
 
-    let mut remaining: Vec<_> = core.workspace.read_chats().expect("read chats").into_iter().map(|c| c.id).collect();
+    let mut remaining: Vec<_> = core
+        .workspace
+        .read_chats()
+        .expect("read chats")
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
     remaining.sort();
     assert_eq!(remaining, ["chat-real", "chat-short"]);
-    assert!(core.workspace.chat("chat-zeron-title").expect("read chat").is_none());
-    assert!(core.workspace.chat("chat-titlegen").expect("read chat").is_none());
-    assert!(core.workspace.chat("chat-classify").expect("read chat").is_none());
+    assert!(
+        core.workspace
+            .chat("chat-zeron-title")
+            .expect("read chat")
+            .is_none()
+    );
+    assert!(
+        core.workspace
+            .chat("chat-titlegen")
+            .expect("read chat")
+            .is_none()
+    );
+    assert!(
+        core.workspace
+            .chat("chat-classify")
+            .expect("read chat")
+            .is_none()
+    );
 
     // Idempotent: a second pass finds nothing left to remove.
-    let removed_again = core.external_import.repair_junk_imports().expect("second repair_junk_imports");
+    let removed_again = core
+        .external_import
+        .repair_junk_imports()
+        .expect("second repair_junk_imports");
     assert_eq!(removed_again, 0);
     assert_eq!(core.workspace.read_chats().expect("read chats").len(), 2);
 

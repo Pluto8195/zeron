@@ -76,6 +76,7 @@ impl Catalog {
     pub(super) async fn refresh(
         &self,
         exe: &Path,
+        cwd: &Path,
         timeout: Duration,
     ) -> Result<Vec<Model>, HarnessError> {
         let requested_at = Instant::now();
@@ -88,6 +89,7 @@ impl Catalog {
         let mut cmd = Command::new(exe);
         cmd.args(["models", "list", "--format", "json"]);
         crate::compose_child_path(&mut cmd, exe);
+        cmd.current_dir(cwd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -90,6 +90,8 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
     executable: Option<PathBuf>,
+    /// Zeron-owned cwd for automatic catalog probes. Never a user project or HOME.
+    model_discovery_cwd: Option<PathBuf>,
     /// Grace between the interrupt control request and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -106,6 +108,7 @@ impl Default for ClaudeHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            model_discovery_cwd: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             initialize: discovery::InitializeCache::default(),
@@ -123,6 +126,12 @@ impl ClaudeHarness {
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Run automatic model probes in this Zeron-owned directory.
+    pub fn with_model_discovery_cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_discovery_cwd = Some(path.into());
         self
     }
 
@@ -232,8 +241,7 @@ impl ClaudeHarness {
     }
 
     /// Share the complete initialize response for the MODEL catalog, which is
-    /// cwd-independent — the probe runs in whatever directory the engine
-    /// itself started in (equivalent to `cwd: ""`, see `probe_initialize`).
+    /// cwd-independent — the probe runs in a Zeron-owned discovery directory.
     /// No user message is written; the short-lived child is retired after
     /// initialize. Command discovery uses its own per-cwd probe/cache
     /// instead (see [`Self::discover_commands`]) since project-scoped
@@ -242,7 +250,7 @@ impl ClaudeHarness {
         self.initialize
             .get(
                 || self.model_context().map(|c| c.unwrap().key()),
-                || self.probe_initialize(""),
+                || self.probe_initialize(None),
             )
             .await
     }
@@ -259,23 +267,41 @@ impl ClaudeHarness {
     /// switching between chats in different repos/worktrees doesn't respawn
     /// the CLI on every popup open.
     async fn discover_commands(&self, cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
+        // The global command request has the same cwd-independent initialize
+        // response as the model catalog. Share that single safe probe; only
+        // project-scoped command requests need the per-cwd cache below.
+        if cwd.is_empty() {
+            return self
+                .initialize()
+                .await
+                .map(|response| parse_initialize_commands(&response));
+        }
         let context = self.model_context()?.unwrap().key();
         self.commands_cache
             .get_or_probe(context, cwd, || async {
-                self.probe_initialize(cwd)
+                self.probe_initialize(Some(cwd))
                     .await
                     .map(|response| parse_initialize_commands(&response))
             })
             .await
     }
 
-    /// `cwd`: empty runs in the engine's own inherited directory (the model
-    /// catalog's use, which doesn't need a specific project); non-empty
-    /// spawns the CLI there instead, so its `initialize` response reflects
+    /// `cwd`: `None` runs in a Zeron-owned discovery directory (the model
+    /// catalog's use, which doesn't need a specific project); `Some` spawns
+    /// the CLI there instead, so its `initialize` response reflects
     /// THAT directory's project-scoped commands/skills (command discovery's
     /// use — see [`Self::discover_commands`]).
-    async fn probe_initialize(&self, cwd: &str) -> Result<Value, HarnessError> {
+    async fn probe_initialize(&self, cwd: Option<&str>) -> Result<Value, HarnessError> {
         let exe = self.resolve_executable()?;
+        let discovery_cwd;
+        let cwd = match cwd.filter(|cwd| !cwd.is_empty()) {
+            Some(cwd) => std::path::Path::new(cwd),
+            None => {
+                discovery_cwd =
+                    crate::executable::model_discovery_cwd(self.model_discovery_cwd.as_deref())?;
+                &discovery_cwd
+            }
+        };
         let mut cmd = Command::new(&exe);
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args([
@@ -288,12 +314,7 @@ impl ClaudeHarness {
             // CLI exits immediately with a usage error.
             "--verbose",
         ]);
-        // Same convention as `build_command`: empty means "inherit the
-        // spawning process's cwd" rather than an explicit (and possibly
-        // nonexistent) path.
-        if !cwd.is_empty() {
-            cmd.current_dir(cwd);
-        }
+        cmd.current_dir(cwd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

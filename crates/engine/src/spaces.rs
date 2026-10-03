@@ -146,6 +146,20 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
         // failures are fine — the repair tick still converges. Built off the
         // runtime: FSEvents registration blocks, and reconcile runs on the
         // spaces-watch task.
+        //
+        // A saved home/root or privacy-managed space deliberately skips this
+        // watcher. FSEvents is subtree-oriented on macOS and registering it
+        // against HOME, Music, Pictures, Documents, etc. can trip a privacy
+        // prompt even with `NonRecursive`. `check_space` is guarded too, so
+        // its initial/repair kicks only clear stale Git stamps without touching
+        // the filesystem.
+        if crate::repos::is_automatic_access_blocked(&entry.path) {
+            tracing::info!(
+                path = %entry.path.display(),
+                "spaces: automatic filesystem checks disabled for privacy-managed path"
+            );
+            continue;
+        }
         let weak = Arc::downgrade(&entry);
         tokio::task::spawn_blocking(move || {
             let Some(entry) = weak.upgrade() else {
@@ -186,6 +200,27 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::repos::{is_automatic_access_blocked, is_broad_workspace_root};
+    use std::path::Path;
+
+    #[test]
+    fn native_watch_skips_the_live_home_root() {
+        let home = crate::repos::home_dir();
+        assert!(is_broad_workspace_root(&home));
+        assert!(is_automatic_access_blocked(&home.join("Music")));
+        assert!(is_automatic_access_blocked(
+            &home.join("Pictures").join("Photos Library.photoslibrary")
+        ));
+        assert!(is_automatic_access_blocked(
+            &home.join("Documents").join("project")
+        ));
+        assert!(is_broad_workspace_root(Path::new("/")));
+        assert!(is_broad_workspace_root(Path::new("relative/project")));
+    }
+}
+
 /// Per-space task: trailing-debounce kicks, then recheck git presence.
 async fn entry_task(
     inner: Weak<SpacesSyncInner>,
@@ -210,7 +245,12 @@ async fn entry_task(
 
 /// Probe git presence and stamp the row — write only on change.
 async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) {
-    let detected = inner.repos.is_repo(path).await;
+    // A broad historical Space is display state, not permission to touch HOME
+    // every two minutes. Avoid even spawning `git -C HOME` here; besides being
+    // unnecessary, filesystem metadata probes by descendants can raise macOS
+    // protected-folder prompts. The watcher is skipped in `reconcile` too.
+    let automatic_access_blocked = crate::repos::is_automatic_access_blocked(path);
+    let detected = !automatic_access_blocked && inner.repos.is_repo(path).await;
     let checkout_id = if detected {
         match inner.repos.checkout_identity(path).await {
             Ok(identity) => Some(identity.id),

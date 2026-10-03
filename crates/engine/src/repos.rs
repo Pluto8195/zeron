@@ -81,6 +81,72 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Whether a path is too broad for automatic recursive filesystem work. A
+/// saved Space may legitimately retain HOME as historical chat context, but
+/// background indexing/watching it would reach macOS-protected descendants
+/// (Music, Pictures/Photos Library, Documents, and so on). Ancestors of HOME
+/// are broader still. Relative paths are rejected because their scope depends
+/// on the process cwd.
+pub(crate) fn is_broad_workspace_root(path: &Path) -> bool {
+    is_broad_workspace_root_with_home(path, &home_dir())
+}
+
+/// The same policy after resolving an existing path. Use this only on an
+/// explicit filesystem operation (not a background scan): canonicalization
+/// catches a saved symlink/`..` alias of HOME before a recursive consumer is
+/// allowed to proceed.
+pub(crate) fn is_broad_workspace_root_resolved(path: &Path) -> bool {
+    if is_broad_workspace_root(path) {
+        return true;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let home = home_dir();
+    let resolved_home = std::fs::canonicalize(&home).unwrap_or(home);
+    is_broad_workspace_root_with_home(&resolved, &resolved_home)
+}
+
+fn is_broad_workspace_root_with_home(path: &Path, home: &Path) -> bool {
+    !path.is_absolute() || home.starts_with(path)
+}
+
+/// Whether unattended/background work must leave this root alone. In addition
+/// to HOME and its ancestors, this covers macOS privacy-managed HOME subtrees.
+/// A person may still explicitly open a project there; this guard is for boot
+/// reconciliation, imported-history discovery, and other automatic activity.
+pub fn is_automatic_access_blocked(path: &Path) -> bool {
+    is_automatic_access_blocked_with_home(path, &home_dir())
+}
+
+fn is_automatic_access_blocked_with_home(path: &Path, home: &Path) -> bool {
+    if is_broad_workspace_root_with_home(path, home) {
+        return true;
+    }
+    let Ok(relative) = path.strip_prefix(home) else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(first)) = relative.components().next() else {
+        return false;
+    };
+    matches!(
+        first.to_str(),
+        Some("Desktop" | "Documents" | "Downloads" | "Movies" | "Music" | "Pictures" | "Library")
+    )
+}
+
+/// A first-level HOME entry whose metadata must not be probed merely to render
+/// the project picker. On macOS even a `stat`/`.git` existence check against
+/// these privacy-managed folders can raise a TCC prompt. Entering the folder is
+/// still allowed when the person explicitly selects it in the picker.
+fn is_protected_home_child_with_home(target: &Path, name: &str, home: &Path) -> bool {
+    target == home
+        && matches!(
+            name,
+            "Desktop" | "Documents" | "Downloads" | "Movies" | "Music" | "Pictures" | "Library"
+        )
+}
+
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
 /// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
@@ -183,7 +249,11 @@ impl Repos {
     // ── git plumbing ────────────────────────────────────────────────────────
 
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
-    async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+    pub(crate) async fn git(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<String, EngineError> {
         let mut cmd = tokio::process::Command::new("git");
         #[cfg(windows)]
         {
@@ -1236,6 +1306,15 @@ impl Repos {
         query: String,
         featured_paths: Vec<String>,
     ) -> Result<Vec<FileSearchMatch>, EngineError> {
+        // Defense in depth: the authenticated workspace-file resolver already
+        // rejects broad roots. Keep the lower-level indexer safe too so a new
+        // caller cannot accidentally recursively walk HOME (and its protected
+        // Music/Pictures/Documents descendants).
+        if is_broad_workspace_root(&root) {
+            return Err(EngineError::Other(
+                "file search requires a specific project folder".into(),
+            ));
+        }
         let deadline = tokio::time::Instant::now() + FILE_SEARCH_TIMEOUT;
         let gate = {
             let mut searches = self
@@ -1375,8 +1454,15 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let is_repo = is_dir && entry.path().join(".git").exists();
+        // Merely opening the project browser at HOME must not probe inside
+        // macOS-protected folders. Importantly this decision happens BEFORE
+        // `DirEntry::file_type`: that metadata call itself can trigger TCC,
+        // even if we avoid the later `Music/.git` / `Pictures/.git` probe.
+        // These well-known entries are directories on macOS; if the user
+        // explicitly navigates into one, that later listing is intentional.
+        let protected_home_child = is_protected_home_child_with_home(target, &name, &home_dir());
+        let is_dir = protected_home_child || entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let is_repo = is_dir && !protected_home_child && entry.path().join(".git").exists();
         entries.push(FolderEntry {
             name,
             is_dir,
@@ -2152,6 +2238,78 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broad_workspace_roots_stop_at_home_but_keep_projects_and_volumes() {
+        let home = Path::new("/Users/mikey");
+        assert!(is_broad_workspace_root_with_home(Path::new("/"), home));
+        assert!(is_broad_workspace_root_with_home(Path::new("/Users"), home));
+        assert!(is_broad_workspace_root_with_home(home, home));
+        assert!(is_broad_workspace_root_with_home(
+            Path::new("relative/project"),
+            home
+        ));
+        assert!(!is_broad_workspace_root_with_home(
+            Path::new("/Users/mikey/Projects/app"),
+            home
+        ));
+        assert!(!is_broad_workspace_root_with_home(
+            Path::new("/Volumes/work/app"),
+            home
+        ));
+    }
+
+    #[test]
+    fn automatic_access_blocks_privacy_managed_home_subtrees_only() {
+        let home = Path::new("/Users/mikey");
+        for path in [
+            "/Users/mikey/Desktop",
+            "/Users/mikey/Documents/project",
+            "/Users/mikey/Downloads/repo",
+            "/Users/mikey/Movies/clips",
+            "/Users/mikey/Music/library",
+            "/Users/mikey/Pictures/Photos Library.photoslibrary",
+            "/Users/mikey/Library/Application Support/app",
+        ] {
+            assert!(is_automatic_access_blocked_with_home(Path::new(path), home));
+        }
+        assert!(!is_automatic_access_blocked_with_home(
+            Path::new("/Users/mikey/Projects/app"),
+            home
+        ));
+        assert!(!is_automatic_access_blocked_with_home(
+            Path::new("/Volumes/work/app"),
+            home
+        ));
+    }
+
+    #[test]
+    fn resolved_broad_root_catches_dot_alias() {
+        let home = home_dir();
+        assert!(is_broad_workspace_root_resolved(&home.join(".")));
+    }
+
+    #[test]
+    fn home_picker_recognizes_privacy_managed_children_before_metadata_probes() {
+        let home = Path::new("/Users/mikey");
+        for name in [
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Movies",
+            "Music",
+            "Pictures",
+            "Library",
+        ] {
+            assert!(is_protected_home_child_with_home(home, name, home));
+        }
+        assert!(!is_protected_home_child_with_home(home, "Projects", home));
+        assert!(!is_protected_home_child_with_home(
+            Path::new("/Users/mikey/Projects"),
+            "Documents",
+            home
+        ));
+    }
 
     fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {
         GitHistoryCommit {

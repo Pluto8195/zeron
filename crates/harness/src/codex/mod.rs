@@ -137,6 +137,8 @@ pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessErr
 pub struct CodexHarness {
     models_cache: crate::catalog::Catalog,
     executable: Option<PathBuf>,
+    /// Zeron-owned cwd for automatic catalog probes. Never a user project or HOME.
+    model_discovery_cwd: Option<PathBuf>,
     /// Grace between `turn/interrupt` and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -151,6 +153,7 @@ impl Default for CodexHarness {
         Self {
             models_cache: crate::catalog::Catalog::default(),
             executable: None,
+            model_discovery_cwd: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
@@ -166,6 +169,12 @@ impl CodexHarness {
     /// Use a fixed CLI binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+
+    /// Run automatic model probes in this Zeron-owned directory.
+    pub fn with_model_discovery_cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_discovery_cwd = Some(path.into());
         self
     }
 
@@ -257,9 +266,12 @@ impl CodexHarness {
     /// successful picker response.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
+        let discovery_cwd =
+            crate::executable::model_discovery_cwd(self.model_discovery_cwd.as_deref())?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
+        cmd.current_dir(discovery_cwd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

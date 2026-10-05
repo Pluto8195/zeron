@@ -1,6 +1,6 @@
 # Zeron unfinished-work handoff
 
-Status: active dirty working tree; several features are implemented locally but are not committed or merged.
+Status: implementation committed and merged to the fork's `main`; the product and verification gaps below remain unfinished.
 
 Prepared: 2026-10-05.
 
@@ -9,16 +9,15 @@ Repository: `/Users/mikey/Projects/agent-mode-tools/zeron`
 Branch and source baseline:
 
 - Branch: `import-external-sessions`
-- HEAD: `51c676c5 Complete session collaboration and repository topology`
-- `origin/import-external-sessions` currently points at the same commit.
-- There are 25 modified tracked files, approximately 2,594 insertions and 340 deletions beyond HEAD.
-- Treat the entire dirty tree as user work. Do not reset, discard, or rewrite it wholesale.
-- No commit was created for the work described below.
+- Implementation commit: `78a999e9 Finish repository workflows and transcript tooling`
+- `origin/import-external-sessions` and the fork's `origin/main` point at that commit.
+- The Zeron working tree was clean immediately after the merge. Re-check before making changes.
+- The implementation landed as one large commit; preserve and review it carefully when preparing any upstream submission.
 
 ## Start here in the next chat
 
 1. Read this document and inspect `git status --short` plus `git diff --stat`.
-2. Preserve all existing edits. Several features share `rpc.rs`, `shell.rs`, `repository_topology.rs`, transcript normalization, and tests.
+2. Preserve the merged implementation. Several features share `rpc.rs`, `shell.rs`, `repository_topology.rs`, transcript normalization, and tests.
 3. Confirm the latest native build is actually running before diagnosing missing UI. The usual test app is `/Applications/Zeron Dev.app`; copying only to `target/debug/zeron` does not update it.
 4. Prioritize the submodule diff expansion described below. Keep durable historical chat diffs as a separate design problem even though the symptoms overlap.
 5. Before committing, run focused tests, the full relevant suites, and review/split the large dirty tree into coherent commits or PRs.
@@ -101,9 +100,9 @@ The user repeatedly observed Zeron requesting access to Music, Photos, and other
 
 Treat this as unresolved until reproduced and verified with the latest app. Audit background discovery, canonicalization, repository scanning, historical chat cwd reconciliation, and file watchers. Read metadata already stored in the document before touching a historical path, and never probe broad/privacy-sensitive folders merely to classify or reconcile unrelated chats.
 
-### 4. Git integration and release packaging
+### 4. Upstream integration and release packaging
 
-The current work is not committed, split, pushed, merged, or packaged as a release.
+The current work is committed, pushed, and fast-forwarded into the Pluto8195 fork's `main`. It has not been merged upstream or packaged as a release.
 
 - The latest debug binary was manually copied into `/Applications/Zeron Dev.app` and ad-hoc re-signed.
 - That makes the local app testable, but it is not a reproducible distribution artifact.
@@ -111,13 +110,13 @@ The current work is not committed, split, pushed, merged, or packaged as a relea
 - The Windows package/build used earlier in the conversation predates the latest dirty changes.
 - No full current Windows build or native Windows acceptance pass has been performed.
 
-Use `split-to-prs` or otherwise separate the dirty work into reviewable units before merging. At minimum, keep worktree closeout, Repo Map refinements, and transcript/code-reference changes independently reviewable where shared files permit.
+Before any upstream submission, review whether the large implementation commit should be decomposed into independently reviewable follow-ups or PRs. At minimum, keep worktree closeout, Repo Map refinements, and transcript/code-reference changes conceptually separate where shared files permit.
 
-## Implemented locally but still needs user acceptance or broader verification
+## Implemented and merged to the fork, but still needs user acceptance or broader verification
 
 ### Worktree closeout safety and Repo Map entry point
 
-Implemented in the dirty tree:
+Implemented in commit `78a999e9`:
 
 - Repo Map shows **Close out worktree...** in the inspector for every non-main linked worktree, including unmatched worktrees.
 - Sidebar and Overview recognize ordinary linked worktrees whose root has a `.git` file; `.workspace-root` is no longer required.
@@ -140,7 +139,7 @@ Primary files:
 
 ### Repo Map refinements
 
-Implemented locally but not committed:
+Implemented and committed:
 
 - workspace tabs instead of depending on the currently open chat;
 - worktree-first graph/inspector details;
@@ -154,7 +153,7 @@ Native visual acceptance is still required for dense graphs, very small zoom, se
 
 ### Transcript tool output and code navigation
 
-Implemented locally but not committed:
+Implemented and committed:
 
 - Claude and Codex tool-result text is retained with bounds instead of being discarded.
 - Imported Claude parent/subagent transcripts preserve bounded tool output.
@@ -190,11 +189,11 @@ Not yet completed:
 - latest Windows build and native acceptance;
 - native macOS acceptance of every dirty UI feature;
 - code review and security review of the entire 2,500+ line dirty diff;
-- coherent commits/PRs and merge.
+- upstream review/merge strategy.
 
-## Current modified files
+## Files changed by the implementation commit
 
-At handoff time:
+Commit `78a999e9` changed:
 
 ```text
 crates/doc/src/parts.rs
@@ -224,4 +223,4 @@ crates/ui/src/shell/closeout_ui.rs
 crates/ui/src/transcript.rs
 ```
 
-Re-run `git status --short` because this list may change after the handoff is created.
+The Zeron working tree was clean after the fork-main fast-forward. Re-run `git status --short` before continuing.

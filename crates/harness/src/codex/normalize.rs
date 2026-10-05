@@ -8,6 +8,22 @@
 use serde_json::Value;
 use zeron_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
 
+/// Bound command output before it crosses the event stream. The document
+/// fold applies its own smaller persistence policy; this prevents an
+/// unexpectedly noisy command from becoming one unbounded event.
+const COMMAND_OUTPUT_CAP: usize = 16 * 1024;
+
+fn cap_output(text: &str) -> String {
+    if text.len() <= COMMAND_OUTPUT_CAP {
+        return text.to_owned();
+    }
+    let mut end = COMMAND_OUTPUT_CAP;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… [truncated]", &text[..end])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Started,
@@ -312,10 +328,14 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 let exit_code = field(item, &["exitCode", "exit_code"])
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                let output = field(item, &["aggregatedOutput", "aggregated_output"])
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(cap_output);
                 vec![AgentEvent::ToolResult {
                     id,
                     is_error: status == "failed" || exit_code != 0,
-                    output: None,
+                    output,
                     diff: None,
                 }]
             }

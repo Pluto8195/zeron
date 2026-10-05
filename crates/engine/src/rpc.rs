@@ -224,22 +224,66 @@ struct CreateChatWorktreeParams {
     name: String,
 }
 
-/// `PLAN_CHAT_CLOSEOUT` request: `{chatId, cwd}`.
+/// `PLAN_CHAT_CLOSEOUT` request: `{chatId?, cwd}`. Repo Map omits `chatId`
+/// when closing an unmatched registered worktree.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlanChatCloseoutParams {
-    chat_id: String,
+    chat_id: Option<String>,
     cwd: String,
 }
 
-/// `CLOSE_CHAT_WORKTREE` request: `{chatId, cwd, force}`.
+/// `CLOSE_CHAT_WORKTREE` request: `{chatId?, cwd, force}`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CloseChatWorktreeParams {
-    chat_id: String,
+    chat_id: Option<String>,
     cwd: String,
     #[serde(default)]
     force: bool,
+}
+
+/// Bind destructive close-out requests to the cwd stored on the addressed
+/// chat. The client-provided cwd is only a claim; canonicalizing both sides
+/// prevents a stale or forged request from planning/removing another
+/// worktree while still accepting harmless path aliases.
+fn validated_closeout_cwd(
+    chat_id: &str,
+    stored_cwd: Option<&str>,
+    requested_cwd: &str,
+) -> Result<std::path::PathBuf, RpcError> {
+    let stored_cwd = stored_cwd.ok_or_else(|| {
+        RpcError::Failed(format!(
+            "cannot close out chat {chat_id}: it has no stored working directory"
+        ))
+    })?;
+    let stored = std::fs::canonicalize(stored_cwd).map_err(|e| {
+        RpcError::Failed(format!(
+            "cannot close out chat {chat_id}: its stored working directory `{stored_cwd}` cannot be resolved: {e}"
+        ))
+    })?;
+    let requested = std::fs::canonicalize(requested_cwd).map_err(|e| {
+        RpcError::Failed(format!(
+            "cannot close out chat {chat_id}: requested working directory `{requested_cwd}` cannot be resolved: {e}"
+        ))
+    })?;
+    if stored != requested {
+        return Err(RpcError::Failed(format!(
+            "cannot close out chat {chat_id}: requested working directory `{}` does not match the chat's stored working directory `{}`",
+            requested.display(),
+            stored.display()
+        )));
+    }
+    Ok(stored)
+}
+
+fn shared_closeout_error(shared: &[String]) -> RpcError {
+    RpcError::Failed(format!(
+        "refusing to close out: this worktree is used by {} open chat{}: {}",
+        shared.len(),
+        if shared.len() == 1 { "" } else { "s" },
+        shared.join(", ")
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -794,21 +838,17 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
     }
 
-    /// Whether `chat_id`'s session is live, for close-out: this engine holds
-    /// a run for it (in-flight or warm between turns), OR a `claude` process
-    /// on this machine is tied to the chat's harness session id or sits in
-    /// `cwd` — the process half of the signal the auto-adopt sweep uses
-    /// ([`crate::liveness`]), minus the transcript-mtime check (a turn that
-    /// just finished must not block close-out for minutes).
-    async fn chat_is_live(&self, chat_id: &str, cwd: &str) -> bool {
-        if self.sessions.has_live_run(chat_id) || self.sessions.turn_in_flight(chat_id) {
-            return true;
+    /// Whether the addressed chat or a process in `cwd` is live. Repo Map
+    /// may close an unmatched worktree without a chat id; that path still
+    /// receives the cwd-based process protection.
+    async fn closeout_is_live(&self, chat_id: Option<&str>, cwd: &str) -> bool {
+        if let Some(chat_id) = chat_id {
+            if self.sessions.has_live_run(chat_id) || self.sessions.turn_in_flight(chat_id) {
+                return true;
+            }
         }
-        let session_id = self
-            .workspace
-            .chat(chat_id)
-            .ok()
-            .flatten()
+        let session_id = chat_id
+            .and_then(|chat_id| self.workspace.chat(chat_id).ok().flatten())
             .and_then(|c| c.harness_session_id)
             .unwrap_or_default();
         let cwd = cwd.to_string();
@@ -817,6 +857,94 @@ impl EngineRpc {
         })
         .await
         .unwrap_or(false)
+    }
+
+    fn validated_chat_closeout_cwd(
+        &self,
+        chat_id: &str,
+        requested_cwd: &str,
+    ) -> Result<std::path::PathBuf, RpcError> {
+        let chat = self
+            .workspace
+            .chat(chat_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .ok_or_else(|| RpcError::Failed(format!("cannot close out unknown chat {chat_id}")))?;
+        validated_closeout_cwd(chat_id, chat.cwd.as_deref(), requested_cwd)
+    }
+
+    fn resolved_closeout_cwd(
+        &self,
+        chat_id: Option<&str>,
+        requested_cwd: &str,
+    ) -> Result<std::path::PathBuf, RpcError> {
+        match chat_id {
+            Some(chat_id) => self.validated_chat_closeout_cwd(chat_id, requested_cwd),
+            None => std::fs::canonicalize(requested_cwd).map_err(|error| {
+                RpcError::Failed(format!(
+                    "cannot close out requested working directory `{requested_cwd}`: {error}"
+                ))
+            }),
+        }
+    }
+
+    /// Every non-archived local chat currently attached to the same canonical
+    /// checkout as `cwd`, except `excluded_chat_id` when this is a chat-bound
+    /// close-out. A worktree is shared filesystem state, even when the
+    /// sessions using it are idle.
+    async fn open_chats_on_checkout(
+        &self,
+        excluded_chat_id: Option<&str>,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<String>, RpcError> {
+        let target =
+            self.repos.checkout_identity(cwd).await.map_err(|e| {
+                RpcError::Failed(format!("could not resolve close-out checkout: {e}"))
+            })?;
+        let chats = self
+            .workspace
+            .read_chats()
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let mut shared = Vec::new();
+        for chat in chats {
+            if excluded_chat_id == Some(chat.id.as_str())
+                || chat.archived
+                || chat.device_id != self.engine_info.device_id
+            {
+                continue;
+            }
+            let Some(other_cwd) = chat.cwd.as_deref() else {
+                continue;
+            };
+            // Resolve the current cwd first because checkoutId is reconciled
+            // asynchronously and can briefly describe the chat's previous
+            // cwd after a retarget. A cwd below the worktree root is also
+            // affected by removing that worktree. Do not run git against
+            // every chat cwd here: besides being slow, probing arbitrary
+            // home folders can trigger platform privacy prompts.
+            let other_path = std::path::Path::new(other_cwd);
+            let same_checkout = if crate::repos::is_automatic_access_blocked(other_path) {
+                // Never touch broad/privacy-sensitive historical chat paths
+                // merely because the user is closing an unrelated worktree.
+                chat.checkout_id.as_deref() == Some(target.id.as_str())
+            } else {
+                match std::fs::canonicalize(other_path) {
+                    Ok(path) => path == target.root || path.starts_with(&target.root),
+                    // If the path disappeared between plan and close, the stored
+                    // identity is a conservative fallback: refusing is safer than
+                    // deleting a worktree another open chat may still reference.
+                    Err(_) => chat.checkout_id.as_deref() == Some(target.id.as_str()),
+                }
+            };
+            if same_checkout {
+                shared.push(
+                    match chat.title.as_deref().filter(|title| !title.is_empty()) {
+                        Some(title) => format!("{title} ({})", chat.id),
+                        None => chat.id,
+                    },
+                );
+            }
+        }
+        Ok(shared)
     }
 
     fn external_importer(
@@ -2412,8 +2540,14 @@ impl RpcService for EngineRpc {
             }
             methods::PLAN_CHAT_CLOSEOUT => {
                 let p: PlanChatCloseoutParams = parse_params(params)?;
-                let chat_live = self.chat_is_live(&p.chat_id, &p.cwd).await;
-                let cwd = std::path::PathBuf::from(&p.cwd);
+                let chat_id = p.chat_id.as_deref();
+                let cwd = self.resolved_closeout_cwd(chat_id, &p.cwd)?;
+                let shared = self.open_chats_on_checkout(chat_id, &cwd).await?;
+                if !shared.is_empty() {
+                    return Err(shared_closeout_error(&shared));
+                }
+                let canonical_cwd = cwd.to_string_lossy().into_owned();
+                let chat_live = self.closeout_is_live(chat_id, &canonical_cwd).await;
                 let plan = tokio::task::spawn_blocking(move || {
                     crate::chat_workspace_plan::plan_chat_closeout(&cwd, chat_live)
                 })
@@ -2423,8 +2557,14 @@ impl RpcService for EngineRpc {
             }
             methods::CLOSE_CHAT_WORKTREE => {
                 let p: CloseChatWorktreeParams = parse_params(params)?;
-                let chat_live = self.chat_is_live(&p.chat_id, &p.cwd).await;
-                let cwd = std::path::PathBuf::from(&p.cwd);
+                let chat_id = p.chat_id.as_deref();
+                let cwd = self.resolved_closeout_cwd(chat_id, &p.cwd)?;
+                let shared = self.open_chats_on_checkout(chat_id, &cwd).await?;
+                if !shared.is_empty() {
+                    return Err(shared_closeout_error(&shared));
+                }
+                let canonical_cwd = cwd.to_string_lossy().into_owned();
+                let chat_live = self.closeout_is_live(chat_id, &canonical_cwd).await;
                 let force = p.force;
                 let mut outcome = tokio::task::spawn_blocking(move || {
                     crate::chat_workspace_plan::close_chat_worktree(&cwd, force, chat_live)
@@ -2437,13 +2577,15 @@ impl RpcService for EngineRpc {
                 // the worktree is already gone, so a missing chat row
                 // (`Ok(false)`) or write error reports `archived: false`
                 // rather than failing the close-out.
-                match self.workspace.set_chat_archived(&p.chat_id, true) {
-                    Ok(archived) => outcome.archived = archived,
-                    Err(err) => tracing::warn!(
-                        chat = %p.chat_id,
-                        error = %err,
-                        "CloseChatWorktree: archiving the chat failed"
-                    ),
+                if let Some(chat_id) = p.chat_id.as_deref() {
+                    match self.workspace.set_chat_archived(chat_id, true) {
+                        Ok(archived) => outcome.archived = archived,
+                        Err(err) => tracing::warn!(
+                            chat = %chat_id,
+                            error = %err,
+                            "CloseChatWorktree: archiving the chat failed"
+                        ),
+                    }
                 }
                 RpcReply::value(&outcome)
             }
@@ -3511,8 +3653,14 @@ mod tests {
             "cwd": "/repo/.worktrees/workspace/eng-42",
         }))
         .unwrap();
-        assert_eq!(p.chat_id, "chat-1");
+        assert_eq!(p.chat_id.as_deref(), Some("chat-1"));
         assert_eq!(p.cwd, "/repo/.worktrees/workspace/eng-42");
+
+        let p: PlanChatCloseoutParams = parse_params(serde_json::json!({
+            "cwd": "/repo/.worktrees/repo-map-only",
+        }))
+        .unwrap();
+        assert_eq!(p.chat_id, None);
 
         let p: CloseChatWorktreeParams = parse_params(serde_json::json!({
             "chatId": "chat-1",
@@ -3520,9 +3668,51 @@ mod tests {
             "force": true,
         }))
         .unwrap();
-        assert_eq!(p.chat_id, "chat-1");
+        assert_eq!(p.chat_id.as_deref(), Some("chat-1"));
         assert_eq!(p.cwd, "/repo/.worktrees/workspace/eng-42");
         assert!(p.force);
+
+        let p: CloseChatWorktreeParams = parse_params(serde_json::json!({
+            "cwd": "/repo/.worktrees/repo-map-only",
+        }))
+        .unwrap();
+        assert_eq!(p.chat_id, None);
+        assert!(!p.force);
+    }
+
+    #[test]
+    fn closeout_cwd_must_match_the_chat_stored_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let stored = root.path().join("stored");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&stored).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let accepted = validated_closeout_cwd(
+            "chat-1",
+            Some(stored.to_str().unwrap()),
+            stored.join(".").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(accepted, stored.canonicalize().unwrap());
+
+        let err = validated_closeout_cwd(
+            "chat-1",
+            Some(stored.to_str().unwrap()),
+            other.to_str().unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn closeout_cwd_refuses_a_chat_without_a_stored_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let err = validated_closeout_cwd("chat-1", None, root.path().to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no stored working directory"), "{err}");
     }
 
     #[test]

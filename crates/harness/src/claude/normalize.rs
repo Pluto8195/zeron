@@ -6,6 +6,43 @@ use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 
 use super::wire::{ContentBlock, Frame};
 
+/// Keep one tool result bounded before it enters the engine journal. The
+/// document fold applies a much smaller inline-summary policy and can place
+/// the full value in its sidecar.
+const TOOL_OUTPUT_CAP: usize = 16 * 1024;
+
+fn cap_tool_output(text: &str) -> String {
+    if text.len() <= TOOL_OUTPUT_CAP {
+        return text.to_owned();
+    }
+    let mut end = TOOL_OUTPUT_CAP;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… [truncated]", &text[..end])
+}
+
+fn tool_result_output(block: &ContentBlock) -> Option<String> {
+    let output = match &block.content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str().or_else(|| {
+                    part.get("text").and_then(Value::as_str).filter(|_| {
+                        part.get("type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|kind| kind == "text")
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    (!output.trim().is_empty()).then(|| cap_tool_output(&output))
+}
+
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
 /// content and NOT as a `result` error — so a usage-limited or otherwise failed
@@ -502,7 +539,7 @@ impl Normalizer {
                                 AgentEvent::ToolResult {
                                     id: b.tool_use_id.clone(),
                                     is_error: b.is_error.unwrap_or(false),
-                                    output: None,
+                                    output: tool_result_output(&b),
                                     diff: None,
                                 },
                             )
@@ -531,7 +568,7 @@ impl Normalizer {
                     .map(|b| AgentEvent::ToolResult {
                         id: b.tool_use_id.clone(),
                         is_error: b.is_error.unwrap_or(false),
-                        output: None,
+                        output: tool_result_output(&b),
                         diff: None,
                     })
                     .collect()
@@ -804,7 +841,7 @@ mod tests {
         assert_eq!(norm.assistant_message_id, before);
 
         let frame = crate::claude::wire::parse_frame(
-            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"command output\n"}]}}"#,
         )
         .expect("parses");
         let ev = norm.normalize(frame, false);
@@ -815,9 +852,25 @@ mod tests {
                 event: Box::new(AgentEvent::ToolResult {
                     id: "t1".into(),
                     is_error: false,
-                    output: None,
+                    output: Some("command output\n".into()),
                     diff: None,
                 }),
+            }]
+        );
+    }
+
+    #[test]
+    fn parent_tool_result_preserves_text_content_blocks() {
+        let ev = normalize_one(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"first"},{"type":"image","source":{}},{"type":"text","text":"second"}]}]}}"#,
+        );
+        assert_eq!(
+            ev,
+            vec![AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: false,
+                output: Some("first\nsecond".into()),
+                diff: None,
             }]
         );
     }

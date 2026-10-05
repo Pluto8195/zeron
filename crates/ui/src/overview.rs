@@ -376,9 +376,10 @@ struct OverviewRow {
     /// chat — copied in like `subagent_count`, for the same reason (it
     /// feeds `tile_size`). See [`link_has_badge_row`].
     has_badge_row: bool,
-    /// `chat.cwd` holds a `.workspace-root` marker — the expanded detail
-    /// offers "Close out worktree…" ([`crate::chat_closeout`]). Computed in
-    /// the cached `rows()` pass so the fs check never runs per frame.
+    /// `chat.cwd` cheaply looks like a linked worktree — the expanded detail
+    /// offers "Close out worktree…" and the engine plan decides actual
+    /// eligibility. Computed in the cached `rows()` pass so the fs check never
+    /// runs per frame.
     closeable: bool,
 }
 
@@ -3032,7 +3033,7 @@ impl Overview {
                 .as_deref()
                 .and_then(|space_id| spaces.get(space_id));
             let repo = repo_key_for_chat(&chat, space);
-            let closeable = crate::chat_closeout::has_workspace_root(chat.cwd.as_deref());
+            let closeable = crate::chat_closeout::is_closeout_candidate(chat.cwd.as_deref());
             known_repos.insert(repo.clone());
             all.push(OverviewRow {
                 status,

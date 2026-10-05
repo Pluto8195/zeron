@@ -1676,6 +1676,15 @@ fn text_element(
                 .into_any_element();
         }
     }
+    // Coding agents overwhelmingly spell navigable references as inline code
+    // (`src/lib.rs:42`) rather than authoring Markdown links. Promote only an
+    // exact, unambiguous code token that resolves safely inside this chat's
+    // workspace; ordinary code and prose remain untouched.
+    let linked_runs = opts
+        .workspace_root
+        .as_deref()
+        .and_then(|root| implicit_workspace_code_links(runs, root));
+    let runs = linked_runs.as_deref().unwrap_or(runs);
     if let Some(lines) = opts
         .workspace_root
         .as_deref()
@@ -1746,6 +1755,31 @@ fn text_element(
         .line_height(crate::typography::ui_rems(line_height))
         .child(content)
         .into_any_element()
+}
+
+fn implicit_workspace_code_links(
+    runs: &[InlineRun],
+    workspace_root: &str,
+) -> Option<Vec<InlineRun>> {
+    let mut linked: Option<Vec<InlineRun>> = None;
+    for (index, run) in runs.iter().enumerate() {
+        let candidate = run.text.trim();
+        if run.style.code
+            && run.style.link.is_none()
+            && run.style.image.is_none()
+            && run.style.task.is_none()
+            && !candidate.is_empty()
+            && !candidate.chars().any(char::is_whitespace)
+            && let Some(link) =
+                crate::workspace_links::resolve_workspace_file_link(candidate, workspace_root)
+            && (candidate.contains('/') || crate::file_icons::has_specific_file_icon(&link.path))
+        {
+            linked.get_or_insert_with(|| runs.to_vec())[index]
+                .style
+                .link = Some(candidate.to_owned());
+        }
+    }
+    linked
 }
 
 /// A file icon belongs beside a link only when the whole visible paragraph is
@@ -2618,6 +2652,31 @@ mod tests {
             },
         }];
         assert_eq!(sole_file_reference(&code, "/work/comet"), None);
+    }
+
+    #[test]
+    fn inline_code_file_references_become_workspace_links() {
+        let runs = vec![InlineRun {
+            text: "src/lib.rs:42:7".into(),
+            style: InlineStyle {
+                code: true,
+                ..Default::default()
+            },
+        }];
+        let linked = implicit_workspace_code_links(&runs, "/work/comet").unwrap();
+        assert_eq!(linked[0].style.link.as_deref(), Some("src/lib.rs:42:7"));
+
+        let ordinary = vec![InlineRun {
+            text: "Vec<String>".into(),
+            style: InlineStyle {
+                code: true,
+                ..Default::default()
+            },
+        }];
+        assert_eq!(
+            implicit_workspace_code_links(&ordinary, "/work/comet"),
+            None
+        );
     }
 
     #[test]

@@ -151,9 +151,9 @@ struct ChatMenuState {
     chat_id: String,
     position: Point<Pixels>,
     page: ChatMenuPage,
-    /// The chat's cwd holds a `.workspace-root` marker — offer "Close out
-    /// worktree…" ([`crate::chat_closeout::has_workspace_root`]). Checked
-    /// once at open, not per frame.
+    /// The chat's cwd cheaply looks like a linked worktree — offer "Close out
+    /// worktree…" and let the engine plan make the authoritative eligibility
+    /// decision. Checked once at open, not per frame.
     closeable: bool,
 }
 
@@ -3023,6 +3023,22 @@ impl Shell {
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
+    pub(crate) fn open_chat_changes(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.open_chat(chat_id, cx);
+        // `open_chat` changes AppState selection immediately, while the
+        // Shell's `active_chat`/panel key follows through its state observer.
+        // Wait until that observer has reconciled so the new diff belongs to
+        // the destination chat instead of the previously active one.
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            this.update(cx, |this, cx| {
+                this.set_surfaces_open(true, cx);
+                this.add_diff_surface(cx);
+            })
+            .ok();
+        });
+    }
+
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
         self.register_diff_surface(changes, cx);
@@ -3030,6 +3046,17 @@ impl Shell {
 
     /// Open or focus a session-owned editor tab. The explorer is independent.
     fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_file_surface_at(path, None, None, window, cx);
+    }
+
+    fn add_file_surface_at(
+        &mut self,
+        path: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -3039,6 +3066,11 @@ impl Shell {
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
             let surface = RightSurface::File(id);
             self.set_right_active(surface, cx);
+            if let Some(line) = line
+                && let Some(file) = self.file_surfaces.get(&id).cloned()
+            {
+                file.update(cx, |file, cx| file.reveal_editor_location(line, column, cx));
+            }
             self.focus_right_file_editor(surface, window, cx);
             return;
         }
@@ -3104,6 +3136,9 @@ impl Shell {
                 }
             },
         );
+        if let Some(line) = line {
+            file.update(cx, |file, cx| file.reveal_editor_location(line, column, cx));
+        }
         self.file_surfaces.insert(id, file);
         self.file_surface_paths.insert(id, path);
         self.file_surface_keys.insert(lookup, id);
@@ -3144,7 +3179,7 @@ impl Shell {
         if !was_open {
             self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         }
-        self.add_file_surface(link.path, window, cx);
+        self.add_file_surface_at(link.path, link.line, link.column, window, cx);
         true
     }
 
@@ -6783,7 +6818,7 @@ impl Shell {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        let closeable = crate::chat_closeout::has_workspace_root(
+                        let closeable = crate::chat_closeout::is_closeout_candidate(
                             this.state
                                 .read(cx)
                                 .chats

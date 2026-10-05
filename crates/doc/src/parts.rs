@@ -17,9 +17,9 @@ use crate::constants::MSG_INLINE_MAX;
 /// summary, so 160 is generous.
 pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
-/// The doc-resident form of a tool output (docs/chat2-sync.md A1; the R2
-/// sidecar is PARKED as of 2026-08-10, so this IS the whole record in the
-/// doc — the full text survives only in the host's local run journal):
+/// The doc-resident form of a tool output (docs/chat2-sync.md A1). The full
+/// text lives in the sidecar while this compact summary keeps the transcript
+/// useful before (or when) that payload is fetched:
 ///
 /// - Markdown code fences are stripped first — ACP harnesses fence every
 ///   output, so the fence is transport wrapping, never content (pre-fix,
@@ -361,16 +361,15 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool OUTPUTS never enter the doc (2026-08-10 product
-                    // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
-                    // host's run journal. Inline diffs die the same way:
-                    // stats only, never text. `is_error` still folds so
-                    // failed chips read as failed.
-                    let _ = output; // journal-only
-                    *out_slot = None;
-                    *output_bytes = None;
+                    // Keep only a compact preview in the replicated doc;
+                    // the caller stamps a sidecar ref for the full payload.
+                    // Inline diffs follow the same split: stats here, full
+                    // text in the sidecar.
+                    *out_slot = output.as_deref().and_then(summarize_tool_output);
+                    *output_bytes = output
+                        .as_ref()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| text.len() as u64);
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
                 }
@@ -1084,10 +1083,8 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: outputs never enter the doc at all
-                // (journal-only); diff text neither — stats survive.
-                assert_eq!(output.as_deref(), None);
-                assert_eq!(*output_bytes, None);
+                assert_eq!(output.as_deref(), Some("running 42 tests…"));
+                assert_eq!(*output_bytes, Some(full.len() as u64));
                 assert!(diff.is_none(), "inline diff text must not enter the doc");
                 let stats = diff_stats.as_ref().unwrap();
                 assert_eq!(stats.len(), 1);
@@ -1140,10 +1137,7 @@ mod tests {
                 diff_ref,
                 ..
             } => {
-                // One-liner fold: outputs never reach the doc, so there is
-                // no output content to key even after resolution; diff
-                // STATS exist, so the diff ref still stamps.
-                assert_eq!(output_ref.as_deref(), None);
+                assert_eq!(output_ref.as_deref(), Some("chat-9/t1"));
                 assert_eq!(diff_ref.as_deref(), Some("chat-9/t1.diff"));
             }
             other => panic!("unexpected {other:?}"),

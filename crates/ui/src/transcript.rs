@@ -110,6 +110,9 @@ const TOOL_TEXT_SIZE: f32 = 12.0;
 const TOOL_LABEL_SIZE: f32 = TOOL_TEXT_SIZE;
 const TOOL_LABEL_LINE_HEIGHT: f32 = 18.0;
 const TOOL_GROUP_HEADER_HEIGHT: f32 = 26.0;
+/// Expandable activity rows must advertise that they open even before hover.
+/// Hover still brings the caret to full contrast.
+const TOOL_TRAIL_REST_OPACITY: f32 = 0.42;
 /// Compact rows retain the analytic heights used by row and group folds.
 const TOOL_TREE_ROW_HEIGHT: f32 = 32.0;
 const TOOL_FOLD: motion::MotionSpec = motion::MotionSpec::new(140, motion::EASE_OUT);
@@ -6815,7 +6818,12 @@ impl Transcript {
                                     .flex_none()
                                     .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
                             )
-                            .child(detail_body(invocation, None, theme));
+                            .child(detail_body(
+                                invocation,
+                                None,
+                                format!("{key}-invocation").into(),
+                                theme,
+                            ));
                     }
                     if let Some(detail) = detail.as_deref() {
                         panel = panel
@@ -6825,7 +6833,12 @@ impl Transcript {
                                     .flex_none()
                                     .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
                             )
-                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                            .child(detail_body(
+                                detail,
+                                detail_highlights[ix].clone(),
+                                format!("{key}-detail").into(),
+                                theme,
+                            ));
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
                         let loading = matches!(
@@ -7174,6 +7187,7 @@ fn file_badge_name(path: &str) -> &str {
 fn detail_body(
     detail: &ToolDetail,
     diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    scroll_id: SharedString,
     theme: &Theme,
 ) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
@@ -7232,24 +7246,37 @@ fn detail_body(
         ToolDetail::Output {
             lines,
             truncated_by,
-        } => body
-            .py(px(6.0))
-            .font_family(theme.font_mono.clone())
-            .text_size(px(TOOL_TEXT_SIZE))
-            .children(lines.iter().map(|line| {
-                div()
-                    .h(px(OUTPUT_LINE_HEIGHT))
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text_faint)
-                    .child(div().w_full().min_w_0().truncate().child(line.clone()))
-            }))
-            .when(*truncated_by > 0, |block| {
-                block.child(more_lines_row(*truncated_by, theme))
-            })
-            .into_any_element(),
+        } => {
+            // Keep one analytic-height row per source line, but preserve the
+            // full line horizontally. The old `.truncate()` made command
+            // invocations and output look permanently clipped even after the
+            // user expanded the tool. Wrapping would invalidate
+            // `detail_height`; an x-only viewport keeps fold geometry stable.
+            let content = div()
+                .min_w_full()
+                .flex_none()
+                .whitespace_nowrap()
+                .py(px(6.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(TOOL_TEXT_SIZE))
+                .children(lines.iter().map(|line| {
+                    div()
+                        .h(px(OUTPUT_LINE_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .text_color(theme.text_faint)
+                        .child(line.clone())
+                }))
+                .when(*truncated_by > 0, |block| {
+                    block.child(more_lines_row(*truncated_by, theme))
+                });
+            let mut viewport = body.id(scroll_id).overflow_x_scroll().child(content);
+            // Vertical transcript scrolling must continue through the local
+            // horizontal viewport; only a genuine x gesture moves it.
+            viewport.style().restrict_scroll_to_axis = Some(true);
+            viewport.into_any_element()
+        }
         ToolDetail::Thought {
             lines,
             truncated_by,
@@ -7584,7 +7611,7 @@ fn chip_header_row(
                 .size(px(18.0))
                 .flex_none()
                 .when(activity, |tile| {
-                    tile.opacity(0.0)
+                    tile.opacity(TOOL_TRAIL_REST_OPACITY)
                         .group_hover("tool-header", |style| style.opacity(1.0))
                 })
                 .when(!activity, |tile| {

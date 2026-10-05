@@ -143,9 +143,6 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for CodexHarness {
@@ -156,7 +153,6 @@ impl Default for CodexHarness {
             model_discovery_cwd: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -653,15 +649,14 @@ impl Harness for CodexHarness {
     }
 
     /// Skills from a short-lived `skills/list` probe (see
-    /// [`Self::discover_commands`]); cached on success.
+    /// [`Self::discover_commands`]). The composer owns the five-minute cache;
+    /// discovery must stay fresh so newly installed user skills appear after
+    /// that cache expires without restarting Zeron.
     // codex's `skills/list` probe boots without a chat cwd (see
     // `discover_commands`'s own doc comment) — that's this harness's own
     // existing, deliberate simplification, unchanged here.
     async fn commands(&self, _cwd: &str) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
-            .await
-            .cloned()
+        self.discover_commands().await
     }
 
     async fn run(

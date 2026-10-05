@@ -174,7 +174,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     assert!(events.contains(&AgentEvent::ToolResult {
         id: "c1".into(),
         is_error: true,
-        output: None,
+        output: Some("command output\n".into()),
         diff: None,
     }));
 
@@ -1478,7 +1478,42 @@ async fn commands_come_from_skills_list() {
         commands[1].description, "No interface block",
         "top-level description is the fallback"
     );
-    assert_eq!(h.commands("").await.expect("cache hit"), commands);
+    assert_eq!(h.commands("").await.expect("second probe"), commands);
+}
+
+#[tokio::test]
+async fn commands_refresh_newly_installed_skills_without_restarting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let counter = temp.path().join("probe-count");
+    let server = temp.path().join("fake-codex-refresh.sh");
+    let script = format!(
+        r#"#!/bin/sh
+counter="{}"
+n=0
+[ -f "$counter" ] && n=$(cat "$counter")
+n=$((n + 1))
+printf '%s' "$n" > "$counter"
+rid() {{ printf '%s' "$1" | sed 's/.*"id":\([0-9]*\).*/\1/'; }}
+read -r line || exit 1
+printf '{{"id":%s,"result":{{}}}}\n' "$(rid "$line")"
+read -r line || exit 1
+read -r line || exit 1
+printf '{{"id":%s,"result":{{"data":[{{"cwd":"","skills":[{{"name":"skill-%s","description":"fresh"}}]}}]}}}}\n' "$(rid "$line")" "$n"
+exec sleep 30
+"#,
+        counter.display()
+    );
+    std::fs::write(&server, script).unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let h = CodexHarness::new().with_executable(&server);
+    let first = h.commands("").await.expect("first discovery");
+    let second = h.commands("").await.expect("refreshed discovery");
+
+    assert_eq!(first[0].name, "skill-1");
+    assert_eq!(second[0].name, "skill-2");
 }
 
 /// Live smoke against the real CLI: `cargo test -p zeron-harness --test

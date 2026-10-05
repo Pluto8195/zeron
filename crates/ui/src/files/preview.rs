@@ -43,6 +43,28 @@ const PREVIEW_TEXT_SIZE_RATIO: f32 = PREVIEW_TEXT_SIZE / crate::typography::CODE
 const PREVIEW_LINE_HEIGHT_RATIO: f32 = PREVIEW_LINE_HEIGHT / PREVIEW_TEXT_SIZE;
 const EDITOR_COMMENT_CARD_WIDTH: f32 = 320.0;
 const EDITOR_COMMENT_CARD_MARGIN: f32 = 8.0;
+
+/// Convert a 1-based line/column target into a UTF-8 byte offset accepted by
+/// the editor, clamping gracefully when an agent cites stale source.
+fn source_location_offset(text: &str, line: u32, column: Option<u32>) -> usize {
+    let mut line_start = 0usize;
+    for _ in 1..line.max(1) {
+        let Some(next) = text[line_start..].find('\n') else {
+            return text.len();
+        };
+        line_start += next + 1;
+    }
+    let line_end = text[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(text.len());
+    let wanted = column.unwrap_or(1).max(1).saturating_sub(1) as usize;
+    text[line_start..line_end]
+        .char_indices()
+        .nth(wanted)
+        .map(|(offset, _)| line_start + offset)
+        .unwrap_or(line_end)
+}
 const EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH: f32 = 220.0;
 const EDITOR_COMMENT_DRAFT_HEIGHT: f32 = 92.0;
 // A read response is capped at 8 MiB and editable files at 1 MiB. The byte
@@ -142,6 +164,12 @@ impl FilePreviewState {
             comment_draft: None,
             active_comment: None,
             typography_generation: 0,
+        }
+    }
+
+    pub(super) fn show_source_for(&mut self, path: &str) {
+        if let Some(document) = self.documents.get_mut(path) {
+            document.show_markdown = false;
         }
     }
 
@@ -2487,7 +2515,18 @@ impl FilesSurface {
             return view.into_any_element();
         }
         self.apply_pending_external_reload(path, window, cx);
+        if self.pending_editor_location.is_some() {
+            self.preview.show_source_for(path);
+        }
         let editor = self.ensure_editor(path, theme, window, cx);
+        if let Some(editor) = &editor
+            && let Some((line, column)) = self.pending_editor_location.take()
+        {
+            editor.update(cx, |state, cx| {
+                let offset = source_location_offset(state.value().as_ref(), line, column);
+                state.set_selected_range(offset..offset, cx);
+            });
+        }
         if let Some(editor) = &editor {
             self.sync_editor_comment_anchors(path, editor, cx);
         }
@@ -3099,6 +3138,15 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_locations_are_one_based_utf8_and_clamped() {
+        let text = "zero\none éx\ntwo";
+        assert_eq!(source_location_offset(text, 1, None), 0);
+        assert_eq!(source_location_offset(text, 2, Some(1)), 5);
+        assert_eq!(source_location_offset(text, 2, Some(6)), 11);
+        assert_eq!(source_location_offset(text, 99, None), text.len());
+    }
 
     // Rendering a preview needs a window, so this asserts on `line_height`,
     // the single source both the uniform-height hint passed to

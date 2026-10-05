@@ -34,7 +34,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::EngineError;
-use crate::external_import::{RawLine, TITLEGEN_PROMPT_PREFIX, parse_blocks};
+use crate::external_import::{
+    RawLine, TITLEGEN_PROMPT_PREFIX, imported_tool_result_output, parse_blocks,
+};
 
 /// `TOOL_INPUT_PREVIEW_CHARS`/`TOOL_RESULT_PREVIEW_CHARS`
 /// (server.py:341-342).
@@ -205,7 +207,10 @@ fn build_transcript(path: &Path) -> Result<SubagentTranscript, EngineError> {
         {
             for block in parse_blocks(&message.content) {
                 if block.kind == "tool_result" && !block.tool_use_id.is_empty() {
-                    results_by_id.insert(block.tool_use_id, message_text(&block.content));
+                    results_by_id.insert(
+                        block.tool_use_id,
+                        imported_tool_result_output(&block.content).unwrap_or_default(),
+                    );
                 }
             }
         }

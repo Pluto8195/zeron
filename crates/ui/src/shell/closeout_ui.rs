@@ -3,8 +3,9 @@
 //! Opened from the sidebar chat menu's "Close out worktree…" and the
 //! overview's expanded-tile detail. Fetches `PLAN_CHAT_CLOSEOUT`, then shows
 //! one of: loading, live-chat notice, not-a-worktree notice, default-branch
-//! notice, clean confirm (`force: false`) or forced confirm with warnings
-//! (`force: true`). Live and plan-failed states offer "Check again".
+//! notice, clean one-step confirm (`force: false`) or a two-step forced
+//! confirm with warnings (`force: true`). Live and plan-failed states offer
+//! "Check again".
 //! Engine errors from `CLOSE_CHAT_WORKTREE` render verbatim inside the
 //! still-open dialog, which then re-plans quietly so its buttons track the
 //! engine's current view. On success the engine archives the chat;
@@ -23,7 +24,9 @@ pub(super) enum CloseoutPhase {
 }
 
 pub(super) struct CloseoutDialog {
-    chat_id: String,
+    /// Present when the worktree is attached to a chat. Repo Map can also
+    /// close an unmatched worktree, in which case the engine receives null.
+    chat_id: Option<String>,
     cwd: String,
     title: String,
     /// Stale-reply guard ([`co::reply_is_current`]): replies for an earlier
@@ -32,6 +35,9 @@ pub(super) struct CloseoutDialog {
     phase: CloseoutPhase,
     /// A `CLOSE_CHAT_WORKTREE` is in flight (ignore repeat clicks).
     submitting: bool,
+    /// The user completed the first of two force-close clicks. Cleared any
+    /// time the dialog is reopened or its plan is refreshed.
+    force_armed: bool,
     /// The close call's error, verbatim; the dialog stays open.
     error: Option<String>,
 }
@@ -58,11 +64,24 @@ impl Shell {
                 .unwrap_or_else(|| "New session".into()),
         );
         let cwd = chat.and_then(|c| c.cwd).unwrap_or_default();
+        self.open_worktree_closeout(cwd, title, Some(chat_id), cx);
+    }
+
+    /// Open the protected close-out flow for a checkout selected outside a
+    /// chat surface (for example Repo Map). `chat_id` is optional because a
+    /// discovered worktree need not have a matched chat.
+    pub(crate) fn open_worktree_closeout(
+        &mut self,
+        cwd: String,
+        title: String,
+        chat_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.closeout_seq += 1;
         let request_id = self.closeout_seq;
         let connected = self.state.read(cx).engine().is_some();
         let phase = if cwd.trim().is_empty() {
-            CloseoutPhase::PlanFailed("This chat has no folder to close out.".into())
+            CloseoutPhase::PlanFailed("This worktree has no folder to close out.".into())
         } else if !connected {
             CloseoutPhase::PlanFailed("Engine not connected".into())
         } else {
@@ -76,6 +95,7 @@ impl Shell {
             request_id,
             phase,
             submitting: false,
+            force_armed: false,
             error: None,
         });
         cx.notify();
@@ -116,14 +136,18 @@ impl Shell {
                     return;
                 };
                 match result {
-                    Ok(plan) => dialog.phase = CloseoutPhase::Ready(plan),
+                    Ok(plan) => {
+                        dialog.phase = CloseoutPhase::Ready(plan);
+                        dialog.force_armed = false;
+                    }
                     Err(err) => {
-                        tracing::warn!(chat = %dialog.chat_id, error = %err, "PlanChatCloseout failed");
+                        tracing::warn!(chat = ?dialog.chat_id, error = %err, "PlanChatCloseout failed");
                         let quiet_replan =
                             matches!(dialog.phase, CloseoutPhase::Ready(_)) && dialog.error.is_some();
                         if !quiet_replan {
                             dialog.phase = CloseoutPhase::PlanFailed(err);
                         }
+                        dialog.force_armed = false;
                     }
                 }
                 cx.notify();
@@ -142,6 +166,7 @@ impl Shell {
         if dialog.submitting {
             return;
         }
+        dialog.force_armed = false;
         if self.state.read(cx).engine().is_none() {
             dialog.phase = CloseoutPhase::PlanFailed("Engine not connected".into());
         } else {
@@ -205,7 +230,7 @@ impl Shell {
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(chat = %chat_id, error = %err, "CloseChatWorktree failed");
+                        tracing::warn!(chat = ?chat_id, error = %err, "CloseChatWorktree failed");
                         if current {
                             if let Some(dialog) = shell.closeout_dialog.as_mut() {
                                 dialog.submitting = false;
@@ -227,6 +252,31 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    /// Clean close-out submits immediately. A force close first arms a
+    /// deliberately explicit permanent-discard state; only a second click
+    /// can issue the destructive RPC.
+    fn proceed_chat_closeout(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.closeout_dialog.as_mut() else {
+            return;
+        };
+        if dialog.submitting {
+            return;
+        }
+        let verdict = match &dialog.phase {
+            CloseoutPhase::Ready(plan) => co::verdict(plan),
+            _ => return,
+        };
+        match co::proceed_action(verdict, dialog.force_armed) {
+            co::CloseoutProceed::Blocked => {}
+            co::CloseoutProceed::ArmForce => {
+                dialog.force_armed = true;
+                dialog.error = None;
+                cx.notify();
+            }
+            co::CloseoutProceed::Submit { force } => self.submit_chat_closeout(force, cx),
+        }
     }
 
     pub(super) fn render_closeout_overlay(
@@ -255,7 +305,8 @@ impl Shell {
             Some(
                 CloseoutVerdict::Live
                 | CloseoutVerdict::NotWorktree
-                | CloseoutVerdict::OnDefaultBranch,
+                | CloseoutVerdict::OnDefaultBranch
+                | CloseoutVerdict::DirtyInspectionFailed,
             ) => "Can\u{2019}t close out worktree",
             Some(CloseoutVerdict::NeedsForce) => "Force close out worktree?",
             _ => "Close out worktree?",
@@ -277,11 +328,8 @@ impl Shell {
             }
             CloseoutPhase::PlanFailed(err) => {
                 body.push(
-                    popover::dialog_body(
-                        &theme,
-                        "Couldn\u{2019}t inspect this chat\u{2019}s worktree.",
-                    )
-                    .into_any_element(),
+                    popover::dialog_body(&theme, "Couldn\u{2019}t inspect this worktree.")
+                        .into_any_element(),
                 );
                 body.push(small(err.clone(), theme.danger).into_any_element());
             }
@@ -312,7 +360,10 @@ impl Shell {
                     );
                 }
                 body.push(popover::dialog_body(&theme, co::body_copy(plan)).into_any_element());
-                if verdict == CloseoutVerdict::NeedsForce {
+                if matches!(
+                    verdict,
+                    CloseoutVerdict::NeedsForce | CloseoutVerdict::DirtyInspectionFailed
+                ) {
                     let mut warnings = div()
                         .flex()
                         .flex_col()
@@ -329,6 +380,9 @@ impl Shell {
                                 .child(div().pl(px(10.0)).child(mono(line, theme.text_muted)));
                         }
                     }
+                    if let Some(line) = co::dirty_inspection_label(plan) {
+                        warnings = warnings.child(small(line, theme.danger));
+                    }
                     if let Some(line) = co::unmerged_label(plan) {
                         warnings = warnings.child(small(line, theme.danger));
                     }
@@ -336,6 +390,16 @@ impl Shell {
                         warnings = warnings.child(small(line, theme.danger));
                     }
                     body.push(warnings.into_any_element());
+                    if dialog.force_armed {
+                        body.push(
+                            small(
+                                "Confirm permanent discard: this work cannot be recovered after the worktree is removed."
+                                    .to_string(),
+                                theme.danger,
+                            )
+                            .into_any_element(),
+                        );
+                    }
                 }
             }
         }
@@ -344,10 +408,13 @@ impl Shell {
         }
 
         let submitting = dialog.submitting;
+        let force_armed = dialog.force_armed;
         let proceed = verdict.filter(|v| v.can_proceed()).map(|verdict| {
             let force = verdict.force();
             let label = if submitting {
                 "Closing out\u{2026}"
+            } else if force && force_armed {
+                "Permanently discard & close out"
             } else {
                 verdict.button_label().unwrap_or("Close out")
             };
@@ -358,7 +425,7 @@ impl Shell {
                     "closeout-confirm"
                 })
                 .when(submitting, |button| button.opacity(0.6))
-                .on_click(cx.listener(move |this, _, _, cx| this.submit_chat_closeout(force, cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.proceed_chat_closeout(cx)))
         });
         let cancel_label = if verdict.is_some_and(|v| !v.can_proceed()) {
             "Close"
@@ -366,9 +433,13 @@ impl Shell {
             "Cancel"
         };
         // Worth re-asking only when the answer can change without reopening:
-        // a live chat that's since been stopped, or a failed plan call.
+        // a live chat that's since been stopped, a transient dirty-inspection
+        // failure, or a failed plan call.
         let recheck = (matches!(dialog.phase, CloseoutPhase::PlanFailed(_))
-            || verdict == Some(CloseoutVerdict::Live))
+            || matches!(
+                verdict,
+                Some(CloseoutVerdict::Live | CloseoutVerdict::DirtyInspectionFailed)
+            ))
         .then(|| {
             popover::btn_ghost(&theme, "Check again", "closeout-recheck")
                 .id("closeout-recheck")

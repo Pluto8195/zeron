@@ -183,6 +183,9 @@ pub struct FilesSurface {
     review_comment_flush_source: u64,
     presentation: FilesPresentation,
     editor_path: Option<String>,
+    /// One-shot location requested by a transcript workspace link. Applied
+    /// after the async file load creates its editor.
+    pending_editor_location: Option<(u32, Option<u32>)>,
     request_context: Option<FilesRequestContext>,
     target_change_pending: bool,
     selected_editor_path: Option<String>,
@@ -504,6 +507,7 @@ impl FilesSurface {
                 .fetch_add(1, Ordering::Relaxed),
             presentation,
             editor_path: editor_path.clone(),
+            pending_editor_location: None,
             request_context: None,
             target_change_pending: false,
             selected_editor_path: None,
@@ -707,6 +711,21 @@ impl FilesSurface {
         if !self.presentation.is_editor() {
             self.ensure_tree_loaded(cx);
         }
+    }
+
+    /// Reveal a 1-based source location once this editor is ready. Markdown
+    /// links with a line target intentionally switch from preview to source.
+    pub(crate) fn reveal_editor_location(
+        &mut self,
+        line: u32,
+        column: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_editor_location = Some((line.max(1), column));
+        if let Some(path) = self.editor_path.as_deref() {
+            self.preview.show_source_for(path);
+        }
+        cx.notify();
     }
 
     fn ensure_tree_loaded(&mut self, cx: &mut Context<Self>) {

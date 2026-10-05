@@ -1,10 +1,7 @@
 //! Durable PR/ticket links (ticket 0xx) backfilled onto chats imported
 //! before the feature existed — `ExternalSessionImporter::repair_missing_links`.
-//! Covers the realistic Claude Code signal (a PR URL/ticket id the agent
-//! narrates back in its own message text — the only reliable one for a real
-//! on-disk transcript; see `external_import.rs`'s `mine_links_from_entries`
-//! doc comment for why tool-result text isn't), plus the pass's idempotency
-//! and its "already linked" / "no chat row" skip guards.
+//! Covers Claude Code's tool-result and assistant-message signals, plus the
+//! pass's idempotency and its "already linked" / "no chat row" skip guards.
 
 use std::sync::Arc;
 
@@ -17,8 +14,7 @@ fn assemble(profile: EngineProfile) -> EngineCore {
 }
 
 /// A synthetic on-disk transcript where the agent creates a PR and narrates
-/// its URL back — the realistic "mentioned" signal for a real Claude Code
-/// transcript (`mine_links_from_entries` never sees real tool-result text).
+/// its URL back. The creation-shaped tool result wins over the later mention.
 fn transcript_with_pr_mention() -> String {
     [
         r#"{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"open a pr for this fix, ticket ENG-2715"},"uuid":"u1","timestamp":"2026-01-01T00:00:01.000Z","cwd":"/work/project","sessionId":"sess-1"}"#,
@@ -80,7 +76,7 @@ async fn repair_mines_a_pr_and_ticket_mention_from_the_transcript() {
         after.linked_pr_url.as_deref(),
         Some("https://github.com/acme/widgets/pull/42")
     );
-    assert_eq!(after.linked_pr_source, Some(ChatLinkSource::Mentioned));
+    assert_eq!(after.linked_pr_source, Some(ChatLinkSource::CreatedInChat));
     assert_eq!(after.linked_ticket_id.as_deref(), Some("ENG-2715"));
     assert_eq!(after.linked_ticket_source, Some(ChatLinkSource::Mentioned));
 

@@ -2048,15 +2048,11 @@ struct MinedLinks {
 /// the offline counterpart to the live tap's per-event mining
 /// (`sessions.rs`'s `drive_run` + `note_message`). The `MessagePart::Tool`
 /// branch below is a defensive no-op for THIS importer's actual input: a
-/// Claude Code on-disk transcript's `tool_result` blocks carry no output text
-/// at all (`parse_transcript`'s own `RawBlock` never captures one, matching
-/// `AgentEvent::ToolResult.output`'s live-wire contract for claude/codex —
-/// see `chat_links`'s module doc comment), so `output` is `None` here in
-/// practice, same as live. The reliable signal for a REAL Claude Code
-/// transcript is the `Text` branch: the agent narrates a created PR's URL
-/// back in its own reply, which lands as `mentioned` here exactly as it does
-/// live via `note_message`. The `Tool` branch exists for a hypothetical
-/// caller whose parts DO carry output (kept correct, not reachable today).
+/// Claude Code on-disk `tool_result` blocks carry their result body in
+/// `content`; [`parse_transcript`] retains a bounded copy on the matching tool
+/// part. That makes tool output a first-class link signal just like the live
+/// event path. Assistant message text remains the fallback for transcripts
+/// written by older clients or tools whose result body is empty.
 fn mine_links_from_entries(entries: &[(usize, SessionMessageEntry)]) -> MinedLinks {
     let mut mined = MinedLinks::default();
     for (_, entry) in entries {
@@ -2213,11 +2209,9 @@ pub(crate) struct RawBlock {
     is_error: Option<bool>,
     /// A `tool_result` block's own nested result payload — same
     /// string-or-content-array shape as a top-level `message.content`.
-    /// Unused by `parse_transcript` (which gets tool-result text from the
-    /// LIVE wire's separate `ToolResult.output`, never the on-disk echo —
-    /// see `mine_links_from_entries`'s doc comment); added for
-    /// `subagent_transcript.rs`'s two-pass `tool_use_id` -> preview lookup,
-    /// which mirrors `session_canvas_server.py`'s `build_transcript_turns`.
+    /// Used by both the parent transcript importer and
+    /// `subagent_transcript.rs`'s two-pass `tool_use_id` -> preview lookup.
+    /// Claude writes either a plain string or an array of text blocks here.
     #[serde(default)]
     pub(crate) content: Value,
 }
@@ -2231,6 +2225,42 @@ pub(crate) fn parse_blocks(content: &Value) -> Vec<RawBlock> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Match the live Claude normalizer's per-result bound. Imported transcripts
+/// are untrusted, long-lived files; one noisy command must not become one
+/// unbounded document event.
+const IMPORTED_TOOL_OUTPUT_CAP: usize = 16 * 1024;
+
+pub(crate) fn imported_tool_result_output(content: &Value) -> Option<String> {
+    let output = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str().or_else(|| {
+                    part.get("text").and_then(Value::as_str).filter(|_| {
+                        part.get("type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|kind| kind == "text")
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    if output.trim().is_empty() {
+        return None;
+    }
+    if output.len() <= IMPORTED_TOOL_OUTPUT_CAP {
+        return Some(output);
+    }
+    let mut end = IMPORTED_TOOL_OUTPUT_CAP;
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}\n… [truncated]", &output[..end]))
 }
 
 /// A real human-typed message's text, or `None` when `content` is a
@@ -3389,7 +3419,7 @@ fn parse_transcript(path: &Path, device_id: &str) -> Result<ParsedTranscript, En
                         let event = AgentEvent::ToolResult {
                             id: block.tool_use_id.clone(),
                             is_error: block.is_error.unwrap_or(false),
-                            output: None,
+                            output: imported_tool_result_output(&block.content),
                             diff: None,
                         };
                         fold_event_into_parts(&mut turn_parts, &event);
@@ -3484,6 +3514,40 @@ fn parse_transcript(path: &Path, device_id: &str) -> Result<ParsedTranscript, En
         skills_loaded: tally.skills_loaded_sorted(),
         classification_input: tally.classification_input(),
     })
+}
+
+#[cfg(test)]
+mod imported_tool_output_tests {
+    use super::*;
+
+    #[test]
+    fn reads_every_claude_text_shape_and_ignores_non_text_blocks() {
+        assert_eq!(
+            imported_tool_result_output(&Value::String("plain output".into())).as_deref(),
+            Some("plain output")
+        );
+        let blocks = serde_json::json!([
+            {"type": "text", "text": "first"},
+            "second",
+            {"text": "third"},
+            {"type": "image", "text": "not output text"}
+        ]);
+        assert_eq!(
+            imported_tool_result_output(&blocks).as_deref(),
+            Some("first\nsecond\nthird")
+        );
+        assert!(imported_tool_result_output(&serde_json::json!([])).is_none());
+    }
+
+    #[test]
+    fn caps_output_without_splitting_utf8() {
+        let output = format!("{}🦀tail", "x".repeat(IMPORTED_TOOL_OUTPUT_CAP - 1));
+        let bounded = imported_tool_result_output(&Value::String(output)).expect("output");
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.ends_with("… [truncated]"));
+        assert!(!bounded.contains("tail"));
+        assert!(bounded.len() <= IMPORTED_TOOL_OUTPUT_CAP + "\n… [truncated]".len());
+    }
 }
 
 #[cfg(test)]

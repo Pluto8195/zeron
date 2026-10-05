@@ -3,12 +3,14 @@
 //!
 //! Two engine calls, both IPC-only:
 //! - [`PLAN_CHAT_CLOSEOUT`] (read-only) feeds the confirmation dialog.
-//! - [`CLOSE_CHAT_WORKTREE`] (destructive) runs on confirm; `force` is sent
-//!   only from the "Force close out" button, which the dialog offers only
-//!   when the plan reports soft blockers (dirty tree / unmerged commits).
+//! - [`CLOSE_CHAT_WORKTREE`] (destructive) runs on confirm; clean worktrees
+//!   close in one step, while dirty/unmerged/unverifiable worktrees require a
+//!   second, explicit permanent-discard confirmation before `force` is sent.
 //!
-//! The action is offered on chats whose cwd holds a `.workspace-root` marker
-//! ([`has_workspace_root`], the same signal the overview's `repo_key` uses).
+//! The action is offered when a chat cwd cheaply looks like an agent worktree:
+//! either it has Zeron's `.workspace-root` marker or its `.git` metadata is a
+//! file, as Git uses for linked worktrees. The engine remains authoritative
+//! about whether the candidate is actually safe and eligible to remove.
 //! Everything here is pure so the decode/format/state logic is unit-testable
 //! without a gpui context; the dialog itself lives in `shell/closeout_ui.rs`.
 
@@ -31,12 +33,19 @@ pub const DIRTY_FILES_CAP: usize = 20;
 /// How many dirty filenames the dialog lists before "+N more".
 pub const DIRTY_FILES_SHOWN: usize = 5;
 
-/// Cheap visibility predicate for the "Close out worktree…" action: the
-/// chat's cwd has a `.workspace-root` file. The engine does the real check
-/// (marker AND registered linked worktree) in the plan.
-pub fn has_workspace_root(cwd: Option<&str>) -> bool {
-    cwd.filter(|c| !c.trim().is_empty())
-        .is_some_and(|c| std::path::Path::new(c).join(".workspace-root").is_file())
+/// Cheap visibility predicate for the "Close out worktree…" action.
+///
+/// Zeron-created worktrees may carry a `.workspace-root` marker. Imported or
+/// otherwise ordinary linked worktrees instead have a `.git` *file* at their
+/// root (main checkouts have a `.git` directory). This intentionally only
+/// decides whether to expose the action; the engine plan validates that the
+/// cwd is the chat's registered, removable linked worktree.
+pub fn is_closeout_candidate(cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd.filter(|c| !c.trim().is_empty()) else {
+        return false;
+    };
+    let cwd = std::path::Path::new(cwd);
+    cwd.join(".workspace-root").is_file() || cwd.join(".git").is_file()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -47,8 +56,14 @@ pub struct CloseoutPlan {
     pub chat_live: bool,
     pub dirty: bool,
     pub dirty_files: Vec<String>,
+    /// Why dirty-state inspection could not be completed. This is a hard
+    /// blocker because force cannot safely distinguish or preserve work.
+    pub dirty_inspection_error: Option<String>,
     pub unmerged_commits: u32,
     pub default_branch: Option<String>,
+    /// Why merge inspection could not be completed. Unlike dirty inspection,
+    /// this is forceable after the destructive two-step acknowledgement.
+    pub merge_inspection_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +110,14 @@ pub fn decode_plan(value: &Value) -> Result<CloseoutPlan, String> {
         dirty: value.get("dirty").and_then(Value::as_bool).unwrap_or(false)
             || !dirty_files.is_empty(),
         dirty_files,
+        dirty_inspection_error: opt_str("dirtyInspectionError"),
         unmerged_commits: value
             .get("unmergedCommits")
             .and_then(Value::as_u64)
             .map(|n| n.min(u32::MAX as u64) as u32)
             .unwrap_or(0),
         default_branch: opt_str("defaultBranch"),
+        merge_inspection_error: opt_str("mergeInspectionError"),
     })
 }
 
@@ -128,6 +145,9 @@ pub enum CloseoutVerdict {
     Live,
     /// Checked out on the repo's default branch — a hard refusal.
     OnDefaultBranch,
+    /// Git could not establish whether uncommitted work exists. The engine
+    /// refuses even with force, so the user must fix/retry inspection.
+    DirtyInspectionFailed,
     /// Nothing to lose — a normal destructive "Close out" (`force: false`).
     Clean,
     /// Dirty and/or unmerged (or unverifiable) — only "Force close out"
@@ -155,10 +175,33 @@ impl CloseoutVerdict {
     }
 }
 
+/// Pure proceed-state decision for the confirmation dialog. Keeping this
+/// separate from the GPUI click handler makes the destructive two-step guard
+/// straightforward to pin with tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseoutProceed {
+    /// The plan cannot currently be closed out.
+    Blocked,
+    /// First force click: reveal the permanent-discard acknowledgement.
+    ArmForce,
+    /// Perform the close-out RPC with the supplied `force` flag.
+    Submit { force: bool },
+}
+
+pub fn proceed_action(verdict: CloseoutVerdict, force_armed: bool) -> CloseoutProceed {
+    match verdict {
+        CloseoutVerdict::Clean => CloseoutProceed::Submit { force: false },
+        CloseoutVerdict::NeedsForce if force_armed => CloseoutProceed::Submit { force: true },
+        CloseoutVerdict::NeedsForce => CloseoutProceed::ArmForce,
+        _ => CloseoutProceed::Blocked,
+    }
+}
+
 /// The engine refuses a non-forced close when it can't resolve the default
-/// branch to verify a checked-out branch is merged — so that case needs force.
+/// branch. That makes merge safety unverifiable for both named branches and
+/// detached HEADs, which may still contain unique commits.
 fn merge_unverifiable(plan: &CloseoutPlan) -> bool {
-    plan.branch.is_some() && plan.default_branch.is_none()
+    plan.default_branch.is_none() || plan.merge_inspection_error.is_some()
 }
 
 /// Permanent blockers first (not a worktree, default branch — stopping the
@@ -173,6 +216,8 @@ pub fn verdict(plan: &CloseoutPlan) -> CloseoutVerdict {
         CloseoutVerdict::OnDefaultBranch
     } else if plan.chat_live {
         CloseoutVerdict::Live
+    } else if plan.dirty_inspection_error.is_some() {
+        CloseoutVerdict::DirtyInspectionFailed
     } else if plan.dirty || plan.unmerged_commits > 0 || merge_unverifiable(plan) {
         CloseoutVerdict::NeedsForce
     } else {
@@ -232,12 +277,24 @@ pub fn unmerged_label(plan: &CloseoutPlan) -> Option<String> {
 
 /// Warning shown when merge status can't be verified (no default branch).
 pub fn unverifiable_label(plan: &CloseoutPlan) -> Option<String> {
-    (merge_unverifiable(plan) && plan.unmerged_commits == 0).then(|| {
-        format!(
-            "Couldn't resolve the default branch to verify {} is merged",
-            plan.branch.as_deref().unwrap_or("HEAD")
-        )
+    (merge_unverifiable(plan) && plan.unmerged_commits == 0).then(|| match plan.branch.as_deref() {
+        _ if plan.merge_inspection_error.is_some() => format!(
+            "Couldn\u{2019}t verify whether commits are merged: {}",
+            plan.merge_inspection_error.as_deref().unwrap_or_default()
+        ),
+        Some(branch) => {
+            format!("Couldn't resolve the default branch to verify {branch} is merged")
+        }
+        None => "Couldn't resolve the default branch to verify detached HEAD commits are merged"
+            .to_string(),
     })
+}
+
+/// Warning shown when git could not establish whether the worktree is dirty.
+pub fn dirty_inspection_label(plan: &CloseoutPlan) -> Option<String> {
+    plan.dirty_inspection_error
+        .as_deref()
+        .map(|error| format!("Couldn\u{2019}t verify uncommitted changes: {error}"))
 }
 
 /// The dialog's `label: value` summary of what gets torn down. Empty for a
@@ -277,6 +334,8 @@ pub fn body_copy(plan: &CloseoutPlan) -> String {
              closed out.",
             plan.branch.as_deref().unwrap_or("default")
         ),
+        CloseoutVerdict::DirtyInspectionFailed => "Couldn\u{2019}t safely inspect this worktree for uncommitted changes. Close out is blocked until inspection succeeds."
+            .to_string(),
         CloseoutVerdict::Clean => match plan.branch.as_deref() {
             Some(branch) => format!(
                 "Removes the worktree, deletes its branch {branch}, and archives this chat. \
@@ -290,6 +349,11 @@ pub fn body_copy(plan: &CloseoutPlan) -> String {
             let mut losses: Vec<String> = Vec::new();
             if plan.dirty {
                 losses.push("permanently discards the uncommitted changes below".into());
+            } else if plan.dirty_inspection_error.is_some() {
+                losses.push(
+                    "may permanently discard uncommitted changes that couldn\u{2019}t be inspected"
+                        .into(),
+                );
             }
             if let Some(branch) = plan.branch.as_deref() {
                 losses.push(if plan.unmerged_commits > 0 {
@@ -299,6 +363,16 @@ pub fn body_copy(plan: &CloseoutPlan) -> String {
                 } else {
                     format!("deletes {branch}")
                 });
+            } else if plan.unmerged_commits > 0 {
+                losses.push(format!(
+                    "discards {} on detached HEAD",
+                    plural(plan.unmerged_commits as usize, "unique commit")
+                ));
+            } else if merge_unverifiable(plan) {
+                losses.push(
+                    "may discard commits on detached HEAD because merge status can\u{2019}t be verified"
+                        .into(),
+                );
             }
             losses.push("removes the worktree".into());
             format!(
@@ -343,8 +417,10 @@ mod tests {
             chat_live: false,
             dirty: false,
             dirty_files: vec![],
+            dirty_inspection_error: None,
             unmerged_commits: 0,
             default_branch: Some("main".into()),
+            merge_inspection_error: None,
         }
     }
 
@@ -357,8 +433,10 @@ mod tests {
             "chatLive": false,
             "dirty": true,
             "dirtyFiles": ["src/a.rs", "b.txt"],
+            "dirtyInspectionError": "git status timed out",
             "unmergedCommits": 2,
             "defaultBranch": "main",
+            "mergeInspectionError": "rev-list timed out",
         }))
         .unwrap();
         assert_eq!(
@@ -370,8 +448,10 @@ mod tests {
                 chat_live: false,
                 dirty: true,
                 dirty_files: vec!["src/a.rs".into(), "b.txt".into()],
+                dirty_inspection_error: Some("git status timed out".into()),
                 unmerged_commits: 2,
                 default_branch: Some("main".into()),
+                merge_inspection_error: Some("rev-list timed out".into()),
             }
         );
     }
@@ -392,6 +472,8 @@ mod tests {
         assert!(!p.is_worktree);
         assert_eq!(p.branch, None);
         assert_eq!(p.default_branch, None);
+        assert_eq!(p.dirty_inspection_error, None);
+        assert_eq!(p.merge_inspection_error, None);
         assert_eq!(verdict(&p), CloseoutVerdict::NotWorktree);
     }
 
@@ -463,14 +545,39 @@ mod tests {
         unverifiable.default_branch = None;
         assert_eq!(verdict(&unverifiable), CloseoutVerdict::NeedsForce);
 
-        // Detached HEAD with no default branch has nothing to verify.
+        // Detached HEAD may still contain unique commits. Without a default
+        // branch the engine cannot prove removing it is safe.
         let mut detached = plan();
         detached.branch = None;
         detached.default_branch = None;
-        assert_eq!(verdict(&detached), CloseoutVerdict::Clean);
+        assert_eq!(verdict(&detached), CloseoutVerdict::NeedsForce);
 
         assert!(!CloseoutVerdict::Clean.force());
         assert_eq!(CloseoutVerdict::Clean.button_label(), Some("Close out"));
+    }
+
+    #[test]
+    fn destructive_proceed_requires_two_steps_but_clean_does_not() {
+        assert_eq!(
+            proceed_action(CloseoutVerdict::Clean, false),
+            CloseoutProceed::Submit { force: false }
+        );
+        assert_eq!(
+            proceed_action(CloseoutVerdict::NeedsForce, false),
+            CloseoutProceed::ArmForce
+        );
+        assert_eq!(
+            proceed_action(CloseoutVerdict::NeedsForce, true),
+            CloseoutProceed::Submit { force: true }
+        );
+        assert_eq!(
+            proceed_action(CloseoutVerdict::Live, true),
+            CloseoutProceed::Blocked
+        );
+        assert_eq!(
+            proceed_action(CloseoutVerdict::DirtyInspectionFailed, true),
+            CloseoutProceed::Blocked
+        );
     }
 
     #[test]
@@ -522,7 +629,31 @@ mod tests {
             unverifiable_label(&p).as_deref(),
             Some("Couldn't resolve the default branch to verify zeron/eng-1 is merged")
         );
+        p.branch = None;
+        assert_eq!(
+            unverifiable_label(&p).as_deref(),
+            Some("Couldn't resolve the default branch to verify detached HEAD commits are merged")
+        );
         assert_eq!(unverifiable_label(&plan()), None);
+
+        let mut inspection_failed = plan();
+        inspection_failed.dirty_inspection_error = Some("git status timed out".into());
+        assert_eq!(
+            dirty_inspection_label(&inspection_failed).as_deref(),
+            Some("Couldn\u{2019}t verify uncommitted changes: git status timed out")
+        );
+        assert_eq!(
+            verdict(&inspection_failed),
+            CloseoutVerdict::DirtyInspectionFailed
+        );
+
+        let mut merge_failed = plan();
+        merge_failed.merge_inspection_error = Some("rev-list timed out".into());
+        assert_eq!(verdict(&merge_failed), CloseoutVerdict::NeedsForce);
+        assert_eq!(
+            unverifiable_label(&merge_failed).as_deref(),
+            Some("Couldn\u{2019}t verify whether commits are merged: rev-list timed out")
+        );
     }
 
     #[test]
@@ -550,7 +681,14 @@ mod tests {
         assert!(body_copy(&plan()).contains("deletes its branch zeron/eng-1"));
         let mut detached = plan();
         detached.branch = None;
+        detached.default_branch = Some("main".into());
         assert!(body_copy(&detached).contains("no branch to delete"));
+
+        let mut detached_unverifiable = detached.clone();
+        detached_unverifiable.default_branch = None;
+        let copy = body_copy(&detached_unverifiable);
+        assert!(copy.contains("may discard commits on detached HEAD"));
+        assert!(copy.contains("merge status can\u{2019}t be verified"));
 
         // Dirty only: work is lost, branch is deleted (merged, so no caveat).
         let mut dirty = plan();
@@ -582,21 +720,54 @@ mod tests {
         let mut dirty_detached = dirty.clone();
         dirty_detached.branch = None;
         assert!(!body_copy(&dirty_detached).contains("deletes"));
+
+        let mut unmerged_detached = plan();
+        unmerged_detached.branch = None;
+        unmerged_detached.unmerged_commits = 2;
+        let copy = body_copy(&unmerged_detached);
+        assert!(copy.contains("discards 2 unique commits on detached HEAD"));
+
+        let mut inspection_failed = plan();
+        inspection_failed.dirty_inspection_error = Some("git status timed out".into());
+        let copy = body_copy(&inspection_failed);
+        assert!(copy.contains("Close out is blocked until inspection succeeds"));
+
+        let mut merge_failed = plan();
+        merge_failed.merge_inspection_error = Some("rev-list timed out".into());
+        let copy = body_copy(&merge_failed);
+        assert!(copy.contains("can\u{2019}t be verified as merged"));
     }
 
     #[test]
-    fn workspace_root_predicate() {
+    fn closeout_candidate_accepts_marker_or_linked_worktree_git_file() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        assert!(!has_workspace_root(Some(cwd)));
+        assert!(!is_closeout_candidate(Some(cwd)));
         std::fs::write(dir.path().join(".workspace-root"), "/r\n").unwrap();
-        assert!(has_workspace_root(Some(cwd)));
-        assert!(!has_workspace_root(None));
-        assert!(!has_workspace_root(Some("")));
-        // A directory named like the marker doesn't count.
-        let other = tempfile::tempdir().unwrap();
-        std::fs::create_dir(other.path().join(".workspace-root")).unwrap();
-        assert!(!has_workspace_root(other.path().to_str()));
+        assert!(is_closeout_candidate(Some(cwd)));
+
+        let linked = tempfile::tempdir().unwrap();
+        std::fs::write(
+            linked.path().join(".git"),
+            "gitdir: /repo/.git/worktrees/wt\n",
+        )
+        .unwrap();
+        assert!(is_closeout_candidate(linked.path().to_str()));
+    }
+
+    #[test]
+    fn closeout_candidate_rejects_missing_empty_and_directory_sentinels() {
+        assert!(!is_closeout_candidate(None));
+        assert!(!is_closeout_candidate(Some("")));
+        assert!(!is_closeout_candidate(Some("   ")));
+
+        let unrelated = tempfile::tempdir().unwrap();
+        assert!(!is_closeout_candidate(unrelated.path().to_str()));
+
+        // Main checkouts use a `.git` directory, which is not closeable.
+        std::fs::create_dir(unrelated.path().join(".git")).unwrap();
+        std::fs::create_dir(unrelated.path().join(".workspace-root")).unwrap();
+        assert!(!is_closeout_candidate(unrelated.path().to_str()));
     }
 
     #[test]

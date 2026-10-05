@@ -150,17 +150,19 @@ async fn transcript_content_lands_in_the_doc_with_live_equivalent_shape() {
                 call,
                 resolved,
                 is_error,
+                output,
                 ..
-            } => Some((call.clone(), *resolved, *is_error)),
+            } => Some((call.clone(), *resolved, *is_error, output.clone())),
             _ => None,
         })
         .expect("assistant turn has a tool part");
-    let (call, resolved, is_error) = tool_part;
+    let (call, resolved, is_error, output) = tool_part;
     assert!(
         resolved,
         "tool_result line must resolve the matching Tool part"
     );
     assert!(!is_error);
+    assert_eq!(output.as_deref(), Some("ok"));
     match call {
         zeron_proto::ToolCall::WriteFile { path, content } => {
             assert_eq!(path, "/work/project/health.rs");

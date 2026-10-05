@@ -253,7 +253,9 @@ async fn plan_chat_closeout_reply_has_exactly_the_pinned_wire_fields() {
             "defaultBranch",
             "dirty",
             "dirtyFiles",
+            "dirtyInspectionError",
             "isWorktree",
+            "mergeInspectionError",
             "unmergedCommits",
             "worktreePath"
         ]
@@ -264,18 +266,21 @@ async fn plan_chat_closeout_reply_has_exactly_the_pinned_wire_fields() {
     assert_eq!(reply["chatLive"], serde_json::json!(false));
     assert_eq!(reply["dirty"], serde_json::json!(true));
     assert_eq!(reply["dirtyFiles"], serde_json::json!(["scratch.txt"]));
+    assert_eq!(reply["dirtyInspectionError"], serde_json::Value::Null);
     assert_eq!(reply["unmergedCommits"], serde_json::json!(0));
+    assert_eq!(reply["mergeInspectionError"], serde_json::Value::Null);
     assert_eq!(reply["defaultBranch"], serde_json::json!("main"));
 
-    // A non-worktree cwd answers isWorktree:false rather than erroring.
-    let reply = client
+    // The RPC is chat-bound: it must not inspect an arbitrary path supplied
+    // for a chat whose stored cwd points at a different worktree.
+    let error = client
         .call(
             zeron_rpc::methods::PLAN_CHAT_CLOSEOUT,
             serde_json::json!({"chatId": CHAT, "cwd": tmp_path.to_string_lossy()}),
         )
         .await
-        .expect("PlanChatCloseout call");
-    assert_eq!(reply["isWorktree"], serde_json::json!(false));
+        .expect_err("mismatched close-out cwd must be rejected");
+    assert!(error.to_string().contains("does not match"), "{error}");
 
     core.shutdown().await;
 }
@@ -341,6 +346,83 @@ async fn close_chat_worktree_clean_merged_happy_path_archives_the_chat() {
         serde_json::json!({"removed": true, "branchDeleted": true, "archived": true})
     );
     assert!(!Path::new(&wt).exists());
+
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repo_map_can_close_an_unmatched_registered_worktree_without_a_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path().canonicalize().unwrap();
+    let repo = tmp_path.join("repo");
+    init_repo(&repo);
+    let wt = tmp_path.join("repo-map-worktree");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "repo-map-worktree",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert!(!wt.join(".workspace-root").exists());
+
+    let (core, client) = assemble(&tmp_path).await;
+    let plan = client
+        .call(
+            zeron_rpc::methods::PLAN_CHAT_CLOSEOUT,
+            serde_json::json!({"cwd": wt.to_string_lossy()}),
+        )
+        .await
+        .expect("unmatched worktree plan");
+    assert_eq!(plan["isWorktree"], serde_json::json!(true));
+    assert_eq!(plan["dirty"], serde_json::json!(false));
+
+    // An unmatched Repo Map action must not delete a checkout owned by any
+    // open local chat, even when that chat is idle.
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": CHAT,
+                "deviceId": core.device_id,
+                "cwd": wt.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("create owner chat");
+    let error = client
+        .call(
+            zeron_rpc::methods::PLAN_CHAT_CLOSEOUT,
+            serde_json::json!({"cwd": wt.to_string_lossy()}),
+        )
+        .await
+        .expect_err("open chat ownership blocks unmatched close-out");
+    assert!(error.to_string().contains("used by 1 open chat"), "{error}");
+
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({"op": "setChatArchived", "chatId": CHAT, "archived": true}),
+        )
+        .await
+        .expect("archive owner chat");
+    let reply = client
+        .call(
+            zeron_rpc::methods::CLOSE_CHAT_WORKTREE,
+            serde_json::json!({"cwd": wt.to_string_lossy(), "force": false}),
+        )
+        .await
+        .expect("close unmatched worktree");
+    assert_eq!(
+        reply,
+        serde_json::json!({"removed": true, "branchDeleted": true, "archived": false})
+    );
+    assert!(!wt.exists());
 
     core.shutdown().await;
 }

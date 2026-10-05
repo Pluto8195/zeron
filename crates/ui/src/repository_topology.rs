@@ -13,6 +13,7 @@ use gpui::{
 };
 use serde::Deserialize;
 
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::shell::Shell;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -258,6 +259,172 @@ struct TopologyAgent {
     name: String,
     kind: Option<String>,
     status: TopologyStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TopologySearchResult {
+    snapshot: TopologySnapshot,
+    direct_matches: usize,
+    focus: Option<TopologySelection>,
+    matching_chat_ids: Vec<String>,
+}
+
+fn topology_search(snapshot: &TopologySnapshot, query: &str) -> TopologySearchResult {
+    let terms = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return TopologySearchResult {
+            snapshot: snapshot.clone(),
+            direct_matches: 0,
+            focus: None,
+            matching_chat_ids: Vec::new(),
+        };
+    }
+
+    if searchable_fields_match(
+        &terms,
+        [
+            snapshot.workspace_name.as_str(),
+            snapshot.workspace_path.as_str(),
+        ],
+    ) {
+        return TopologySearchResult {
+            snapshot: snapshot.clone(),
+            direct_matches: snapshot
+                .repositories
+                .iter()
+                .map(|repository| 1 + repository.worktrees.len())
+                .sum(),
+            focus: None,
+            matching_chat_ids: Vec::new(),
+        };
+    }
+
+    let mut direct_repositories = HashSet::new();
+    let mut direct_worktrees = HashMap::<String, HashSet<String>>::new();
+    let mut direct_selections = Vec::new();
+    let mut matching_chat_ids = Vec::new();
+    let mut direct_matches = 0;
+    for repository in &snapshot.repositories {
+        if repository_matches(repository, &terms) {
+            direct_repositories.insert(repository.id.clone());
+            direct_selections.push(TopologySelection::Repository(repository.id.clone()));
+            direct_matches += 1;
+        }
+        for worktree in &repository.worktrees {
+            let matched_chats = worktree
+                .chats
+                .iter()
+                .filter(|chat| chat_matches(chat, &terms))
+                .map(|chat| chat.id.clone())
+                .collect::<Vec<_>>();
+            if worktree_metadata_matches(worktree, &terms) || !matched_chats.is_empty() {
+                direct_worktrees
+                    .entry(repository.id.clone())
+                    .or_default()
+                    .insert(worktree.id.clone());
+                direct_selections.push(TopologySelection::Worktree {
+                    repository_id: repository.id.clone(),
+                    worktree_id: worktree.id.clone(),
+                });
+                matching_chat_ids.extend(matched_chats);
+                direct_matches += 1;
+            }
+        }
+    }
+
+    let parents = snapshot
+        .repositories
+        .iter()
+        .map(|repository| (repository.id.as_str(), repository.parent_id.as_deref()))
+        .collect::<HashMap<_, _>>();
+    let mut included_repositories = direct_repositories.clone();
+    included_repositories.extend(direct_worktrees.keys().cloned());
+    let mut pending = included_repositories.iter().cloned().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if let Some(Some(parent_id)) = parents.get(id.as_str()) {
+            if included_repositories.insert((*parent_id).to_string()) {
+                pending.push((*parent_id).to_string());
+            }
+        }
+    }
+
+    let repositories = snapshot
+        .repositories
+        .iter()
+        .filter(|repository| included_repositories.contains(&repository.id))
+        .map(|repository| {
+            let mut repository = repository.clone();
+            if !direct_repositories.contains(&repository.id) {
+                let matching = direct_worktrees.get(&repository.id);
+                repository
+                    .worktrees
+                    .retain(|worktree| matching.is_some_and(|ids| ids.contains(&worktree.id)));
+            }
+            repository
+        })
+        .collect();
+
+    TopologySearchResult {
+        snapshot: TopologySnapshot {
+            workspace_id: snapshot.workspace_id.clone(),
+            workspace_name: snapshot.workspace_name.clone(),
+            workspace_path: snapshot.workspace_path.clone(),
+            workspace_branch: snapshot.workspace_branch.clone(),
+            workspace_status: snapshot.workspace_status,
+            repositories,
+        },
+        direct_matches,
+        focus: (direct_selections.len() == 1).then(|| direct_selections.remove(0)),
+        matching_chat_ids,
+    }
+}
+
+fn searchable_fields_match<'a>(
+    terms: &[String],
+    fields: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let haystack = fields
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join("\n");
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn repository_matches(repository: &TopologyRepository, terms: &[String]) -> bool {
+    let mut fields = vec![
+        repository.id.as_str(),
+        repository.name.as_str(),
+        repository.path.as_str(),
+        repository.full_path.as_str(),
+    ];
+    fields.extend(repository.branch.as_deref());
+    fields.extend(repository.head_sha.as_deref());
+    searchable_fields_match(terms, fields)
+}
+
+fn worktree_metadata_matches(worktree: &TopologyWorktree, terms: &[String]) -> bool {
+    let mut fields = vec![
+        worktree.id.as_str(),
+        worktree.name.as_str(),
+        worktree.path.as_str(),
+        worktree.full_path.as_str(),
+    ];
+    fields.extend(worktree.branch.as_deref());
+    fields.extend(worktree.head_sha.as_deref());
+    searchable_fields_match(terms, fields)
+}
+
+fn chat_matches(chat: &TopologyChat, terms: &[String]) -> bool {
+    let mut fields = vec![chat.id.as_str(), chat.title.as_str()];
+    fields.extend(chat.source_branch.as_deref());
+    fields.extend(chat.checkout_id.as_deref());
+    fields.extend(chat.linked_ticket_id.as_deref());
+    fields.extend(chat.linked_pr_urls.iter().map(String::as_str));
+    searchable_fields_match(terms, fields)
 }
 
 struct TopologyAdapter;
@@ -787,6 +954,32 @@ fn node_size(kind: GraphNodeKind) -> (f32, f32) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenNodeRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    content_scale: f32,
+}
+
+/// Map a logical node into the canvas with the overview canvas's layout-time
+/// scaling model. Card bounds, padding, icons, and type all use the same raw
+/// zoom, avoiding both rasterized text and mismatched content/card geometry.
+fn screen_node_rect(node: &GraphNode, zoom: f32, pan: (f32, f32)) -> ScreenNodeRect {
+    let width = node.width * zoom;
+    let height = node.height * zoom;
+    let center_x = (node.x + node.width / 2.0) * zoom + pan.0;
+    let center_y = (node.y + node.height / 2.0) * zoom + pan.1;
+    ScreenNodeRect {
+        x: center_x - width / 2.0,
+        y: center_y - height / 2.0,
+        width,
+        height,
+        content_scale: zoom,
+    }
+}
+
 fn ref_label(branch: Option<&str>, sha: Option<&str>) -> Option<String> {
     branch
         .filter(|branch| !branch.trim().is_empty())
@@ -809,6 +1002,19 @@ fn worktree_ref_label(worktree: &TopologyWorktree) -> String {
         .unwrap_or_else(|| "detached HEAD".into())
 }
 
+fn worktree_closeout_chat_id(worktree: &TopologyWorktree) -> Option<String> {
+    worktree
+        .chats
+        .iter()
+        .find(|chat| !chat.archived)
+        .or_else(|| worktree.chats.first())
+        .map(|chat| chat.id.clone())
+}
+
+fn worktree_can_closeout(worktree: &TopologyWorktree) -> bool {
+    !worktree.is_main
+}
+
 fn sync_detail(ahead: Option<u64>, behind: Option<u64>) -> Option<String> {
     if ahead.is_none() && behind.is_none() {
         return Some("upstream unknown".into());
@@ -828,7 +1034,109 @@ enum LoadState {
     Idle,
     Loading,
     Loaded(TopologySnapshot),
+    Refreshing(TopologySnapshot),
     Failed(String),
+}
+
+impl LoadState {
+    /// Starts a request while retaining an already rendered snapshot. Returns
+    /// whether this is a background refresh rather than an initial load.
+    fn begin_request(&mut self) -> bool {
+        let previous = std::mem::replace(self, Self::Idle);
+        match previous {
+            Self::Loaded(snapshot) | Self::Refreshing(snapshot) => {
+                *self = Self::Refreshing(snapshot);
+                true
+            }
+            _ => {
+                *self = Self::Loading;
+                false
+            }
+        }
+    }
+
+    /// Applies a completed request. A failed background refresh keeps the last
+    /// good snapshot on screen instead of replacing the map with an error.
+    fn finish_request(&mut self, result: Result<TopologySnapshot, String>) -> bool {
+        let previous = std::mem::replace(self, Self::Idle);
+        match result {
+            Ok(snapshot) => {
+                *self = Self::Loaded(snapshot);
+                true
+            }
+            Err(error) => {
+                *self = match previous {
+                    Self::Refreshing(snapshot) => Self::Loaded(snapshot),
+                    _ => Self::Failed(error),
+                };
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ChatDiffSummary {
+    files: Vec<zeron_proto::DiffFileSummary>,
+    additions: u32,
+    deletions: u32,
+    truncated: bool,
+}
+
+impl From<zeron_proto::CheckoutDiff> for ChatDiffSummary {
+    fn from(diff: zeron_proto::CheckoutDiff) -> Self {
+        Self {
+            files: diff.files,
+            additions: diff.additions,
+            deletions: diff.deletions,
+            truncated: diff.truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ChatDiffPeek {
+    Loading { request_id: u64 },
+    Loaded(ChatDiffSummary),
+    Failed(String),
+}
+
+fn begin_chat_diff_request(
+    peeks: &mut HashMap<String, ChatDiffPeek>,
+    next_request_id: &mut u64,
+    chat_id: &str,
+) -> Option<u64> {
+    if matches!(peeks.get(chat_id), Some(ChatDiffPeek::Loading { .. })) {
+        return None;
+    }
+    *next_request_id = (*next_request_id).wrapping_add(1);
+    let request_id = *next_request_id;
+    peeks.insert(chat_id.to_string(), ChatDiffPeek::Loading { request_id });
+    Some(request_id)
+}
+
+fn finish_chat_diff_request(
+    peeks: &mut HashMap<String, ChatDiffPeek>,
+    chat_id: String,
+    request_id: u64,
+    result: Result<ChatDiffSummary, String>,
+) -> bool {
+    if !matches!(
+        peeks.get(&chat_id),
+        Some(ChatDiffPeek::Loading {
+            request_id: active_request_id,
+        }) if *active_request_id == request_id
+    ) {
+        return false;
+    }
+    peeks.insert(
+        chat_id,
+        match result {
+            Ok(diff) => ChatDiffPeek::Loaded(diff),
+            Err(error) => ChatDiffPeek::Failed(error),
+        },
+    );
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -941,9 +1249,19 @@ impl Render for TopologyTooltip {
     }
 }
 
+fn toggle_disclosure(expanded: &mut HashSet<String>, id: &str) -> bool {
+    if expanded.remove(id) {
+        false
+    } else {
+        expanded.insert(id.to_string());
+        true
+    }
+}
+
 pub struct RepositoryTopology {
     state: Entity<AppState>,
     shell: gpui::WeakEntity<Shell>,
+    search: Entity<ComposerInput>,
     load: LoadState,
     workspace_selection: WorkspaceTabSelection,
     requested_space_id: Option<String>,
@@ -954,7 +1272,11 @@ pub struct RepositoryTopology {
     canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     auto_fit: bool,
     selected: Option<TopologySelection>,
+    expanded_chats: HashSet<String>,
+    chat_diff_peeks: HashMap<String, ChatDiffPeek>,
+    chat_diff_request_seq: u64,
     _state_subscription: gpui::Subscription,
+    _search_events: gpui::Subscription,
     _refresh_task: gpui::Task<()>,
 }
 
@@ -964,6 +1286,16 @@ impl RepositoryTopology {
         shell: gpui::WeakEntity<Shell>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let search = cx.new(|cx| {
+            ComposerInput::with_context(
+                "Search repositories, worktrees, branches, or chats…",
+                crate::composer::PALETTE_SEARCH_CONTEXT,
+                cx,
+            )
+            .with_single_line()
+            .with_accessibility_role(gpui::Role::SearchInput)
+            .with_text_metrics(11.0, 16.0)
+        });
         let workspace_selection = {
             let state = state.read(cx);
             let tabs = Self::workspace_tabs(&state);
@@ -974,6 +1306,14 @@ impl RepositoryTopology {
             )
         };
         let subscription = cx.observe(&state, |_, _, cx| cx.notify());
+        let search_events = cx.subscribe(&search, |this: &mut Self, input, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                this.auto_fit = true;
+                let query = input.read(cx).text().to_string();
+                this.focus_search_match(&query);
+                cx.notify();
+            }
+        });
         let refresh_task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LIVE_REFRESH).await;
@@ -985,6 +1325,7 @@ impl RepositoryTopology {
         Self {
             state,
             shell,
+            search,
             load: LoadState::Idle,
             workspace_selection,
             requested_space_id: None,
@@ -995,7 +1336,11 @@ impl RepositoryTopology {
             canvas_bounds: Rc::new(Cell::new(None)),
             auto_fit: true,
             selected: None,
+            expanded_chats: HashSet::new(),
+            chat_diff_peeks: HashMap::new(),
+            chat_diff_request_seq: 0,
             _state_subscription: subscription,
+            _search_events: search_events,
             _refresh_task: refresh_task,
         }
     }
@@ -1005,10 +1350,22 @@ impl RepositoryTopology {
             .shell
             .upgrade()
             .is_some_and(|shell| shell.read(cx).is_repository_topology_route());
-        if visible && !matches!(&self.load, LoadState::Loading) {
+        if visible && !matches!(&self.load, LoadState::Loading | LoadState::Refreshing(_)) {
             let tabs = self.reconcile_workspace_tabs(cx);
             self.requested_space_id = None;
             self.ensure_loaded(&tabs, cx);
+        }
+    }
+
+    fn focus_search_match(&mut self, query: &str) {
+        let snapshot = match &self.load {
+            LoadState::Loaded(snapshot) | LoadState::Refreshing(snapshot) => snapshot,
+            _ => return,
+        };
+        let result = topology_search(snapshot, query);
+        if let Some(focus) = result.focus {
+            self.selected = Some(focus);
+            self.expanded_chats.extend(result.matching_chat_ids);
         }
     }
 
@@ -1036,6 +1393,8 @@ impl RepositoryTopology {
         self.requested_space_id = None;
         self.load = LoadState::Idle;
         self.selected = None;
+        self.expanded_chats.clear();
+        self.chat_diff_peeks.clear();
         self.pan = (20.0, 20.0);
         self.zoom = 0.9;
         self.panning = None;
@@ -1075,7 +1434,7 @@ impl RepositoryTopology {
         self.requested_space_id = Some(space_id.clone());
         self.request_seq += 1;
         let request_id = self.request_seq;
-        self.load = LoadState::Loading;
+        let is_refresh = self.load.begin_request();
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -1087,11 +1446,10 @@ impl RepositoryTopology {
                 if this.request_seq != request_id {
                     return;
                 }
-                this.load = match result {
-                    Ok(snapshot) => LoadState::Loaded(snapshot),
-                    Err(error) => LoadState::Failed(error),
-                };
-                this.auto_fit = true;
+                let loaded = this.load.finish_request(result);
+                if loaded && !is_refresh {
+                    this.auto_fit = true;
+                }
                 cx.notify();
             })
             .ok();
@@ -1104,6 +1462,63 @@ impl RepositoryTopology {
         let tabs = self.reconcile_workspace_tabs(cx);
         self.ensure_loaded(&tabs, cx);
         cx.notify();
+    }
+
+    fn load_chat_diff(
+        &mut self,
+        chat_id: String,
+        cwd: String,
+        target_device_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.chat_diff_peeks.get(&chat_id),
+            Some(ChatDiffPeek::Loading { .. })
+        ) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.chat_diff_peeks
+                .insert(chat_id, ChatDiffPeek::Failed("Engine unavailable".into()));
+            cx.notify();
+            return;
+        };
+        let Some(request_id) = begin_chat_diff_request(
+            &mut self.chat_diff_peeks,
+            &mut self.chat_diff_request_seq,
+            &chat_id,
+        ) else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let mut payload = serde_json::json!({
+                "cwd": cwd,
+                "mode": "turn",
+                "chatId": chat_id,
+            });
+            if let Some(target_device_id) = target_device_id {
+                payload["targetDeviceId"] = serde_json::Value::String(target_device_id);
+            }
+            let result = engine
+                .client()
+                .call(zeron_rpc::methods::GET_CHECKOUT_DIFF, payload)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<zeron_proto::CheckoutDiff>(value)
+                        .map_err(|error| error.to_string())
+                })
+                .map(ChatDiffSummary::from);
+            this.update(cx, |this, cx| {
+                if finish_chat_diff_request(&mut this.chat_diff_peeks, chat_id, request_id, result)
+                {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn fit_layout(&mut self, layout: &GraphLayout) {
@@ -1200,10 +1615,7 @@ impl RepositoryTopology {
         index: usize,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let x = node.x * self.zoom + self.pan.0;
-        let y = node.y * self.zoom + self.pan.1;
-        let width = node.width * self.zoom;
-        let height = node.height * self.zoom;
+        let rect = screen_node_rect(node, self.zoom, self.pan);
         let selection = node.selection.clone();
         let selected = selection
             .as_ref()
@@ -1220,7 +1632,7 @@ impl RepositoryTopology {
             GraphNodeKind::Repository(_) => crate::icons::GIT_BRANCH,
             GraphNodeKind::Worktree => crate::icons::FILE_TREE,
         };
-        let scale = self.zoom.clamp(0.65, 1.0);
+        let scale = rect.content_scale;
         let tooltip = if node.kind == GraphNodeKind::Worktree {
             let occupancy = node.occupancy.clone().unwrap_or_default();
             Some(SharedString::from(format!(
@@ -1246,10 +1658,10 @@ impl RepositoryTopology {
         let base = div()
             .id(("topology-node", index))
             .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(width))
-            .h(px(height))
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.width))
+            .h(px(rect.height))
             .p(px(if node.kind == GraphNodeKind::Worktree {
                 13.0
             } else {
@@ -1538,6 +1950,136 @@ impl RepositoryTopology {
             .into_any_element()
     }
 
+    fn render_chat_diff_peek(&self, peek: &ChatDiffPeek, theme: &Theme) -> gpui::AnyElement {
+        match peek {
+            ChatDiffPeek::Loading { .. } => div()
+                .mt(px(8.0))
+                .p(px(8.0))
+                .rounded(px(6.0))
+                .bg(theme.element_hover)
+                .text_size(crate::typography::ui_rems(9.0))
+                .text_color(theme.text_muted)
+                .child("Loading this turn’s changes…")
+                .into_any_element(),
+            ChatDiffPeek::Failed(error) => div()
+                .mt(px(8.0))
+                .p(px(8.0))
+                .rounded(px(6.0))
+                .bg(theme.danger.opacity(0.08))
+                .text_size(crate::typography::ui_rems(9.0))
+                .text_color(theme.danger)
+                .child(SharedString::from(format!("Changes unavailable: {error}")))
+                .into_any_element(),
+            ChatDiffPeek::Loaded(diff) => {
+                let visible_files = diff.files.iter().take(5).map(|file| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(crate::typography::ui_rems(8.5))
+                        .child(
+                            div()
+                                .w(px(12.0))
+                                .flex_none()
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(file.status.clone())),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(file.path.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.success)
+                                .child(SharedString::from(format!("+{}", file.additions))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.danger)
+                                .child(SharedString::from(format!("−{}", file.deletions))),
+                        )
+                });
+                div()
+                    .mt(px(8.0))
+                    .p(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.0))
+                    .rounded(px(6.0))
+                    .bg(theme.element_hover)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_size(crate::typography::ui_rems(9.0))
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(format!(
+                                        "{} changed file{}",
+                                        diff.files.len(),
+                                        if diff.files.len() == 1 { "" } else { "s" }
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div().text_color(theme.success).child(SharedString::from(
+                                            format!("+{}", diff.additions),
+                                        )),
+                                    )
+                                    .child(
+                                        div().text_color(theme.danger).child(SharedString::from(
+                                            format!("−{}", diff.deletions),
+                                        )),
+                                    ),
+                            ),
+                    )
+                    .when(diff.files.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(8.5))
+                                .text_color(theme.text_faint)
+                                .child("No file changes in the latest turn"),
+                        )
+                    })
+                    .children(visible_files)
+                    .when(diff.files.len() > 5, |element| {
+                        element.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(8.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "+{} more",
+                                    diff.files.len() - 5
+                                ))),
+                        )
+                    })
+                    .when(diff.truncated, |element| {
+                        element.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(8.0))
+                                .text_color(theme.warning)
+                                .child("Partial snapshot"),
+                        )
+                    })
+                    .into_any_element()
+            }
+        }
+    }
+
     fn inspector_header(
         &self,
         eyebrow: &'static str,
@@ -1699,12 +2241,46 @@ impl RepositoryTopology {
                 .collect::<Vec<_>>()
                 .join(" · ");
                 let has_chats = !worktree.chats.is_empty();
+                let closeout_cwd = worktree.full_path.clone();
+                let closeout_title =
+                    format!("{} · {}", repository.name, worktree_ref_label(worktree));
+                let closeout_chat_id = worktree_closeout_chat_id(worktree);
+                let (last_message_previews, target_device_id) = {
+                    let state = self.state.read(cx);
+                    let previews = worktree
+                        .chats
+                        .iter()
+                        .filter_map(|topology_chat| {
+                            state
+                                .chats
+                                .iter()
+                                .find(|chat| chat.id == topology_chat.id)
+                                .and_then(|chat| chat.last_message_preview.as_ref())
+                                .filter(|preview| !preview.trim().is_empty())
+                                .map(|preview| (topology_chat.id.clone(), preview.clone()))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    let tabs = Self::workspace_tabs(&state);
+                    let device_id = self
+                        .workspace_selection
+                        .selected(&tabs)
+                        .map(|tab| tab.device_id.clone());
+                    (previews, device_id)
+                };
                 let chats = worktree
                     .chats
                     .iter()
                     .enumerate()
                     .map(|(index, chat)| {
-                        let chat_id = chat.id.clone();
+                        let expanded = self.expanded_chats.contains(&chat.id);
+                        let last_message_preview = last_message_previews.get(&chat.id).cloned();
+                        let diff_peek = self.chat_diff_peeks.get(&chat.id);
+                        let toggle_chat_id = chat.id.clone();
+                        let open_chat_id = chat.id.clone();
+                        let open_changes_chat_id = chat.id.clone();
+                        let peek_changes_chat_id = chat.id.clone();
+                        let peek_changes_cwd = worktree.full_path.clone();
+                        let peek_changes_device_id = target_device_id.clone();
                         let mut meta = vec![
                             chat.status.label().to_string(),
                             format!(
@@ -1733,6 +2309,26 @@ impl RepositoryTopology {
                                 }
                             ));
                         }
+                        let pr_rows = chat
+                            .linked_pr_urls
+                            .iter()
+                            .enumerate()
+                            .map(|(pr_index, url)| {
+                                let open_url = url.clone();
+                                div()
+                                    .id(("topology-inspector-chat-pr", index * 100 + pr_index))
+                                    .mt(px(4.0))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .cursor_pointer()
+                                    .text_size(crate::typography::ui_rems(8.5))
+                                    .text_color(theme.accent)
+                                    .hover(|element| element.text_color(theme.busy))
+                                    .child(SharedString::from(url.clone()))
+                                    .on_click(move |_, _, cx| cx.open_url(&open_url))
+                            })
+                            .collect::<Vec<_>>();
                         let agent_rows = chat
                             .agents
                             .iter()
@@ -1759,77 +2355,261 @@ impl RepositoryTopology {
                                     )))
                             })
                             .collect::<Vec<_>>();
+                        let diff_peek_element =
+                            diff_peek.map(|peek| self.render_chat_diff_peek(peek, theme));
+                        let peek_changes_label = match diff_peek {
+                            Some(ChatDiffPeek::Loading { .. }) => "Loading…",
+                            Some(ChatDiffPeek::Loaded(_)) => "Refresh changes",
+                            Some(ChatDiffPeek::Failed(_)) => "Retry changes",
+                            None => "Peek changes",
+                        };
                         div()
                             .id(("topology-inspector-chat", index))
-                            .p(px(9.0))
                             .rounded(px(7.0))
                             .border_1()
                             .border_color(theme.border)
                             .bg(theme.surface_card)
                             .child(
                                 div()
-                                    .id(("topology-inspector-chat-title", index))
+                                    .id(("topology-inspector-chat-toggle", index))
+                                    .p(px(9.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
                                     .cursor_pointer()
-                                    .hover(|element| element.text_color(theme.busy))
-                                    .text_size(crate::typography::ui_rems(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(chat.title.clone()))
+                                    .hover(|element| element.bg(theme.element_hover))
+                                    .child(
+                                        crate::icons::icon(if expanded {
+                                            crate::icons::ALT_ARROW_DOWN
+                                        } else {
+                                            crate::icons::ALT_ARROW_RIGHT
+                                        })
+                                        .size(px(11.0))
+                                        .text_color(theme.text_muted),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(3.0))
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_size(crate::typography::ui_rems(10.5))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme.text)
+                                                    .child(SharedString::from(chat.title.clone())),
+                                            )
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_size(crate::typography::ui_rems(9.0))
+                                                    .text_color(theme.text_muted)
+                                                    .child(SharedString::from(meta.join(" · "))),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .size(px(6.0))
+                                            .rounded_full()
+                                            .bg(chat.status.color(theme)),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(shell) = this.shell.upgrade() {
-                                            shell.update(cx, |shell, cx| {
-                                                shell.open_chat(chat_id.clone(), cx)
-                                            });
-                                        }
+                                        toggle_disclosure(
+                                            &mut this.expanded_chats,
+                                            &toggle_chat_id,
+                                        );
+                                        cx.notify();
                                     })),
                             )
-                            .child(
-                                div()
-                                    .mt(px(3.0))
-                                    .text_size(crate::typography::ui_rems(9.0))
-                                    .text_color(theme.text_muted)
-                                    .child(SharedString::from(meta.join(" · "))),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(3.0))
-                                    .text_size(crate::typography::ui_rems(8.5))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(format!(
-                                        "ID {}{}{}",
-                                        chat.id,
-                                        chat.checkout_id
-                                            .as_ref()
-                                            .map(|id| format!(" · checkout {id}"))
-                                            .unwrap_or_default(),
-                                        chat.parent_chat_id
-                                            .as_ref()
-                                            .map(|id| format!(" · parent {id}"))
-                                            .unwrap_or_default()
-                                    ))),
-                            )
-                            .when_some(chat.source_branch.clone(), |element, source_branch| {
+                            .when(expanded, |element| {
                                 element.child(
                                     div()
-                                        .mt(px(3.0))
-                                        .text_size(crate::typography::ui_rems(8.5))
-                                        .text_color(theme.text_faint)
-                                        .child(SharedString::from(format!(
-                                            "Started on {source_branch}"
-                                        ))),
+                                        .px(px(9.0))
+                                        .pb(px(9.0))
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .mt(px(8.0))
+                                                .text_size(crate::typography::ui_rems(8.5))
+                                                .text_color(theme.text_faint)
+                                                .child(SharedString::from(format!(
+                                                    "ID {}{}{}",
+                                                    chat.id,
+                                                    chat.checkout_id
+                                                        .as_ref()
+                                                        .map(|id| format!(" · checkout {id}"))
+                                                        .unwrap_or_default(),
+                                                    chat.parent_chat_id
+                                                        .as_ref()
+                                                        .map(|id| format!(" · parent {id}"))
+                                                        .unwrap_or_default()
+                                                ))),
+                                        )
+                                        .when_some(
+                                            chat.source_branch.clone(),
+                                            |element, source_branch| {
+                                                element.child(
+                                                    div()
+                                                        .mt(px(4.0))
+                                                        .text_size(crate::typography::ui_rems(8.5))
+                                                        .text_color(theme.text_faint)
+                                                        .child(SharedString::from(format!(
+                                                            "Started on {source_branch}"
+                                                        ))),
+                                                )
+                                            },
+                                        )
+                                        .when_some(last_message_preview, |element, preview| {
+                                            element.child(
+                                                div()
+                                                    .mt(px(8.0))
+                                                    .p(px(8.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(theme.element_hover)
+                                                    .text_size(crate::typography::ui_rems(9.0))
+                                                    .text_color(theme.text_muted)
+                                                    .child(
+                                                        div()
+                                                            .mb(px(3.0))
+                                                            .text_size(crate::typography::ui_rems(
+                                                                8.0,
+                                                            ))
+                                                            .text_color(theme.text_faint)
+                                                            .child("LATEST MESSAGE"),
+                                                    )
+                                                    .child(SharedString::from(preview)),
+                                            )
+                                        })
+                                        .children(pr_rows)
+                                        .children(agent_rows)
+                                        .children(diff_peek_element)
+                                        .child(
+                                            div()
+                                                .mt(px(9.0))
+                                                .pt(px(8.0))
+                                                .border_t_1()
+                                                .border_color(theme.border)
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(8.0))
+                                                .child(
+                                                    div()
+                                                        .id((
+                                                            "topology-inspector-chat-peek-changes",
+                                                            index,
+                                                        ))
+                                                        .flex_none()
+                                                        .px(px(8.0))
+                                                        .py(px(4.0))
+                                                        .rounded(px(5.0))
+                                                        .cursor_pointer()
+                                                        .bg(theme.element_hover)
+                                                        .text_size(crate::typography::ui_rems(9.0))
+                                                        .text_color(theme.text_muted)
+                                                        .hover(|element| {
+                                                            element
+                                                                .bg(theme.element_active)
+                                                                .text_color(theme.text)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.load_chat_diff(
+                                                                    peek_changes_chat_id.clone(),
+                                                                    peek_changes_cwd.clone(),
+                                                                    peek_changes_device_id.clone(),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child(peek_changes_label),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("topology-inspector-chat-open", index))
+                                                        .flex_none()
+                                                        .px(px(8.0))
+                                                        .py(px(4.0))
+                                                        .rounded(px(5.0))
+                                                        .cursor_pointer()
+                                                        .bg(theme.accent.opacity(0.12))
+                                                        .text_size(crate::typography::ui_rems(9.0))
+                                                        .text_color(theme.accent)
+                                                        .hover(|element| {
+                                                            element.bg(theme.accent.opacity(0.2))
+                                                        })
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if let Some(shell) =
+                                                                    this.shell.upgrade()
+                                                                {
+                                                                    shell.update(
+                                                                        cx,
+                                                                        |shell, cx| {
+                                                                            shell.open_chat(
+                                                                                open_chat_id
+                                                                                    .clone(),
+                                                                                cx,
+                                                                            )
+                                                                        },
+                                                                    );
+                                                                }
+                                                            },
+                                                        ))
+                                                        .child("Open chat →"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id((
+                                                            "topology-inspector-chat-open-changes",
+                                                            index,
+                                                        ))
+                                                        .flex_none()
+                                                        .px(px(8.0))
+                                                        .py(px(4.0))
+                                                        .rounded(px(5.0))
+                                                        .cursor_pointer()
+                                                        .bg(theme.accent.opacity(0.12))
+                                                        .text_size(crate::typography::ui_rems(9.0))
+                                                        .text_color(theme.accent)
+                                                        .hover(|element| {
+                                                            element.bg(theme.accent.opacity(0.2))
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if let Some(shell) =
+                                                                    this.shell.upgrade()
+                                                                {
+                                                                    shell.update(
+                                                                        cx,
+                                                                        |shell, cx| {
+                                                                            shell.open_chat_changes(
+                                                                                open_changes_chat_id
+                                                                                    .clone(),
+                                                                                cx,
+                                                                            )
+                                                                        },
+                                                                    );
+                                                                }
+                                                            },
+                                                        ))
+                                                        .child("Open changes →"),
+                                                ),
+                                        ),
                                 )
                             })
-                            .children(chat.linked_pr_urls.iter().map(|url| {
-                                div()
-                                    .mt(px(3.0))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(crate::typography::ui_rems(8.5))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(url.clone()))
-                            }))
-                            .children(agent_rows)
                     })
                     .collect::<Vec<_>>();
                 div()
@@ -1879,6 +2659,41 @@ impl RepositoryTopology {
                         ),
                         theme,
                     ))
+                    .when(worktree_can_closeout(worktree), |element| {
+                        element.child(
+                            div()
+                                .id("topology-inspector-closeout-worktree")
+                                .w_full()
+                                .px(px(10.0))
+                                .py(px(7.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(theme.danger.opacity(0.4))
+                                .bg(theme.danger.opacity(0.08))
+                                .cursor_pointer()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.danger)
+                                .hover(|element| element.bg(theme.danger.opacity(0.16)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(shell) = this.shell.upgrade() {
+                                        shell.update(cx, |shell, cx| {
+                                            shell.open_worktree_closeout(
+                                                closeout_cwd.clone(),
+                                                closeout_title.clone(),
+                                                closeout_chat_id.clone(),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }))
+                                .child("Close out worktree\u{2026}"),
+                        )
+                    })
                     .child(
                         div()
                             .pt(px(3.0))
@@ -1947,14 +2762,13 @@ impl RepositoryTopology {
                     ) else {
                         continue;
                     };
+                    let parent_rect = screen_node_rect(parent, zoom, pan);
+                    let child_rect = screen_node_rect(child, zoom, pan);
                     let start = (
-                        (parent.x + parent.width) * zoom + pan.0,
-                        (parent.y + parent.height / 2.0) * zoom + pan.1,
+                        parent_rect.x + parent_rect.width,
+                        parent_rect.y + parent_rect.height / 2.0,
                     );
-                    let end = (
-                        child.x * zoom + pan.0,
-                        (child.y + child.height / 2.0) * zoom + pan.1,
-                    );
+                    let end = (child_rect.x, child_rect.y + child_rect.height / 2.0);
                     let elbow = (start.0 + end.0) / 2.0;
                     let mut builder = PathBuilder::stroke(px((1.2 * zoom).clamp(0.8, 1.6)));
                     builder.move_to(point(
@@ -1985,8 +2799,10 @@ impl RepositoryTopology {
         let relation_labels = layout.edges.iter().filter_map(|edge| {
             let parent = layout.node(&edge.parent)?;
             let child = layout.node(&edge.child)?;
-            let x = ((parent.x + parent.width + child.x) / 2.0) * zoom + pan.0;
-            let y = (child.y + child.height / 2.0) * zoom + pan.1;
+            let parent_rect = screen_node_rect(parent, zoom, pan);
+            let child_rect = screen_node_rect(child, zoom, pan);
+            let x = (parent_rect.x + parent_rect.width + child_rect.x) / 2.0;
+            let y = child_rect.y + child_rect.height / 2.0;
             Some(
                 div()
                     .absolute()
@@ -1996,7 +2812,7 @@ impl RepositoryTopology {
                     .py(px(1.0))
                     .rounded(px(3.0))
                     .bg(theme.surface)
-                    .text_size(crate::typography::ui_rems(8.5 * zoom.clamp(0.7, 1.0)))
+                    .text_size(crate::typography::ui_rems(8.5 * zoom))
                     .text_color(theme.text_faint)
                     .child(SharedString::from(edge.relation)),
             )
@@ -2239,6 +3055,50 @@ impl Render for RepositoryTopology {
         self.ensure_loaded(&workspace_tabs, cx);
         let theme = Theme::of(cx).clone();
         let selected_workspace = self.workspace_selection.selected(&workspace_tabs).cloned();
+        let search_query = self.search.read(cx).text().trim().to_string();
+        let search_active = !search_query.is_empty();
+        let search_control = div()
+            .id("repository-topology-search")
+            .w(px(340.0))
+            .h(px(32.0))
+            .flex_none()
+            .px(px(9.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(if search_active {
+                theme.border_strong
+            } else {
+                theme.border
+            })
+            .bg(theme.surface_raised)
+            .text_color(theme.text_muted)
+            .child(crate::icons::icon(crate::icons::MAGNIFER).size(px(12.0)))
+            .child(div().min_w_0().flex_1().child(self.search.clone()))
+            .when(search_active, |row| {
+                row.child(
+                    div()
+                        .id("repository-topology-search-clear")
+                        .size(px(20.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .role(gpui::Role::Button)
+                        .aria_label("Clear repository map search")
+                        .hover(|element| element.bg(theme.element_hover).text_color(theme.text))
+                        .child(crate::icons::icon(crate::icons::CLOSE_CIRCLE).size(px(12.0)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.search.update(cx, |input, cx| input.set_text("", cx));
+                            this.auto_fit = true;
+                            cx.notify();
+                        })),
+                )
+            });
         let header = div()
             .flex_none()
             .flex()
@@ -2298,18 +3158,27 @@ impl Render for RepositoryTopology {
                     )
                     .child(
                         div()
-                            .id("topology-refresh")
-                            .size(px(30.0))
-                            .flex_none()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .text_color(theme.text_muted)
-                            .hover(|element| element.bg(theme.element_hover).text_color(theme.text))
-                            .child(crate::icons::icon(crate::icons::REFRESH).size(px(14.0)))
-                            .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                            .gap(px(8.0))
+                            .child(search_control)
+                            .child(
+                                div()
+                                    .id("topology-refresh")
+                                    .size(px(30.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .text_color(theme.text_muted)
+                                    .hover(|element| {
+                                        element.bg(theme.element_hover).text_color(theme.text)
+                                    })
+                                    .child(crate::icons::icon(crate::icons::REFRESH).size(px(14.0)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                            ),
                     ),
             )
             .child(self.render_workspace_tabs(&workspace_tabs, &theme, cx));
@@ -2352,15 +3221,34 @@ impl Render for RepositoryTopology {
                 Some("Try again"),
                 cx,
             ),
-            LoadState::Loaded(snapshot) if snapshot.repositories.is_empty() => self
-                .render_center_state(
-                    &theme,
-                    "No Git repositories found",
-                    "This workspace does not contain a detected repository or worktree yet.",
-                    Some("Refresh"),
-                    cx,
-                ),
-            LoadState::Loaded(snapshot) => self.render_graph(&snapshot, &theme, cx),
+            LoadState::Loaded(snapshot) | LoadState::Refreshing(snapshot) => {
+                if snapshot.repositories.is_empty() {
+                    self.render_center_state(
+                        &theme,
+                        "No Git repositories found",
+                        "This workspace does not contain a detected repository or worktree yet.",
+                        Some("Refresh"),
+                        cx,
+                    )
+                } else if search_active {
+                    let result = topology_search(&snapshot, &search_query);
+                    if result.direct_matches == 0 {
+                        self.render_center_state(
+                            &theme,
+                            "No repository map matches",
+                            &format!(
+                                "No repository, worktree, branch, path, or attached chat matches ‘{search_query}’."
+                            ),
+                            None,
+                            cx,
+                        )
+                    } else {
+                        self.render_graph(&result.snapshot, &theme, cx)
+                    }
+                } else {
+                    self.render_graph(&snapshot, &theme, cx)
+                }
+            }
         };
         div()
             .size_full()
@@ -2498,6 +3386,73 @@ mod tests {
     }
 
     #[test]
+    fn search_matches_attached_chat_title_and_id() {
+        let result = topology_search(&fixture(), "CHAT-1 repository map");
+
+        assert_eq!(result.direct_matches, 1);
+        assert_eq!(result.matching_chat_ids, vec!["chat-1"]);
+        assert_eq!(
+            result.focus,
+            Some(TopologySelection::Worktree {
+                repository_id: "repo-root".into(),
+                worktree_id: "checkout-main".into(),
+            })
+        );
+        assert_eq!(result.snapshot.repositories.len(), 1);
+        assert_eq!(result.snapshot.repositories[0].id, "repo-root");
+        assert_eq!(result.snapshot.repositories[0].worktrees.len(), 1);
+    }
+
+    #[test]
+    fn search_keeps_repository_ancestors_but_removes_unmatched_worktrees() {
+        let result = topology_search(&fixture(), "feature/colors");
+
+        assert_eq!(result.direct_matches, 1);
+        assert_eq!(result.snapshot.repositories.len(), 2);
+        assert_eq!(result.snapshot.repositories[0].id, "repo-root");
+        assert!(result.snapshot.repositories[0].worktrees.is_empty());
+        assert_eq!(result.snapshot.repositories[1].id, "repo-sub");
+    }
+
+    #[test]
+    fn direct_repository_match_keeps_its_worktrees() {
+        let result = topology_search(&fixture(), "repo-root");
+
+        assert_eq!(result.direct_matches, 1);
+        assert_eq!(result.snapshot.repositories.len(), 1);
+        assert_eq!(result.snapshot.repositories[0].worktrees.len(), 1);
+    }
+
+    #[test]
+    fn search_returns_an_empty_map_when_nothing_matches() {
+        let result = topology_search(&fixture(), "missing-saturn-repository");
+
+        assert_eq!(result.direct_matches, 0);
+        assert!(result.snapshot.repositories.is_empty());
+    }
+
+    #[test]
+    fn screen_node_rect_scales_bounds_and_center_by_the_same_zoom() {
+        let layout = GraphLayout::from_snapshot(&fixture());
+        let node = &layout.nodes[0];
+        let zoom = MIN_ZOOM;
+        let pan = (17.0, 29.0);
+        let rect = screen_node_rect(node, zoom, pan);
+
+        assert_eq!(rect.width, node.width * zoom);
+        assert_eq!(rect.height, node.height * zoom);
+        assert_eq!(rect.content_scale, zoom);
+        assert_eq!(
+            rect.x + rect.width / 2.0,
+            (node.x + node.width / 2.0) * zoom + pan.0
+        );
+        assert_eq!(
+            rect.y + rect.height / 2.0,
+            (node.y + node.height / 2.0) * zoom + pan.1
+        );
+    }
+
+    #[test]
     fn worktree_card_leads_with_branch_and_keeps_git_and_occupancy_separate() {
         let layout = GraphLayout::from_snapshot(&fixture());
         let worktree = layout
@@ -2540,6 +3495,133 @@ mod tests {
         let worktree = &mut snapshot.repositories[0].worktrees[0];
         worktree.branch = None;
         assert_eq!(worktree_ref_label(worktree), "detached @ abcdef12");
+    }
+
+    #[test]
+    fn closeout_is_only_offered_for_non_main_worktrees() {
+        let mut snapshot = fixture();
+        let worktree = &mut snapshot.repositories[0].worktrees[0];
+        assert!(!worktree_can_closeout(worktree));
+
+        worktree.is_main = false;
+        assert!(worktree_can_closeout(worktree));
+        assert_eq!(
+            worktree_closeout_chat_id(worktree).as_deref(),
+            Some("chat-1")
+        );
+
+        worktree.chats.clear();
+        assert!(worktree_can_closeout(worktree));
+        assert_eq!(worktree_closeout_chat_id(worktree), None);
+    }
+
+    #[test]
+    fn chat_disclosure_toggles_without_affecting_other_chats() {
+        let mut expanded = HashSet::from(["chat-other".to_string()]);
+
+        assert!(toggle_disclosure(&mut expanded, "chat-1"));
+        assert!(expanded.contains("chat-1"));
+        assert!(expanded.contains("chat-other"));
+
+        assert!(!toggle_disclosure(&mut expanded, "chat-1"));
+        assert!(!expanded.contains("chat-1"));
+        assert!(expanded.contains("chat-other"));
+    }
+
+    #[test]
+    fn background_refresh_keeps_the_last_snapshot_visible() {
+        let snapshot = fixture();
+        let mut load = LoadState::Loaded(snapshot.clone());
+
+        assert!(load.begin_request());
+        assert!(matches!(load, LoadState::Refreshing(ref current) if current == &snapshot));
+
+        assert!(!load.finish_request(Err("temporary failure".into())));
+        assert!(matches!(load, LoadState::Loaded(ref current) if current == &snapshot));
+    }
+
+    #[test]
+    fn initial_load_still_uses_loading_and_failure_states() {
+        let mut load = LoadState::Idle;
+
+        assert!(!load.begin_request());
+        assert!(matches!(load, LoadState::Loading));
+
+        assert!(!load.finish_request(Err("unavailable".into())));
+        assert!(matches!(load, LoadState::Failed(ref error) if error == "unavailable"));
+    }
+
+    fn diff_summary() -> ChatDiffSummary {
+        ChatDiffSummary {
+            files: vec![zeron_proto::DiffFileSummary {
+                path: "src/main.rs".into(),
+                old_path: None,
+                status: "M".into(),
+                additions: 4,
+                deletions: 2,
+                binary: false,
+            }],
+            additions: 4,
+            deletions: 2,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn diff_peek_ignores_stale_completions_and_can_refresh_loaded_data() {
+        let mut peeks = HashMap::new();
+        let mut sequence = 0;
+
+        let first = begin_chat_diff_request(&mut peeks, &mut sequence, "chat-1").unwrap();
+        assert!(begin_chat_diff_request(&mut peeks, &mut sequence, "chat-1").is_none());
+        assert!(!finish_chat_diff_request(
+            &mut peeks,
+            "chat-1".into(),
+            first + 1,
+            Ok(diff_summary()),
+        ));
+        assert_eq!(
+            peeks.get("chat-1"),
+            Some(&ChatDiffPeek::Loading { request_id: first })
+        );
+
+        assert!(finish_chat_diff_request(
+            &mut peeks,
+            "chat-1".into(),
+            first,
+            Ok(diff_summary()),
+        ));
+        assert!(matches!(peeks.get("chat-1"), Some(ChatDiffPeek::Loaded(_))));
+
+        let refresh = begin_chat_diff_request(&mut peeks, &mut sequence, "chat-1").unwrap();
+        assert_ne!(refresh, first);
+        assert_eq!(
+            peeks.get("chat-1"),
+            Some(&ChatDiffPeek::Loading {
+                request_id: refresh,
+            })
+        );
+    }
+
+    #[test]
+    fn diff_peek_summary_discards_the_patch_payload() {
+        let summary = ChatDiffSummary::from(zeron_proto::CheckoutDiff {
+            checkout_id: "checkout-1".into(),
+            device_id: "device-1".into(),
+            cwd: "/repo".into(),
+            patch: "large patch body".repeat(1024),
+            files: diff_summary().files,
+            additions: 4,
+            deletions: 2,
+            truncated: true,
+            checksum: "checksum".into(),
+            updated_at: chrono::Utc::now(),
+        });
+
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.additions, 4);
+        assert_eq!(summary.deletions, 2);
+        assert!(summary.truncated);
     }
 
     #[test]

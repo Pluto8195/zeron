@@ -77,8 +77,7 @@ pub struct ToolDiffStat {
     pub deletions: u64,
 }
 
-/// Line-level add/delete counts for one file's diff.
-pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
+fn text_diff_stat(diff: &ToolDiff) -> ToolDiffStat {
     let (additions, deletions) = match &diff.old_text {
         None => (diff.new_text.lines().count() as u64, 0),
         Some(old) => {
@@ -99,6 +98,102 @@ pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
         path: diff.path.clone(),
         additions,
         deletions,
+    }
+}
+
+fn unquote_git_path(path: &str) -> String {
+    let path = path.trim();
+    let path = if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
+        &path[1..path.len() - 1]
+    } else {
+        path
+    };
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+}
+
+fn git_section_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git ")?;
+    let split = rest.rfind(" b/").or_else(|| rest.rfind(" \"b/"));
+    Some(match split {
+        Some(index) => unquote_git_path(&rest[index + 1..]),
+        None => unquote_git_path(rest),
+    })
+}
+
+/// Per-file stats for either an ACP before/after diff or a Codex unified patch.
+/// Unified patches may contain multiple `diff --git` sections, so callers that
+/// persist stats use this vector form instead of collapsing the edit to one row.
+pub fn tool_diff_stats(diff: &ToolDiff) -> Vec<ToolDiffStat> {
+    let Some(patch) = diff.unified_diff.as_deref() else {
+        return vec![text_diff_stat(diff)];
+    };
+    let mut stats = Vec::new();
+    let mut current: Option<ToolDiffStat> = None;
+    let mut in_hunk = false;
+    for line in patch.lines() {
+        if let Some(path) = git_section_path(line) {
+            if let Some(stat) = current.take() {
+                stats.push(stat);
+            }
+            current = Some(ToolDiffStat {
+                path,
+                additions: 0,
+                deletions: 0,
+            });
+            in_hunk = false;
+            continue;
+        }
+        if line.starts_with("@@") {
+            current.get_or_insert_with(|| ToolDiffStat {
+                path: diff.path.clone(),
+                additions: 0,
+                deletions: 0,
+            });
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') => current.as_mut().unwrap().additions += 1,
+            Some(b'-') => current.as_mut().unwrap().deletions += 1,
+            Some(b' ') | Some(b'\\') | None => {}
+            // A provider-specific line outside the unified hunk ends counting
+            // until another hunk header makes the state explicit again.
+            _ => in_hunk = false,
+        }
+    }
+    if let Some(stat) = current {
+        stats.push(stat);
+    }
+    if stats.is_empty() {
+        stats.push(ToolDiffStat {
+            path: diff.path.clone(),
+            additions: 0,
+            deletions: 0,
+        });
+    }
+    stats
+}
+
+/// Aggregate stat retained for older callers that only expect one file.
+pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
+    if diff.unified_diff.is_none() {
+        return text_diff_stat(diff);
+    }
+    let stats = tool_diff_stats(diff);
+    if stats.len() == 1 {
+        return stats.into_iter().next().unwrap();
+    }
+    ToolDiffStat {
+        path: diff.path.clone(),
+        additions: stats.iter().map(|stat| stat.additions).sum(),
+        deletions: stats.iter().map(|stat| stat.deletions).sum(),
     }
 }
 
@@ -371,7 +466,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                         .filter(|text| !text.trim().is_empty())
                         .map(|text| text.len() as u64);
                     *diff_slot = None;
-                    *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
+                    *diff_stats = diff.as_ref().map(tool_diff_stats);
                 }
             }
         }
@@ -1036,6 +1131,7 @@ mod tests {
             path: "/w/a.rs".into(),
             old_text: Some("a\nb\nc\n".into()),
             new_text: "a\nB\nc\nd\n".into(),
+            unified_diff: None,
         });
         assert_eq!(stat.path, "/w/a.rs");
         assert_eq!(stat.additions, 2); // B + d
@@ -1045,8 +1141,94 @@ mod tests {
             path: "/w/new.rs".into(),
             old_text: None,
             new_text: "one\ntwo\n".into(),
+            unified_diff: None,
         });
         assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    #[test]
+    fn unified_diff_stats_keep_each_file() {
+        let patch = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n",
+            "@@ -1,2 +1,2 @@\n same\n-old\n+new\n",
+            "diff --git a/src/new.rs b/src/new.rs\n",
+            "--- /dev/null\n+++ b/src/new.rs\n",
+            "@@ -0,0 +1,2 @@\n+one\n+two\n",
+        );
+        let diff = ToolDiff {
+            path: "workspace".into(),
+            old_text: None,
+            new_text: String::new(),
+            unified_diff: Some(patch.into()),
+        };
+        assert_eq!(
+            tool_diff_stats(&diff),
+            vec![
+                ToolDiffStat {
+                    path: "src/a.rs".into(),
+                    additions: 1,
+                    deletions: 1,
+                },
+                ToolDiffStat {
+                    path: "src/new.rs".into(),
+                    additions: 2,
+                    deletions: 0,
+                },
+            ]
+        );
+        let aggregate = diff_stat(&diff);
+        assert_eq!(aggregate.path, "workspace");
+        assert_eq!((aggregate.additions, aggregate.deletions), (3, 1));
+    }
+
+    #[test]
+    fn fold_and_sidecar_preserve_unified_patch() {
+        let diff = ToolDiff {
+            path: "src/a.rs".into(),
+            old_text: None,
+            new_text: String::new(),
+            unified_diff: Some(
+                "diff --git a/src/a.rs b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            ),
+        };
+        let event = AgentEvent::ToolResult {
+            id: "edit-1".into(),
+            is_error: false,
+            output: None,
+            diff: Some(diff.clone()),
+        };
+        let mut parts = vec![MessagePart::Tool {
+            id: "edit-1".into(),
+            call: ToolCall::EditFile {
+                path: "src/a.rs".into(),
+                old_string: None,
+                new_string: None,
+            },
+            is_error: false,
+            resolved: false,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }];
+        fold_event_into_parts(&mut parts, &event);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                diff: None,
+                diff_stats: Some(stats),
+                ..
+            } if stats == &vec![ToolDiffStat {
+                path: "src/a.rs".into(), additions: 1, deletions: 1
+            }]
+        ));
+        assert_eq!(sidecar_payload(&event).unwrap().diff, Some(diff));
     }
 
     #[test]
@@ -1072,6 +1254,7 @@ mod tests {
                     path: "/w/a.rs".into(),
                     old_text: Some("a\n".into()),
                     new_text: "b\n".into(),
+                    unified_diff: None,
                 }),
             },
         );
@@ -1126,6 +1309,7 @@ mod tests {
                     path: "/w/a".into(),
                     old_text: None,
                     new_text: "x\n".into(),
+                    unified_diff: None,
                 }),
             },
         );

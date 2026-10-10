@@ -175,12 +175,9 @@ struct SyncCursor {
     origin: String,
     /// [`CLASSIFIER_VERSION`] of the heuristic that wrote `category`. `None`
     /// (every cursor written before versioning) means version 1 and is stale.
-    /// Only ever written alongside a classifier-produced category: there is
-    /// no manual-recategorize path anywhere (category is read-only in the RPC
-    /// and UI; see [`ExternalSessionImporter::reclassify_stale_classifier_version`]),
-    /// so a stale stamp always means "the classifier wrote this and a newer
-    /// classifier may disagree". If a manual category write is ever added it
-    /// must clear/sentinel this field so the reclassify pass skips it.
+    /// Written alongside classifier output and manual overrides. Manual
+    /// records are identified by `classifier_source == Manual`; automatic
+    /// repair/reclassification explicitly skips them regardless of version.
     #[serde(default)]
     classifier_version: Option<u32>,
     /// Who produced `category`: TypeSafe/Jev or [`classify_heuristic`]. Absent
@@ -255,6 +252,9 @@ struct NativeClassification {
 #[serde(rename_all = "lowercase")]
 pub enum ClassifierSource {
     Jev,
+    /// Explicit user choice. Automatic repair/reclassification must never
+    /// replace this until the user returns the chat to automatic mode.
+    Manual,
     #[default]
     Heuristic,
 }
@@ -921,11 +921,9 @@ impl ExternalSessionImporter {
     /// AND origin are left to [`Self::repair_missing_classification`], which
     /// does the full backfill and stamps them (heuristic).
     ///
-    /// Manual-override guard: none needed. Category has no manual write path
-    /// — the only writers are `import`, `repair_missing_classification` and
-    /// this pass, all classifier output; the RPC (`classification_for`) and
-    /// UI only read it. See [`SyncCursor::classifier_version`] for what to do
-    /// if one is added.
+    /// Manual-override guard: cursors stamped [`ClassifierSource::Manual`] are
+    /// skipped. They re-enter this automatic path only when the user clears
+    /// the override through [`Self::set_manual_classification`].
     ///
     /// The cursor is re-read right before the write (the tally and the Jev
     /// call can take a while) so a concurrent `sync` advancing
@@ -940,6 +938,9 @@ impl ExternalSessionImporter {
             let Some(cursor) = self.read_cursor(&chat.id)? else {
                 continue;
             };
+            if cursor.classifier_source == ClassifierSource::Manual {
+                continue;
+            }
             let version_stale = cursor.classifier_version.unwrap_or(1) < CLASSIFIER_VERSION;
             let upgradable = jev_available
                 && cursor.classifier_source == ClassifierSource::Heuristic
@@ -1068,6 +1069,9 @@ impl ExternalSessionImporter {
         for chat in self.workspace.read_chats()? {
             let cursor = self.read_cursor(&chat.id)?;
             let (target, path, native_needs_refresh) = if let Some(cursor) = cursor {
+                if cursor.classifier_source == ClassifierSource::Manual {
+                    continue;
+                }
                 if !is_other_category(&cursor.category) {
                     continue;
                 }
@@ -1078,6 +1082,12 @@ impl ExternalSessionImporter {
                 )
             } else {
                 let existing = self.read_native_classification(&chat.id)?;
+                if existing
+                    .as_ref()
+                    .is_some_and(|c| c.classifier_source == ClassifierSource::Manual)
+                {
+                    continue;
+                }
                 let stale = existing.as_ref().is_none_or(|classification| {
                     classification.classifier_version.unwrap_or(1) < CLASSIFIER_VERSION
                 });
@@ -1231,9 +1241,9 @@ impl ExternalSessionImporter {
 
     /// The cursor of an imported chat whose category is `other` or empty.
     fn is_other_cursor(&self, chat_id: &str) -> Result<Option<SyncCursor>, EngineError> {
-        Ok(self
-            .read_cursor(chat_id)?
-            .filter(|c| is_other_category(&c.category)))
+        Ok(self.read_cursor(chat_id)?.filter(|c| {
+            c.classifier_source != ClassifierSource::Manual && is_other_category(&c.category)
+        }))
     }
 
     /// Sibling to [`Self::repair_missing_timestamps`]/
@@ -1620,6 +1630,108 @@ impl ExternalSessionImporter {
         }))
     }
 
+    /// Whether the effective category was explicitly selected by the user.
+    pub fn classification_is_manual(&self, chat_id: &str) -> Result<bool, EngineError> {
+        if let Some(cursor) = self.read_cursor(chat_id)? {
+            return Ok(cursor.classifier_source == ClassifierSource::Manual);
+        }
+        Ok(self
+            .read_native_classification(chat_id)?
+            .is_some_and(|c| c.classifier_source == ClassifierSource::Manual))
+    }
+
+    /// Set a durable category override, or clear it and immediately restore
+    /// automatic classification from the chat's transcript. Imported chats
+    /// keep using their sync cursor; native/resumed chats keep using their
+    /// separate sidecar, so there is exactly one authoritative record per
+    /// chat and both UI surfaces observe the same value after a refetch.
+    pub fn set_manual_classification(
+        &self,
+        context_usage: &ContextUsageProvider,
+        chat_id: &str,
+        category: Option<&str>,
+    ) -> Result<(), EngineError> {
+        if self.workspace.chat(chat_id)?.is_none() {
+            return Err(EngineError::Other(format!("chat not found: {chat_id}")));
+        }
+        if let Some(category) = category
+            && !crate::typesafe::CHAT_CATEGORIES.contains(&category)
+        {
+            return Err(EngineError::Other(format!(
+                "unknown chat category: {category}"
+            )));
+        }
+
+        if let Some(cursor) = self.read_cursor(chat_id)? {
+            let (category, source, inconclusive) = if let Some(category) = category {
+                (category.to_string(), ClassifierSource::Manual, false)
+            } else {
+                let tally = tally_transcript(Path::new(&cursor.transcript_path))
+                    .ok_or_else(|| EngineError::Other("chat transcript is unavailable".into()))?;
+                self.classify_category(&tally.classification_input(), tally.category())
+            };
+            self.write_cursor(
+                chat_id,
+                &SyncCursor {
+                    category,
+                    classifier_version: Some(CLASSIFIER_VERSION),
+                    classifier_source: source,
+                    jev_inconclusive_version: inconclusive.then_some(CLASSIFIER_VERSION),
+                    ..cursor
+                },
+            )?;
+            return Ok(());
+        }
+
+        let existing = self.read_native_classification(chat_id)?;
+        if let Some(category) = category {
+            return self.write_native_classification(
+                chat_id,
+                &NativeClassification {
+                    category: category.to_string(),
+                    origin: existing
+                        .as_ref()
+                        .map(|value| value.origin.clone())
+                        .unwrap_or_default(),
+                    classifier_version: Some(CLASSIFIER_VERSION),
+                    classifier_source: ClassifierSource::Manual,
+                    jev_inconclusive_version: None,
+                    tool_counts: existing
+                        .as_ref()
+                        .map(|value| value.tool_counts.clone())
+                        .unwrap_or_default(),
+                    skills_loaded: existing
+                        .as_ref()
+                        .map(|value| value.skills_loaded.clone())
+                        .unwrap_or_default(),
+                },
+            );
+        }
+        let path = context_usage
+            .transcript_path_for_chat(&self.workspace, self, chat_id)?
+            .ok_or_else(|| EngineError::Other("chat transcript is unavailable".into()))?;
+        let tally = tally_transcript(&path)
+            .ok_or_else(|| EngineError::Other("chat transcript is unavailable".into()))?;
+        let (effective, source, inconclusive) =
+            self.classify_category(&tally.classification_input(), tally.category());
+        self.write_native_classification(
+            chat_id,
+            &NativeClassification {
+                category: effective,
+                origin: existing
+                    .as_ref()
+                    .map(|value| value.origin.clone())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| tally.origin()),
+                classifier_version: Some(CLASSIFIER_VERSION),
+                classifier_source: source,
+                jev_inconclusive_version: inconclusive.then_some(CLASSIFIER_VERSION),
+                tool_counts: tally.tool_counts.clone(),
+                skills_loaded: tally.skills_loaded_sorted(),
+            },
+        )
+    }
+
     /// Tool-call tally and loaded-skill names from the same persisted source
     /// [`Self::classification_for`] uses.
     pub fn tool_usage_for(
@@ -1649,7 +1761,8 @@ impl ExternalSessionImporter {
         if self
             .read_native_classification(chat_id)?
             .is_some_and(|classification| {
-                classification.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION
+                classification.classifier_source == ClassifierSource::Manual
+                    || classification.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION
             })
         {
             return Ok(());
@@ -1672,7 +1785,8 @@ impl ExternalSessionImporter {
         if self
             .read_native_classification(chat_id)?
             .is_some_and(|classification| {
-                classification.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION
+                classification.classifier_source == ClassifierSource::Manual
+                    || classification.classifier_version.unwrap_or(1) >= CLASSIFIER_VERSION
             })
         {
             return Ok(());
@@ -4155,6 +4269,104 @@ mod native_classification_sidecar_tests {
             !store_root
                 .join("external_import_cursors/native-chat.json")
                 .exists()
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn manual_category_persists_skips_reclassification_and_can_return_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = EngineProfile::development(dir.path(), "dev-org", "dev-user");
+        let core = EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat(
+                "manual-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/work/project".into()),
+            )
+            .unwrap();
+        let transcript = dir.path().join("manual.jsonl");
+        std::fs::write(&transcript, review_transcript()).unwrap();
+        core.external_import
+            .write_cursor(
+                "manual-chat",
+                &SyncCursor {
+                    transcript_path: transcript.to_string_lossy().into_owned(),
+                    external_session_id: "session-manual".into(),
+                    lines_consumed: 2,
+                    category: "pr_review".into(),
+                    origin: "bare_cli".into(),
+                    classifier_version: Some(1),
+                    classifier_source: ClassifierSource::Heuristic,
+                    jev_inconclusive_version: None,
+                    tool_counts: Default::default(),
+                    skills_loaded: Default::default(),
+                    last_synced_mtime: None,
+                    last_synced_len: None,
+                    pending_assistant_tail: Some(false),
+                },
+            )
+            .unwrap();
+
+        core.external_import
+            .set_manual_classification(&core.context_usage, "manual-chat", Some("planning"))
+            .unwrap();
+        assert_eq!(
+            core.external_import
+                .classification_for("manual-chat")
+                .unwrap()
+                .unwrap()
+                .0,
+            "planning"
+        );
+        assert!(
+            core.external_import
+                .classification_is_manual("manual-chat")
+                .unwrap()
+        );
+
+        // Even a stale-version repair must respect the explicit user choice.
+        assert_eq!(
+            core.external_import
+                .reclassify_stale_classifier_version()
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            core.external_import
+                .classification_for("manual-chat")
+                .unwrap()
+                .unwrap()
+                .0,
+            "planning"
+        );
+
+        // Cursor-backed persistence is the same record a restarted importer
+        // reads; clearing the override recomputes the transcript's category.
+        core.external_import
+            .set_manual_classification(&core.context_usage, "manual-chat", None)
+            .unwrap();
+        assert_eq!(
+            core.external_import
+                .classification_for("manual-chat")
+                .unwrap()
+                .unwrap()
+                .0,
+            "pr_review"
+        );
+        assert!(
+            !core
+                .external_import
+                .classification_is_manual("manual-chat")
+                .unwrap()
         );
         core.shutdown().await;
     }

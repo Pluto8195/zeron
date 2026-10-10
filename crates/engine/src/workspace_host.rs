@@ -1309,9 +1309,29 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_cwd(chat_id, cwd))?)
     }
 
+    /// Atomically retarget a chat to a cwd and the identity resolved for that
+    /// exact cwd. `None` deliberately clears any prior checkout identity.
+    pub fn set_chat_target(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        checkout_id: Option<&str>,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_target(chat_id, cwd, checkout_id))?)
+    }
+
     /// Canonical checkout identity for the chat's cwd (diff grouping key).
     pub fn set_chat_checkout(&self, chat_id: &str, checkout_id: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_checkout(chat_id, checkout_id))?)
+    }
+
+    pub fn set_chat_checkout_for_cwd(
+        &self,
+        chat_id: &str,
+        expected_cwd: &str,
+        checkout_id: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_checkout_for_cwd(chat_id, expected_cwd, checkout_id))?)
     }
 
     // ── persistence / teardown ──────────────────────────────────────────────

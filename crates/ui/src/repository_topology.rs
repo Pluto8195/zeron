@@ -20,6 +20,9 @@ use crate::theme::Theme;
 
 const COLUMN_GAP: f32 = 88.0;
 const ROW_GAP: f32 = 24.0;
+const DENSE_WORKTREE_THRESHOLD: usize = 4;
+const WORKTREE_GRID_COLUMN_GAP: f32 = 28.0;
+const WORKTREE_GRID_ROW_GAP: f32 = 12.0;
 const GRAPH_PAD: f32 = 52.0;
 const MIN_ZOOM: f32 = 0.35;
 const MAX_ZOOM: f32 = 1.8;
@@ -56,8 +59,8 @@ impl TopologyStatus {
     fn label(self) -> &'static str {
         match self {
             Self::Clean => "clean",
-            Self::Modified => "modified",
-            Self::Conflicted => "conflicted",
+            Self::Modified => "uncommitted",
+            Self::Conflicted => "conflicts",
             Self::Working => "working",
             Self::AwaitingInput => "needs input",
             Self::Error => "error",
@@ -803,7 +806,12 @@ impl GraphLayout {
             list.sort_by(|a, b| node_sort_key(&seeds[*a]).cmp(&node_sort_key(&seeds[*b])));
         }
 
-        let mut placements = HashMap::<String, (usize, f32)>::new();
+        let max_width = seeds
+            .iter()
+            .map(|seed| node_size(seed.kind).0)
+            .fold(0.0, f32::max);
+        let column_step = max_width + COLUMN_GAP;
+        let mut placements = HashMap::<String, (f32, f32)>::new();
         let mut cursor_y = GRAPH_PAD;
         let mut visiting = HashSet::new();
         Self::place_node(
@@ -814,6 +822,7 @@ impl GraphLayout {
             &mut placements,
             &mut cursor_y,
             &mut visiting,
+            column_step,
         );
         // Malformed/missing-parent records stay visible as a second root row.
         for index in 1..seeds.len() {
@@ -826,24 +835,19 @@ impl GraphLayout {
                     &mut placements,
                     &mut cursor_y,
                     &mut visiting,
+                    column_step,
                 );
             }
         }
 
-        let max_width = seeds
-            .iter()
-            .map(|seed| node_size(seed.kind).0)
-            .fold(0.0, f32::max);
-        let column_step = max_width + COLUMN_GAP;
         let mut nodes = Vec::with_capacity(seeds.len());
         let mut max_x = 0.0_f32;
         let mut max_y = 0.0_f32;
         for seed in seeds {
-            let Some((depth, center_y)) = placements.get(&seed.id).copied() else {
+            let Some((x, center_y)) = placements.get(&seed.id).copied() else {
                 continue;
             };
             let (width, height) = node_size(seed.kind);
-            let x = GRAPH_PAD + depth as f32 * column_step;
             let y = center_y - height / 2.0;
             max_x = max_x.max(x + width);
             max_y = max_y.max(y + height);
@@ -887,9 +891,10 @@ impl GraphLayout {
         depth: usize,
         seeds: &[NodeSeed],
         children: &HashMap<String, Vec<usize>>,
-        placements: &mut HashMap<String, (usize, f32)>,
+        placements: &mut HashMap<String, (f32, f32)>,
         cursor_y: &mut f32,
         visiting: &mut HashSet<String>,
+        column_step: f32,
     ) -> f32 {
         let seed = &seeds[index];
         if let Some((_, center)) = placements.get(&seed.id) {
@@ -899,24 +904,62 @@ impl GraphLayout {
             let (_, height) = node_size(seed.kind);
             let center = *cursor_y + height / 2.0;
             *cursor_y += height + ROW_GAP;
+            placements.insert(
+                seed.id.clone(),
+                (GRAPH_PAD + depth as f32 * column_step, center),
+            );
             return center;
         }
-        let child_centers = children
-            .get(&seed.id)
+        let child_indices = children.get(&seed.id).cloned().unwrap_or_default();
+        let (worktree_children, regular_children): (Vec<_>, Vec<_>) = child_indices
             .into_iter()
-            .flatten()
+            .partition(|child| seeds[*child].kind == GraphNodeKind::Worktree);
+        let mut child_centers = regular_children
+            .into_iter()
             .map(|child| {
                 Self::place_node(
-                    *child,
+                    child,
                     depth + 1,
                     seeds,
                     children,
                     placements,
                     cursor_y,
                     visiting,
+                    column_step,
                 )
             })
             .collect::<Vec<_>>();
+        if worktree_children.len() > DENSE_WORKTREE_THRESHOLD {
+            let columns = worktree_grid_columns(worktree_children.len());
+            let rows = worktree_children.len().div_ceil(columns);
+            let (worktree_width, worktree_height) = node_size(GraphNodeKind::Worktree);
+            let start_y = *cursor_y;
+            let first_x = GRAPH_PAD + (depth + 1) as f32 * column_step;
+            for (slot, child) in worktree_children.into_iter().enumerate() {
+                let column = slot % columns;
+                let row = slot / columns;
+                let x = first_x + column as f32 * (worktree_width + WORKTREE_GRID_COLUMN_GAP);
+                let center = start_y
+                    + row as f32 * (worktree_height + WORKTREE_GRID_ROW_GAP)
+                    + worktree_height / 2.0;
+                placements.insert(seeds[child].id.clone(), (x, center));
+                child_centers.push(center);
+            }
+            *cursor_y += rows as f32 * (worktree_height + WORKTREE_GRID_ROW_GAP);
+        } else {
+            child_centers.extend(worktree_children.into_iter().map(|child| {
+                Self::place_node(
+                    child,
+                    depth + 1,
+                    seeds,
+                    children,
+                    placements,
+                    cursor_y,
+                    visiting,
+                    column_step,
+                )
+            }));
+        }
         let (_, height) = node_size(seed.kind);
         let center =
             if let (Some(first), Some(last)) = (child_centers.first(), child_centers.last()) {
@@ -927,7 +970,10 @@ impl GraphLayout {
                 center
             };
         visiting.remove(&seed.id);
-        placements.insert(seed.id.clone(), (depth, center));
+        placements.insert(
+            seed.id.clone(),
+            (GRAPH_PAD + depth as f32 * column_step, center),
+        );
         center
     }
 
@@ -946,11 +992,20 @@ fn node_sort_key(seed: &NodeSeed) -> (u8, String) {
     (order, seed.title.to_lowercase())
 }
 
+fn worktree_grid_columns(count: usize) -> usize {
+    match count {
+        0..=DENSE_WORKTREE_THRESHOLD => 1,
+        5..=8 => 2,
+        9..=15 => 3,
+        _ => 4,
+    }
+}
+
 fn node_size(kind: GraphNodeKind) -> (f32, f32) {
     match kind {
         GraphNodeKind::Workspace => (220.0, 88.0),
         GraphNodeKind::Repository(_) => (222.0, 96.0),
-        GraphNodeKind::Worktree => (304.0, 164.0),
+        GraphNodeKind::Worktree => (304.0, 116.0),
     }
 }
 
@@ -1013,6 +1068,144 @@ fn worktree_closeout_chat_id(worktree: &TopologyWorktree) -> Option<String> {
 
 fn worktree_can_closeout(worktree: &TopologyWorktree) -> bool {
     !worktree.is_main
+}
+
+fn render_closeout_preview(preview: &WorktreeCloseoutPreview, theme: &Theme) -> gpui::AnyElement {
+    let (label, detail, color, files) = match preview {
+        WorktreeCloseoutPreview::Loading { .. } => (
+            "Checking uncommitted changes…".to_string(),
+            None,
+            theme.text_muted,
+            Vec::new(),
+        ),
+        WorktreeCloseoutPreview::Failed(error) => (
+            "Couldn’t inspect uncommitted changes".to_string(),
+            Some(error.clone()),
+            theme.danger,
+            Vec::new(),
+        ),
+        WorktreeCloseoutPreview::Loaded(plan) if !plan.is_worktree => (
+            "Couldn’t inspect uncommitted changes".to_string(),
+            Some("This path is not a linked worktree".to_string()),
+            theme.danger,
+            Vec::new(),
+        ),
+        WorktreeCloseoutPreview::Loaded(plan) => {
+            let mut blockers = Vec::new();
+            let mut rows = Vec::new();
+            let mut hard_blocker = false;
+            if plan.branch.is_some() && plan.branch == plan.default_branch {
+                blockers.push(format!(
+                    "Checked out on default branch {}",
+                    plan.default_branch.as_deref().unwrap_or_default()
+                ));
+                hard_blocker = true;
+            }
+            if plan.chat_live {
+                blockers.push("Chat session is still live".to_string());
+                hard_blocker = true;
+            }
+            if !plan.shared_chats.is_empty() {
+                blockers.push(format!(
+                    "{} other active chat{} use this worktree",
+                    plan.shared_chats.len(),
+                    if plan.shared_chats.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+                rows.extend(
+                    plan.shared_chats
+                        .iter()
+                        .map(|chat| format!("Chat  {}", chat.title)),
+                );
+                hard_blocker = true;
+            }
+            if let Some(label) = crate::chat_closeout::dirty_inspection_label(plan) {
+                blockers.push(label);
+                hard_blocker = true;
+            }
+            if plan.dirty {
+                blockers.push(crate::chat_closeout::dirty_count_label(plan));
+                rows.extend(crate::chat_closeout::dirty_file_lines(plan));
+            }
+            if let Some(label) = crate::chat_closeout::unmerged_label(plan) {
+                blockers.push(label);
+                rows.extend(plan.unmerged_commit_details.iter().map(|commit| {
+                    let short = commit.sha.chars().take(8).collect::<String>();
+                    format!("{short}  {}", commit.subject)
+                }));
+                let omitted = plan.unmerged_commits as usize
+                    - plan
+                        .unmerged_commit_details
+                        .len()
+                        .min(plan.unmerged_commits as usize);
+                if omitted > 0 {
+                    rows.push(format!("+{omitted} older commits not shown"));
+                }
+            }
+            if let Some(label) = crate::chat_closeout::unverifiable_label(plan) {
+                blockers.push(label);
+            }
+            if blockers.is_empty() {
+                (
+                    "No close-out blockers".to_string(),
+                    None,
+                    theme.success,
+                    Vec::new(),
+                )
+            } else {
+                (
+                    "Close-out blockers".to_string(),
+                    Some(blockers.join(" · ")),
+                    if hard_blocker {
+                        theme.danger
+                    } else {
+                        theme.warning
+                    },
+                    rows,
+                )
+            }
+        }
+    };
+
+    div()
+        .w_full()
+        .p(px(9.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(color.opacity(0.35))
+        .bg(color.opacity(0.07))
+        .text_size(crate::typography::ui_rems(9.5))
+        .text_color(color)
+        .child(SharedString::from(label))
+        .when_some(detail, |element, detail| {
+            element.child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(crate::typography::ui_rems(8.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(detail)),
+            )
+        })
+        .children(files.into_iter().enumerate().map(|(index, file)| {
+            let tooltip_path = file.clone();
+            div()
+                .id(("topology-closeout-dirty-file", index))
+                .mt(px(3.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(crate::typography::ui_rems(8.5))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(file))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| TopologyTooltip(SharedString::from(tooltip_path.clone())))
+                        .into()
+                })
+        }))
+        .into_any_element()
 }
 
 fn sync_detail(ahead: Option<u64>, behind: Option<u64>) -> Option<String> {
@@ -1099,6 +1292,79 @@ enum ChatDiffPeek {
     Loading { request_id: u64 },
     Loaded(ChatDiffSummary),
     Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorktreeCloseoutPreviewKey {
+    device_id: String,
+    cwd: String,
+    chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeCloseoutPreview {
+    Loading { request_id: u64 },
+    Loaded(crate::chat_closeout::CloseoutPlan),
+    Failed(String),
+}
+
+fn closeout_preview_key(
+    tab: Option<&WorkspaceTab>,
+    local_device_id: Option<&str>,
+    worktree: &TopologyWorktree,
+) -> Option<WorktreeCloseoutPreviewKey> {
+    let tab = tab?;
+    if !worktree_can_closeout(worktree) || local_device_id != Some(tab.device_id.as_str()) {
+        return None;
+    }
+    Some(WorktreeCloseoutPreviewKey {
+        device_id: tab.device_id.clone(),
+        cwd: worktree.full_path.clone(),
+        chat_id: worktree_closeout_chat_id(worktree),
+    })
+}
+
+fn begin_closeout_preview_request(
+    previews: &mut HashMap<WorktreeCloseoutPreviewKey, WorktreeCloseoutPreview>,
+    next_request_id: &mut u64,
+    key: &WorktreeCloseoutPreviewKey,
+    force: bool,
+) -> Option<u64> {
+    if matches!(
+        previews.get(key),
+        Some(WorktreeCloseoutPreview::Loading { .. })
+    ) || (!force && previews.contains_key(key))
+    {
+        return None;
+    }
+    *next_request_id = (*next_request_id).wrapping_add(1);
+    let request_id = *next_request_id;
+    previews.insert(key.clone(), WorktreeCloseoutPreview::Loading { request_id });
+    Some(request_id)
+}
+
+fn finish_closeout_preview_request(
+    previews: &mut HashMap<WorktreeCloseoutPreviewKey, WorktreeCloseoutPreview>,
+    key: WorktreeCloseoutPreviewKey,
+    request_id: u64,
+    result: Result<crate::chat_closeout::CloseoutPlan, String>,
+) -> bool {
+    if !matches!(
+        previews.get(&key),
+        Some(WorktreeCloseoutPreview::Loading {
+            request_id: active_request_id,
+        }) if *active_request_id == request_id
+    ) {
+        return false;
+    }
+    previews.insert(
+        key,
+        match result {
+            Ok(plan) => WorktreeCloseoutPreview::Loaded(plan),
+            Err(error) => WorktreeCloseoutPreview::Failed(error),
+        },
+    );
+    true
 }
 
 fn begin_chat_diff_request(
@@ -1275,6 +1541,8 @@ pub struct RepositoryTopology {
     expanded_chats: HashSet<String>,
     chat_diff_peeks: HashMap<String, ChatDiffPeek>,
     chat_diff_request_seq: u64,
+    closeout_previews: HashMap<WorktreeCloseoutPreviewKey, WorktreeCloseoutPreview>,
+    closeout_preview_request_seq: u64,
     _state_subscription: gpui::Subscription,
     _search_events: gpui::Subscription,
     _refresh_task: gpui::Task<()>,
@@ -1310,7 +1578,7 @@ impl RepositoryTopology {
             if matches!(event, ComposerInputEvent::Edited) {
                 this.auto_fit = true;
                 let query = input.read(cx).text().to_string();
-                this.focus_search_match(&query);
+                this.focus_search_match(&query, cx);
                 cx.notify();
             }
         });
@@ -1339,6 +1607,8 @@ impl RepositoryTopology {
             expanded_chats: HashSet::new(),
             chat_diff_peeks: HashMap::new(),
             chat_diff_request_seq: 0,
+            closeout_previews: HashMap::new(),
+            closeout_preview_request_seq: 0,
             _state_subscription: subscription,
             _search_events: search_events,
             _refresh_task: refresh_task,
@@ -1357,16 +1627,109 @@ impl RepositoryTopology {
         }
     }
 
-    fn focus_search_match(&mut self, query: &str) {
+    fn focus_search_match(&mut self, query: &str, cx: &mut Context<Self>) {
         let snapshot = match &self.load {
             LoadState::Loaded(snapshot) | LoadState::Refreshing(snapshot) => snapshot,
             _ => return,
         };
         let result = topology_search(snapshot, query);
         if let Some(focus) = result.focus {
-            self.selected = Some(focus);
             self.expanded_chats.extend(result.matching_chat_ids);
+            self.select_topology_node(focus, cx);
         }
+    }
+
+    fn select_topology_node(&mut self, selection: TopologySelection, cx: &mut Context<Self>) {
+        self.selected = Some(selection);
+        self.ensure_selected_closeout_preview(true, cx);
+        cx.notify();
+    }
+
+    fn ensure_selected_closeout_preview(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(TopologySelection::Worktree {
+            repository_id,
+            worktree_id,
+        }) = self.selected.as_ref()
+        else {
+            return;
+        };
+        let snapshot = match &self.load {
+            LoadState::Loaded(snapshot) | LoadState::Refreshing(snapshot) => snapshot,
+            _ => return,
+        };
+        let Some(worktree) = snapshot
+            .repositories
+            .iter()
+            .find(|repository| &repository.id == repository_id)
+            .and_then(|repository| {
+                repository
+                    .worktrees
+                    .iter()
+                    .find(|worktree| &worktree.id == worktree_id)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let (key, engine) = {
+            let state = self.state.read(cx);
+            let tabs = Self::workspace_tabs(&state);
+            (
+                closeout_preview_key(
+                    self.workspace_selection.selected(&tabs),
+                    state.local_device_id.as_deref(),
+                    &worktree,
+                ),
+                state.engine().cloned(),
+            )
+        };
+        let Some(key) = key else {
+            return;
+        };
+        let Some(request_id) = begin_closeout_preview_request(
+            &mut self.closeout_previews,
+            &mut self.closeout_preview_request_seq,
+            &key,
+            force,
+        ) else {
+            return;
+        };
+        let Some(engine) = engine else {
+            self.closeout_previews.insert(
+                key,
+                WorktreeCloseoutPreview::Failed("Engine unavailable".into()),
+            );
+            cx.notify();
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let payload = serde_json::json!({
+                "chatId": key.chat_id.clone(),
+                "cwd": key.cwd.clone(),
+            });
+            let result = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                crate::chat_closeout::PLAN_CHAT_CLOSEOUT,
+                payload,
+                crate::chat_closeout::PLAN_TIMEOUT,
+            )
+            .await
+            .and_then(|value| crate::chat_closeout::decode_plan(&value));
+            this.update(cx, |this, cx| {
+                if finish_closeout_preview_request(
+                    &mut this.closeout_previews,
+                    key,
+                    request_id,
+                    result,
+                ) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn workspace_tabs(state: &AppState) -> Vec<WorkspaceTab> {
@@ -1395,6 +1758,7 @@ impl RepositoryTopology {
         self.selected = None;
         self.expanded_chats.clear();
         self.chat_diff_peeks.clear();
+        self.closeout_previews.clear();
         self.pan = (20.0, 20.0);
         self.zoom = 0.9;
         self.panning = None;
@@ -1449,6 +1813,13 @@ impl RepositoryTopology {
                 let loaded = this.load.finish_request(result);
                 if loaded && !is_refresh {
                     this.auto_fit = true;
+                }
+                if loaded {
+                    // The topology snapshot refreshes while Repo Map is open;
+                    // refresh the selected worktree's detailed blocker plan at
+                    // the same time so file/commit rows cannot contradict the
+                    // newly refreshed card status.
+                    this.ensure_selected_closeout_preview(is_refresh, cx);
                 }
                 cx.notify();
             })
@@ -1663,7 +2034,7 @@ impl RepositoryTopology {
             .w(px(rect.width))
             .h(px(rect.height))
             .p(px(if node.kind == GraphNodeKind::Worktree {
-                13.0
+                9.0
             } else {
                 10.0
             } * scale))
@@ -1691,8 +2062,7 @@ impl RepositoryTopology {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when_some(selection, |element, selection| {
                 element.on_click(cx.listener(move |this, _, _, cx| {
-                    this.selected = Some(selection.clone());
-                    cx.notify();
+                    this.select_topology_node(selection.clone(), cx);
                 }))
             })
             .when_some(tooltip, |element, tooltip| {
@@ -1720,13 +2090,13 @@ impl RepositoryTopology {
             }
             base.flex()
                 .flex_col()
-                .gap(px(7.0 * scale))
+                .gap(px(4.0 * scale))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap(px(8.0 * scale))
+                        .gap(px(6.0 * scale))
                         .child(
                             div()
                                 .min_w_0()
@@ -1734,7 +2104,7 @@ impl RepositoryTopology {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .text_size(crate::typography::ui_rems(14.5 * scale))
+                                .text_size(crate::typography::ui_rems(13.5 * scale))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text)
                                 .child(SharedString::from(node.title.clone())),
@@ -1745,16 +2115,16 @@ impl RepositoryTopology {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(5.0 * scale))
+                        .gap(px(4.0 * scale))
                         .text_color(theme.text_muted)
-                        .child(crate::icons::icon(crate::icons::FILE_TREE).size(px(11.0 * scale)))
+                        .child(crate::icons::icon(crate::icons::FILE_TREE).size(px(10.0 * scale)))
                         .child(
                             div()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .text_size(crate::typography::ui_rems(10.5 * scale))
+                                .text_size(crate::typography::ui_rems(10.0 * scale))
                                 .child(SharedString::from(node.branch.clone().unwrap_or_default())),
                         ),
                 )
@@ -1765,7 +2135,7 @@ impl RepositoryTopology {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_size(crate::typography::ui_rems(9.5 * scale))
+                            .text_size(crate::typography::ui_rems(9.0 * scale))
                             .text_color(theme.text_faint)
                             .child(SharedString::from(path)),
                     )
@@ -1774,7 +2144,7 @@ impl RepositoryTopology {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(6.0 * scale))
+                        .gap(px(5.0 * scale))
                         .child(self.status_chip(node.status, theme, scale))
                         .child(
                             self.muted_chip(
@@ -1788,11 +2158,11 @@ impl RepositoryTopology {
                 .child(
                     div()
                         .mt_auto()
-                        .h(px(28.0 * scale))
-                        .px(px(8.0 * scale))
+                        .h(px(24.0 * scale))
+                        .px(px(7.0 * scale))
                         .flex()
                         .items_center()
-                        .gap(px(6.0 * scale))
+                        .gap(px(5.0 * scale))
                         .rounded(px(6.0 * scale))
                         .bg(theme.element_hover)
                         .child(
@@ -1803,7 +2173,7 @@ impl RepositoryTopology {
                         )
                         .child(
                             crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(11.0 * scale)),
+                                .size(px(10.0 * scale)),
                         )
                         .child(
                             div()
@@ -1811,7 +2181,7 @@ impl RepositoryTopology {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .text_size(crate::typography::ui_rems(10.0 * scale))
+                                .text_size(crate::typography::ui_rems(9.5 * scale))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(occupancy.card_label())),
                         ),
@@ -2245,7 +2615,13 @@ impl RepositoryTopology {
                 let closeout_title =
                     format!("{} · {}", repository.name, worktree_ref_label(worktree));
                 let closeout_chat_id = worktree_closeout_chat_id(worktree);
-                let (last_message_previews, target_device_id) = {
+                let (
+                    last_message_previews,
+                    target_space_id,
+                    target_device_id,
+                    closeout_is_local,
+                    closeout_preview,
+                ) = {
                     let state = self.state.read(cx);
                     let previews = worktree
                         .chats
@@ -2261,11 +2637,24 @@ impl RepositoryTopology {
                         })
                         .collect::<HashMap<_, _>>();
                     let tabs = Self::workspace_tabs(&state);
-                    let device_id = self
-                        .workspace_selection
-                        .selected(&tabs)
-                        .map(|tab| tab.device_id.clone());
-                    (previews, device_id)
+                    let selected_tab = self.workspace_selection.selected(&tabs);
+                    let device_id = selected_tab.map(|tab| tab.device_id.clone());
+                    let closeout_key = closeout_preview_key(
+                        selected_tab,
+                        state.local_device_id.as_deref(),
+                        worktree,
+                    );
+                    let closeout_preview = closeout_key
+                        .as_ref()
+                        .and_then(|key| self.closeout_previews.get(key))
+                        .cloned();
+                    (
+                        previews,
+                        selected_tab.map(|tab| tab.id.clone()),
+                        device_id,
+                        closeout_key.is_some(),
+                        closeout_preview,
+                    )
                 };
                 let chats = worktree
                     .chats
@@ -2612,6 +3001,8 @@ impl RepositoryTopology {
                             })
                     })
                     .collect::<Vec<_>>();
+                let new_chat_path = worktree.full_path.clone();
+                let new_chat_branch = worktree.branch.clone();
                 div()
                     .flex()
                     .flex_col()
@@ -2659,7 +3050,47 @@ impl RepositoryTopology {
                         ),
                         theme,
                     ))
-                    .when(worktree_can_closeout(worktree), |element| {
+                    .when_some(target_space_id, |element, space_id| {
+                        element.child(
+                            div()
+                                .id("topology-inspector-new-chat-in-worktree")
+                                .w_full()
+                                .px(px(10.0))
+                                .py(px(7.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(theme.accent.opacity(0.12))
+                                .cursor_pointer()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.accent)
+                                .hover(|element| element.bg(theme.accent.opacity(0.2)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(shell) = this.shell.upgrade() {
+                                        shell.update(cx, |shell, cx| {
+                                            shell.open_new_session_in_worktree(
+                                                space_id.clone(),
+                                                new_chat_path.clone(),
+                                                new_chat_branch.clone(),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::PEN_NEW_SQUARE).size(px(11.0)),
+                                )
+                                .child("New chat in this worktree"),
+                        )
+                    })
+                    .when_some(closeout_preview, |element, preview| {
+                        element.child(render_closeout_preview(&preview, theme))
+                    })
+                    .when(closeout_is_local, |element| {
                         element.child(
                             div()
                                 .id("topology-inspector-closeout-worktree")
@@ -3386,6 +3817,56 @@ mod tests {
     }
 
     #[test]
+    fn many_worktrees_use_a_dense_grid_without_losing_card_data() {
+        let mut snapshot = fixture();
+        let template = snapshot.repositories[0].worktrees[0].clone();
+        snapshot.repositories[0].worktrees = (0..24)
+            .map(|index| TopologyWorktree {
+                id: format!("checkout-{index}"),
+                name: format!("worktree-{index}"),
+                path: format!(".worktrees/worktree-{index}"),
+                full_path: format!("/src/zeron/.worktrees/worktree-{index}"),
+                branch: Some(format!("feature/worktree-{index}")),
+                ..template.clone()
+            })
+            .collect();
+
+        let layout = GraphLayout::from_snapshot(&snapshot);
+        let worktrees = layout
+            .nodes
+            .iter()
+            .filter(|node| node.kind == GraphNodeKind::Worktree)
+            .collect::<Vec<_>>();
+        let columns = worktrees
+            .iter()
+            .map(|node| node.x.to_bits())
+            .collect::<HashSet<_>>();
+        let rows = worktrees
+            .iter()
+            .map(|node| node.y.to_bits())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(worktrees.len(), 24);
+        assert_eq!(columns.len(), 4);
+        assert_eq!(rows.len(), 6);
+        assert!(
+            layout.height < 1_100.0,
+            "dense layout was {}px tall",
+            layout.height
+        );
+
+        let last = worktrees
+            .iter()
+            .find(|node| node.id.ends_with("checkout-23"))
+            .unwrap();
+        assert_eq!(last.title, "feature/worktree-23");
+        assert_eq!(last.path.as_deref(), Some(".worktrees/worktree-23"));
+        assert_eq!(last.status, template.status);
+        assert_eq!(last.occupancy.as_ref().unwrap().chats, template.chats.len());
+        assert_eq!(last.height, 116.0);
+    }
+
+    #[test]
     fn search_matches_attached_chat_title_and_id() {
         let result = topology_search(&fixture(), "CHAT-1 repository map");
 
@@ -3516,6 +3997,112 @@ mod tests {
     }
 
     #[test]
+    fn closeout_preview_key_requires_the_local_workspace_owner() {
+        let tabs = workspace_tabs();
+        let mut snapshot = fixture();
+        let worktree = &mut snapshot.repositories[0].worktrees[0];
+        worktree.is_main = false;
+
+        let key = closeout_preview_key(Some(&tabs[0]), Some("device-a"), worktree).unwrap();
+        assert_eq!(key.device_id, "device-a");
+        assert_eq!(key.cwd, "/src/zeron");
+        assert_eq!(key.chat_id.as_deref(), Some("chat-1"));
+        assert!(closeout_preview_key(Some(&tabs[0]), Some("device-b"), worktree).is_none());
+
+        worktree.is_main = true;
+        assert!(closeout_preview_key(Some(&tabs[0]), Some("device-a"), worktree).is_none());
+    }
+
+    #[test]
+    fn closeout_preview_ignores_stale_completions_and_keys_all_inputs() {
+        let first_key = WorktreeCloseoutPreviewKey {
+            device_id: "device-a".into(),
+            cwd: "/repo/one".into(),
+            chat_id: Some("chat-1".into()),
+        };
+        let other_key = WorktreeCloseoutPreviewKey {
+            device_id: "device-a".into(),
+            cwd: "/repo/one".into(),
+            chat_id: Some("chat-2".into()),
+        };
+        let mut previews = HashMap::new();
+        let mut sequence = 0;
+        let request_id =
+            begin_closeout_preview_request(&mut previews, &mut sequence, &first_key, false)
+                .unwrap();
+
+        assert!(
+            begin_closeout_preview_request(&mut previews, &mut sequence, &first_key, true)
+                .is_none()
+        );
+        assert!(!finish_closeout_preview_request(
+            &mut previews,
+            first_key.clone(),
+            request_id + 1,
+            Ok(crate::chat_closeout::CloseoutPlan::default()),
+        ));
+        assert!(matches!(
+            previews.get(&first_key),
+            Some(WorktreeCloseoutPreview::Loading { request_id: active })
+                if *active == request_id
+        ));
+
+        assert!(finish_closeout_preview_request(
+            &mut previews,
+            first_key.clone(),
+            request_id,
+            Ok(crate::chat_closeout::CloseoutPlan::default()),
+        ));
+        assert!(matches!(
+            previews.get(&first_key),
+            Some(WorktreeCloseoutPreview::Loaded(_))
+        ));
+
+        let other_request =
+            begin_closeout_preview_request(&mut previews, &mut sequence, &other_key, false)
+                .unwrap();
+        assert_ne!(other_request, request_id);
+        assert!(previews.contains_key(&first_key));
+        assert!(previews.contains_key(&other_key));
+    }
+
+    #[test]
+    fn closeout_preview_refreshes_only_for_explicit_selection_or_a_new_key() {
+        let key = WorktreeCloseoutPreviewKey {
+            device_id: "device-a".into(),
+            cwd: "/repo/one".into(),
+            chat_id: Some("chat-1".into()),
+        };
+        let mut previews = HashMap::from([(
+            key.clone(),
+            WorktreeCloseoutPreview::Loaded(crate::chat_closeout::CloseoutPlan::default()),
+        )]);
+        let mut sequence = 7;
+
+        assert!(
+            begin_closeout_preview_request(&mut previews, &mut sequence, &key, false).is_none()
+        );
+        assert_eq!(sequence, 7);
+
+        let forced =
+            begin_closeout_preview_request(&mut previews, &mut sequence, &key, true).unwrap();
+        assert_eq!(forced, 8);
+        assert!(matches!(
+            previews.get(&key),
+            Some(WorktreeCloseoutPreview::Loading { request_id: 8 })
+        ));
+
+        let changed_key = WorktreeCloseoutPreviewKey {
+            chat_id: Some("chat-2".into()),
+            ..key
+        };
+        let background =
+            begin_closeout_preview_request(&mut previews, &mut sequence, &changed_key, false)
+                .unwrap();
+        assert_eq!(background, 9);
+    }
+
+    #[test]
     fn chat_disclosure_toggles_without_affecting_other_chats() {
         let mut expanded = HashSet::from(["chat-other".to_string()]);
 
@@ -3611,6 +4198,7 @@ mod tests {
             cwd: "/repo".into(),
             patch: "large patch body".repeat(1024),
             files: diff_summary().files,
+            submodules: Vec::new(),
             additions: 4,
             deletions: 2,
             truncated: true,

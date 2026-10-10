@@ -403,6 +403,18 @@ fn tool_group_collapses(tools: &[ToolItem]) -> bool {
     tools.iter().any(|t| !is_agent_tool(t))
 }
 
+/// A file-changing chip's first disclosure should start loading its sidecar
+/// diff. Other tools keep the explicit output affordance because opening a
+/// command is not equivalent to asking for its potentially-large stdout.
+fn edit_diff_ref_on_open(tool: &ToolItem) -> Option<SharedString> {
+    matches!(
+        tool.call,
+        ToolCall::WriteFile { .. } | ToolCall::EditFile { .. } | ToolCall::ApplyPatch { .. }
+    )
+    .then(|| tool.diff_ref.clone())
+    .flatten()
+}
+
 /// Column budget for soft-wrapping thought text into detail lines. The
 /// detail body is preformatted (no element wrapping), so the wrap happens
 /// here — conservative enough to fit the card at typical transcript widths.
@@ -748,6 +760,12 @@ pub enum ToolDetail {
         old_text: Option<Arc<str>>,
         new_text: Option<Arc<str>>,
     },
+    /// One or more files decoded from a raw unified patch. Codex reports
+    /// edits in this form (rather than full old/new documents), so keep the
+    /// parsed file sections together under the originating tool chip.
+    UnifiedPatch {
+        files: Arc<Vec<crate::changes::FileDiff>>,
+    },
     /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
     /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
     /// via the sidecar fetch.
@@ -763,6 +781,9 @@ pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
 /// stacked element inside its transcript row, so it must stay bounded
 /// (~600 lines ≈ 12.6k px, several screens of context before the cut).
 pub const DIFF_DETAIL_MAX_LINES: usize = 600;
+
+/// Compact file header above each section of a multi-file tool patch.
+const TOOL_PATCH_FILE_HEADER_HEIGHT: f32 = 28.0;
 
 /// Per-line height of an output detail block (diff blocks use the changes
 /// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
@@ -783,6 +804,14 @@ pub fn tool_detail(
     diff_stats: Option<&[zeron_doc::ToolDiffStat]>,
 ) -> Option<ToolDetail> {
     if let Some(diff) = diff {
+        if let Some(mut files) = tool_patch_files(diff)
+            && !files.is_empty()
+        {
+            truncate_tool_patch(&mut files, DIFF_DETAIL_MAX_LINES);
+            return Some(ToolDetail::UnifiedPatch {
+                files: Arc::new(files),
+            });
+        }
         let mut file = diff_to_file(diff);
         if file.hunks.is_empty() {
             return None;
@@ -821,6 +850,55 @@ pub fn tool_detail(
         lines,
         truncated_by,
     })
+}
+
+/// Decode the raw unified patch carried by newer harnesses. A normal git
+/// patch can contain several `diff --git` sections. Some providers instead
+/// send one headerless `@@` patch per file; wrap that form in a synthetic
+/// section, then restore the provider's exact path after parsing.
+fn tool_patch_files(diff: &zeron_proto::ToolDiff) -> Option<Vec<crate::changes::FileDiff>> {
+    let patch = diff.unified_diff.as_deref()?.trim();
+    if patch.is_empty() {
+        return None;
+    }
+    let files = crate::changes::parse_patch(patch);
+    if !files.is_empty() {
+        return Some(files);
+    }
+    if diff.path.trim().is_empty() {
+        return None;
+    }
+    let wrapped = format!("diff --git a/__zeron_tool_diff__ b/__zeron_tool_diff__\n{patch}\n");
+    let mut files = crate::changes::parse_patch(&wrapped);
+    if let Some(file) = files.first_mut() {
+        file.path = diff.path.clone();
+        file.old_path = None;
+    }
+    files
+        .iter()
+        .any(|file| {
+            !file.hunks.is_empty()
+                || file.binary
+                || !file.notices.is_empty()
+                || file.status != crate::changes::FileStatus::Modified
+        })
+        .then_some(files)
+}
+
+/// Bound the whole patch, not each file independently. A multi-file edit
+/// should never multiply the transcript's 600-line safety budget by its file
+/// count; later sections remain visible with a counted truncation notice.
+fn truncate_tool_patch(files: &mut [crate::changes::FileDiff], max_lines: usize) {
+    let mut remaining = max_lines;
+    for file in files {
+        let lines = file
+            .hunks
+            .iter()
+            .map(|hunk| hunk.lines.len())
+            .sum::<usize>();
+        crate::changes::truncate_file_lines(file, remaining);
+        remaining = remaining.saturating_sub(lines);
+    }
 }
 
 /// Columns at which an invocation line soft-wraps into continuation lines.
@@ -982,6 +1060,13 @@ pub enum RowKind {
         name: String,
         mime_type: String,
     },
+    /// A Codex `visualize` control envelope. Zeron does not execute local
+    /// HTML in the embedded browser; the row instead opens a validated file
+    /// inside the current workspace. `None` is a malformed envelope, kept as
+    /// a quiet unavailable card so private-use control bytes never leak.
+    Visualization {
+        artifact: Option<VisualizationArtifact>,
+    },
     User {
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
@@ -1029,6 +1114,126 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+}
+
+const VISUALIZE_PREFIX: &str = "\u{e200}visualize\u{e202}";
+const VISUALIZE_SUFFIX: &str = "\u{e201}";
+const MAX_VISUALIZE_PAYLOAD_BYTES: usize = 8 * 1024;
+const MAX_VISUALIZE_PATH_BYTES: usize = 4 * 1024;
+const MAX_VISUALIZE_TITLE_CHARS: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualizationArtifact {
+    path: String,
+    title: String,
+    wide: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VisualizationPayload {
+    path: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+enum AssistantTextFragment<'a> {
+    Markdown(&'a str),
+    Visualization(Option<VisualizationArtifact>),
+}
+
+fn visualization_artifact(payload: &str) -> Option<VisualizationArtifact> {
+    if payload.len() > MAX_VISUALIZE_PAYLOAD_BYTES {
+        return None;
+    }
+    let payload: VisualizationPayload = serde_json::from_str(payload).ok()?;
+    if payload.path.is_empty()
+        || payload.path.len() > MAX_VISUALIZE_PATH_BYTES
+        || !std::path::Path::new(&payload.path).has_root()
+        || payload.path.chars().any(char::is_control)
+        || !payload.path.to_ascii_lowercase().ends_with(".html")
+        || payload.mode.as_deref().is_some_and(|mode| mode != "wide")
+    {
+        return None;
+    }
+    let title = payload
+        .title
+        .or_else(|| {
+            std::path::Path::new(&payload.path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "Visualization".to_owned());
+    let title = title.trim();
+    if title.is_empty()
+        || title.chars().count() > MAX_VISUALIZE_TITLE_CHARS
+        || title.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(VisualizationArtifact {
+        path: payload.path,
+        title: title.to_owned(),
+        wide: payload.mode.as_deref() == Some("wide"),
+    })
+}
+
+/// Split only the exact Codex visualization envelope. Invalid framed payloads
+/// still become an unavailable artifact row: rendering their raw private-use
+/// delimiters would be both noisy and an accidental parser escape hatch.
+fn trailing_visualize_prefix_len(text: &str) -> usize {
+    VISUALIZE_PREFIX
+        .char_indices()
+        .skip(1)
+        .map(|(boundary, _)| boundary)
+        .filter(|&boundary| text.ends_with(&VISUALIZE_PREFIX[..boundary]))
+        .max()
+        .unwrap_or(0)
+}
+
+fn assistant_text_fragments(
+    text: &str,
+    suppress_streaming_prefix: bool,
+) -> Vec<AssistantTextFragment<'_>> {
+    let mut fragments = Vec::new();
+    let mut plain_start = 0;
+    let mut search_start = 0;
+    while let Some(relative) = text[search_start..].find(VISUALIZE_PREFIX) {
+        let start = search_start + relative;
+        if start > plain_start {
+            fragments.push(AssistantTextFragment::Markdown(&text[plain_start..start]));
+        }
+        let payload_start = start + VISUALIZE_PREFIX.len();
+        let Some(relative_end) = text[payload_start..].find(VISUALIZE_SUFFIX) else {
+            // Streaming may stop between the envelope and its terminator.
+            // Suppress that control tail until the next transcript update.
+            fragments.push(AssistantTextFragment::Visualization(None));
+            plain_start = text.len();
+            break;
+        };
+        let end = payload_start + relative_end;
+        fragments.push(AssistantTextFragment::Visualization(
+            visualization_artifact(&text[payload_start..end]),
+        ));
+        plain_start = end + VISUALIZE_SUFFIX.len();
+        search_start = plain_start;
+    }
+    let partial_prefix_len = suppress_streaming_prefix
+        .then(|| trailing_visualize_prefix_len(&text[plain_start..]))
+        .unwrap_or(0);
+    let plain_end = text.len() - partial_prefix_len;
+    if plain_start < plain_end {
+        fragments.push(AssistantTextFragment::Markdown(
+            &text[plain_start..plain_end],
+        ));
+    }
+    if fragments.is_empty() && partial_prefix_len == 0 {
+        fragments.push(AssistantTextFragment::Markdown(text));
+    }
+    fragments
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1141,6 +1346,17 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                 acc.extend_from_slice(&file.additions.to_le_bytes());
                 acc.extend_from_slice(&file.deletions.to_le_bytes());
                 acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+            }
+            Some(ToolDetail::UnifiedPatch { files }) => {
+                acc.push(5);
+                for file in files.iter() {
+                    acc.extend_from_slice(file.path.as_bytes());
+                    acc.extend_from_slice(&file.additions.to_le_bytes());
+                    acc.extend_from_slice(&file.deletions.to_le_bytes());
+                    acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+                    let lines = file.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
+                    acc.extend_from_slice(&(lines as u32).to_le_bytes());
+                }
             }
             Some(ToolDetail::Stats { stats }) => {
                 acc.push(3);
@@ -1417,41 +1633,84 @@ pub fn rows_for_entry(
                             continue;
                         }
                         let key = format!("{}#{}", entry.id, part_id);
-                        let tree = parse(&key, text);
-                        // Live and completed parts split identically — one row
-                        // per top-level block, same ids, so the live→complete
-                        // handoff never changes row identity. The version is a
-                        // content hash of the block's bytes (LSB = streaming),
-                        // so a commit only splices rows whose bytes actually
-                        // changed — the settled prefix of a live reply is
-                        // untouched (and its render caches stay valid).
-                        for block_ix in 0..tree.blocks.len() {
-                            let range = &tree.blocks[block_ix].range;
-                            let end = range.end.min(text.len());
-                            let bytes = text
-                                .as_bytes()
-                                .get(range.start.min(end)..end)
-                                .unwrap_or_default();
-                            let version = (fnv1a(bytes) << 1) | streaming as u64;
-                            rows.push(Row {
-                                id: format!("{key}.{block_ix}").into(),
-                                version,
-                                turn_start: false,
-                                entry_id: entry_id.clone(),
-                                timestamp: None,
-                                copy_text: None,
-                                kind: if streaming {
-                                    RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
-                                        block_ix,
+                        let fragments = assistant_text_fragments(text, streaming);
+                        let segmented = fragments.len() > 1
+                            || matches!(
+                                fragments.first(),
+                                Some(AssistantTextFragment::Visualization(_))
+                            );
+                        for (fragment_ix, fragment) in fragments.into_iter().enumerate() {
+                            match fragment {
+                                AssistantTextFragment::Markdown(markdown) => {
+                                    if markdown.trim().is_empty() {
+                                        continue;
                                     }
-                                } else {
-                                    RowKind::Markdown {
-                                        tree: tree.clone(),
-                                        block_ix,
+                                    // Preserve the ordinary part key for a leading text
+                                    // fragment, so an artifact appended during streaming
+                                    // does not re-key already-settled Markdown rows.
+                                    let fragment_key = if segmented && fragment_ix > 0 {
+                                        format!("{key}#s{fragment_ix}")
+                                    } else {
+                                        key.clone()
+                                    };
+                                    let tree = parse(&fragment_key, markdown);
+                                    // Live and completed parts split identically — one row
+                                    // per top-level block, same ids, so the live→complete
+                                    // handoff never changes row identity. The version is a
+                                    // content hash of the block's bytes (LSB = streaming),
+                                    // so a commit only splices rows whose bytes actually
+                                    // changed — the settled prefix of a live reply is
+                                    // untouched (and its render caches stay valid).
+                                    for block_ix in 0..tree.blocks.len() {
+                                        let range = &tree.blocks[block_ix].range;
+                                        let end = range.end.min(markdown.len());
+                                        let bytes = markdown
+                                            .as_bytes()
+                                            .get(range.start.min(end)..end)
+                                            .unwrap_or_default();
+                                        let version = (fnv1a(bytes) << 1) | streaming as u64;
+                                        rows.push(Row {
+                                            id: format!("{fragment_key}.{block_ix}").into(),
+                                            version,
+                                            turn_start: false,
+                                            entry_id: entry_id.clone(),
+                                            timestamp: None,
+                                            copy_text: None,
+                                            kind: if streaming {
+                                                RowKind::LiveMarkdown {
+                                                    tree: tree.clone(),
+                                                    block_ix,
+                                                }
+                                            } else {
+                                                RowKind::Markdown {
+                                                    tree: tree.clone(),
+                                                    block_ix,
+                                                }
+                                            },
+                                        });
                                     }
-                                },
-                            });
+                                }
+                                AssistantTextFragment::Visualization(artifact) => {
+                                    let version = artifact.as_ref().map_or(0, |artifact| {
+                                        fnv1a(
+                                            format!(
+                                                "{}\0{}\0{}",
+                                                artifact.path, artifact.title, artifact.wide
+                                            )
+                                            .as_bytes(),
+                                        )
+                                    });
+                                    rows.push(Row {
+                                        id: format!("{key}#v{fragment_ix}").into(),
+                                        version: (version << 1) | streaming as u64,
+                                        turn_start: false,
+                                        entry_id: entry_id.clone(),
+                                        timestamp: None,
+                                        copy_text: None,
+                                        kind: RowKind::Visualization { artifact },
+                                    });
+                                }
+                            }
                         }
                     }
                     MessagePart::Image {
@@ -1904,6 +2163,10 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
             rows as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
         }
         ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
+        ToolDetail::UnifiedPatch { files } => files
+            .iter()
+            .map(|file| TOOL_PATCH_FILE_HEADER_HEIGHT + crate::changes::body_height(file))
+            .sum(),
         ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
     };
     DETAIL_SEPARATOR + body
@@ -1920,6 +2183,10 @@ pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
 struct ChipAffordance {
     blob_ref: SharedString,
     label: SharedString,
+    /// Present after a failed fetch so the retry control can explain why the
+    /// previous attempt failed instead of silently snapping back to the same
+    /// label. The row stays compact; the full cause lives in its tooltip.
+    failure: Option<SharedString>,
 }
 
 /// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
@@ -2929,8 +3196,27 @@ pub struct Transcript {
 enum BlobFetch {
     Loading(#[allow(dead_code)] Task<()>),
     /// Failed with the affordance re-armed as a retry.
-    Failed,
+    Failed(SharedString),
     Ready(Arc<ToolDetail>),
+}
+
+struct BlobFetchErrorTooltip(SharedString);
+
+impl Render for BlobFetchErrorTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .max_w(px(420.0))
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.1))
+            .bg(theme.surface)
+            .text_size(px(12.0))
+            .line_height(px(17.0))
+            .text_color(theme.text_muted)
+            .child(self.0.clone())
+    }
 }
 
 /// Shell-facing events (the transcript itself hosts no surfaces).
@@ -4712,7 +4998,7 @@ impl Transcript {
                 return;
             }
             Some(BlobFetch::Loading(_)) => return,
-            Some(BlobFetch::Failed) | None => {}
+            Some(BlobFetch::Failed(_)) | None => {}
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -4736,9 +5022,21 @@ impl Transcript {
                         .unwrap_or_default();
                     blob_detail(text, is_diff)
                         .map(|d| BlobFetch::Ready(Arc::new(d)))
-                        .unwrap_or(BlobFetch::Failed)
+                        .unwrap_or_else(|| {
+                            BlobFetch::Failed(
+                                if is_diff {
+                                    "The fetched diff was empty or invalid."
+                                } else {
+                                    "The fetched output was empty."
+                                }
+                                .into(),
+                            )
+                        })
                 }
-                Err(_) => BlobFetch::Failed,
+                Err(error) => {
+                    tracing::warn!(blob_ref = %ref_key, error = %error, "tool blob fetch failed");
+                    BlobFetch::Failed(error.into())
+                }
             };
             this.update(cx, |this, cx| {
                 this.blob_details.insert(ref_key, fetched);
@@ -6075,6 +6373,13 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
+            RowKind::Visualization { artifact } => visualization_card(
+                &row.id,
+                artifact.as_ref(),
+                workspace_root.as_deref(),
+                self.link_ui(),
+                &theme,
+            ),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
@@ -6468,25 +6773,27 @@ impl Transcript {
                 ];
                 for (blob_ref, what, bytes) in candidates {
                     let Some(blob_ref) = blob_ref else { continue };
-                    let label = match self.blob_details.get(blob_ref) {
+                    let (label, failure) = match self.blob_details.get(blob_ref) {
                         Some(BlobFetch::Ready(_)) => {
                             if shown == Some(blob_ref) {
                                 continue;
                             }
-                            format!("Show full {what}")
+                            (format!("Show full {what}"), None)
                         }
-                        Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
-                        Some(BlobFetch::Failed) => {
-                            format!("Couldn't load full {what} — tap to retry")
-                        }
+                        Some(BlobFetch::Loading(_)) => (format!("Loading full {what}…"), None),
+                        Some(BlobFetch::Failed(error)) => (
+                            format!("Couldn't load full {what} — retry"),
+                            Some(error.clone()),
+                        ),
                         None => match bytes {
-                            Some(b) => format!("Show full {what} ({})", format_kb(b)),
-                            None => format!("Show full {what}"),
+                            Some(b) => (format!("Show full {what} ({})", format_kb(b)), None),
+                            None => (format!("Show full {what}"), None),
                         },
                     };
                     return Some(ChipAffordance {
                         blob_ref: blob_ref.clone(),
                         label: SharedString::from(label),
+                        failure,
                     });
                 }
                 None
@@ -6761,6 +7068,11 @@ impl Transcript {
                         .toggled_at
                         .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
                 let toggle_key = key.clone();
+                // Edit chips should disclose the actual change in one click.
+                // The replicated row usually carries only stats + a sidecar
+                // ref, so opening the chip starts that diff fetch immediately
+                // instead of making the stats panel ask for a second click.
+                let diff_on_open = edit_diff_ref_on_open(tool);
                 let mut card = div()
                     .my(px((base_row_height - CHIP_CARD_HEIGHT) / 2.0))
                     .when(collapses, |el| el.ml(px(ACTIVITY_TEXT_GAP)))
@@ -6792,10 +7104,14 @@ impl Transcript {
                                 let entry =
                                     this.tool_details.entry(toggle_key.clone()).or_default();
                                 let currently_open = entry.open.unwrap_or(open);
+                                let opening = !currently_open;
                                 entry.from = row_height - base_row_height + CHIP_CARD_HEIGHT;
-                                entry.open = Some(!currently_open);
+                                entry.open = Some(opening);
                                 entry.epoch += 1;
                                 entry.toggled_at = Some(Instant::now());
+                                if opening && let Some(blob_ref) = diff_on_open.clone() {
+                                    this.spawn_blob_fetch(blob_ref, cx);
+                                }
                                 cx.notify();
                             }))
                             .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
@@ -6840,7 +7156,12 @@ impl Transcript {
                                 theme,
                             ));
                     }
-                    if let Some(ChipAffordance { blob_ref, label }) = affordance {
+                    if let Some(ChipAffordance {
+                        blob_ref,
+                        label,
+                        failure,
+                    }) = affordance
+                    {
                         let loading = matches!(
                             self.blob_details.get(&blob_ref),
                             Some(BlobFetch::Loading(_))
@@ -6851,14 +7172,24 @@ impl Transcript {
                             .flex_none()
                             .flex()
                             .items_center()
+                            .occlude()
                             .text_size(px(TOOL_TEXT_SIZE))
                             .text_color(theme.text_faint)
                             .child(label);
+                        if let Some(error) = failure {
+                            row = row.tooltip(move |_, cx| {
+                                cx.new(|_| BlobFetchErrorTooltip(error.clone())).into()
+                            });
+                        }
                         if !loading {
                             row = row
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme.text_muted))
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default();
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.spawn_blob_fetch(blob_ref.clone(), cx);
                                     cx.notify();
                                 }));
@@ -7066,6 +7397,118 @@ fn user_bubble_text(
         .into_any_element()
 }
 
+fn visualization_card(
+    row_id: &str,
+    artifact: Option<&VisualizationArtifact>,
+    workspace_root: Option<&str>,
+    link_ui: Option<render::LinkUi>,
+    theme: &Theme,
+) -> AnyElement {
+    // Resolution is lexical and workspace-jailed. The shell repeats the same
+    // validation at activation time, so a stale card cannot open an arbitrary
+    // absolute path after a session switch.
+    let available = artifact.and_then(|artifact| {
+        let relative =
+            crate::workspace_links::resolve_workspace_file_link(&artifact.path, workspace_root?)?;
+        Some((artifact, relative.path))
+    });
+    let title: SharedString = available
+        .as_ref()
+        .map_or("Visualization", |(artifact, _)| artifact.title.as_str())
+        .into();
+    let detail: SharedString = available
+        .as_ref()
+        .map(|(artifact, path)| {
+            if artifact.wide {
+                format!("Wide artifact · {path}")
+            } else {
+                path.clone()
+            }
+        })
+        .unwrap_or_else(|| "Artifact unavailable in this workspace".to_owned())
+        .into();
+    let activation =
+        available.map(|(artifact, _)| (artifact.title.clone(), artifact.path.clone(), link_ui));
+    div()
+        .py(px(4.0))
+        .w_full()
+        .child(
+            div()
+                .id(SharedString::from(format!("{row_id}#visualization")))
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_raised)
+                .px(px(10.0))
+                .py(px(9.0))
+                .when(activation.is_some(), |card| {
+                    card.cursor_pointer()
+                        .hover(|card| card.bg(theme.element_hover))
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(28.0))
+                        .rounded(px(7.0))
+                        .bg(theme.accent.opacity(0.10))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::FILE_CODE)
+                                .size(px(15.0))
+                                .text_color(theme.accent),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(13.0))
+                                .text_color(theme.text)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
+                                .child(detail),
+                        ),
+                )
+                .when(activation.is_some(), |card| {
+                    card.child(
+                        crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+                })
+                .when_some(activation, |card, (title, path, ui)| {
+                    card.on_click(move |_, window, cx| {
+                        render::activate_link(
+                            render::LinkTarget::new(&title, &path),
+                            render::LinkAction::Primary,
+                            ui.as_ref(),
+                            window,
+                            cx,
+                        )
+                    })
+                }),
+        )
+        .into_any_element()
+}
+
 /// The transcript ErrorChip — the shared [`notice_chip`] in its tile
 /// treatment (a port of zeron chat-view.tsx `ErrorChip`, restacked for long
 /// payloads: header row with the red-washed tile and the medium "Error"
@@ -7178,6 +7621,56 @@ fn file_badge_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+fn tool_patch_file_header(file: &crate::changes::FileDiff, theme: &Theme) -> AnyElement {
+    div()
+        .h(px(TOOL_PATCH_FILE_HEADER_HEIGHT))
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .px(px(8.0))
+        .border_b_1()
+        .border_color(crate::theme::hairline(0.07))
+        .bg(crate::theme::ink(0.025))
+        .font_family(theme.font_sans_fixed.clone())
+        .text_size(px(TOOL_TEXT_SIZE))
+        .child(
+            crate::file_icons::icon(
+                crate::file_icons::FileIconIdentity::file(&file.path),
+                theme.appearance,
+            )
+            .size(px(14.0))
+            .flex_none(),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .text_color(theme.text.opacity(0.9))
+                .child(SharedString::from(file.path.clone())),
+        )
+        .when(file.additions > 0, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_color(theme.success)
+                    .child(SharedString::from(format!("+{}", file.additions))),
+            )
+        })
+        .when(file.deletions > 0, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_color(theme.danger)
+                    .child(SharedString::from(format!("−{}", file.deletions))),
+            )
+        })
+        .into_any_element()
+}
+
 /// The body of an expanded chip card, under the header's separator. Diffs
 /// render through the changes pane's section body — the real component, with
 /// hunk headers, dual line-number gutters, accent bars, row washes, and
@@ -7200,6 +7693,19 @@ fn detail_body(
                 diff_highlights,
                 theme,
             ))
+            .into_any_element(),
+        ToolDetail::UnifiedPatch { files } => body
+            .children(files.iter().map(|file| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(tool_patch_file_header(file, theme))
+                    .child(crate::changes::render_file_body_with_syntax(
+                        file, None, theme,
+                    ))
+            }))
             .into_any_element(),
         ToolDetail::Stats { stats } => body
             .py(px(6.0))
@@ -9919,6 +10425,167 @@ mod tests {
     }
 
     #[test]
+    fn visualize_control_token_builds_an_artifact_row_and_preserves_surrounding_text() {
+        let token = concat!(
+            "\u{e200}visualize\u{e202}",
+            r#"{"path":"/work/project/work/node-graphs.fragment.html","mode":"wide","title":"Kit estimation backend node graphs"}"#,
+            "\u{e201}"
+        );
+        let raw = format!("Before\n\n{token}\n\nAfter");
+        let entry = assistant("a", MessageStatus::Complete, vec![text_part("t", &raw)]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0].kind, RowKind::Markdown { .. }));
+        let RowKind::Visualization {
+            artifact: Some(artifact),
+        } = &rows[1].kind
+        else {
+            panic!("visualization row")
+        };
+        assert_eq!(
+            artifact.path,
+            "/work/project/work/node-graphs.fragment.html"
+        );
+        assert_eq!(artifact.title, "Kit estimation backend node graphs");
+        assert!(artifact.wide);
+        assert!(matches!(rows[2].kind, RowKind::Markdown { .. }));
+        assert_eq!(
+            rows.last().unwrap().copy_text.as_deref(),
+            Some(raw.as_str())
+        );
+    }
+
+    #[test]
+    fn appending_visualize_token_keeps_streamed_markdown_row_ids_and_parser_key() {
+        let prefix = "Before the graph\n\n";
+        let token = concat!(
+            "\u{e200}visualize\u{e202}",
+            r#"{"path":"/work/project/chart.html","title":"Chart"}"#,
+            "\u{e201}"
+        );
+        let initial = assistant("a", MessageStatus::Streaming, vec![text_part("t", prefix)]);
+        let appended = assistant(
+            "a",
+            MessageStatus::Streaming,
+            vec![text_part("t", &format!("{prefix}{token}"))],
+        );
+        let mut initial_keys = Vec::new();
+        let initial_rows = rows_for_entry(&initial, false, &mut |key, text| {
+            initial_keys.push(key.to_owned());
+            Arc::new(parse_full(text))
+        });
+        let mut appended_keys = Vec::new();
+        let appended_rows = rows_for_entry(&appended, false, &mut |key, text| {
+            appended_keys.push(key.to_owned());
+            Arc::new(parse_full(text))
+        });
+        let initial_markdown_ids = initial_rows
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let appended_markdown_ids = appended_rows
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(initial_keys, vec!["a#t"]);
+        assert_eq!(appended_keys, initial_keys);
+        assert_eq!(appended_markdown_ids, initial_markdown_ids);
+        assert!(matches!(
+            appended_rows.last().map(|row| &row.kind),
+            Some(RowKind::Visualization { artifact: Some(_) })
+        ));
+    }
+
+    #[test]
+    fn every_partial_visualize_prefix_is_suppressed_while_streaming() {
+        let visible = "Settled prefix";
+        let baseline = assistant("a", MessageStatus::Streaming, vec![text_part("t", visible)]);
+        let baseline_rows = rows_for_entry(&baseline, false, &mut parse);
+        let baseline_ids = baseline_rows
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let baseline_versions = baseline_rows
+            .iter()
+            .map(|row| row.version)
+            .collect::<Vec<_>>();
+
+        for boundary in VISUALIZE_PREFIX
+            .char_indices()
+            .skip(1)
+            .map(|(boundary, _)| boundary)
+        {
+            let raw = format!("{visible}{}", &VISUALIZE_PREFIX[..boundary]);
+            let entry = assistant("a", MessageStatus::Streaming, vec![text_part("t", &raw)]);
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(
+                rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+                baseline_ids,
+                "row id changed at prefix boundary {boundary}"
+            );
+            assert_eq!(
+                rows.iter().map(|row| row.version).collect::<Vec<_>>(),
+                baseline_versions,
+                "raw prefix affected row content at boundary {boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn visualize_payload_is_strictly_bounded_and_whitelisted() {
+        let valid =
+            visualization_artifact(r#"{"path":"/work/project/chart.html","title":"Chart"}"#)
+                .unwrap();
+        assert_eq!(valid.title, "Chart");
+        assert!(!valid.wide);
+
+        for payload in [
+            r#"{"path":"relative/chart.html"}"#,
+            r#"{"path":"/work/project/chart.svg"}"#,
+            r#"{"path":"/work/project/chart.html","mode":"normal"}"#,
+            r#"{"path":"/work/project/chart.html","unknown":true}"#,
+            "{\"path\":\"/work/project/chart.html\",\"title\":\"bad\\nline\"}",
+        ] {
+            assert!(
+                visualization_artifact(payload).is_none(),
+                "accepted {payload}"
+            );
+        }
+        let huge_path = format!("/work/{}.html", "a".repeat(MAX_VISUALIZE_PATH_BYTES));
+        let huge_payload = serde_json::json!({ "path": huge_path }).to_string();
+        assert!(visualization_artifact(&huge_payload).is_none());
+    }
+
+    #[test]
+    fn malformed_and_incomplete_visualize_envelopes_never_become_markdown() {
+        for raw in [
+            "before \u{e200}visualize\u{e202}{not json}\u{e201} after",
+            "before \u{e200}visualize\u{e202}{\"path\":\"/work/chart.html\"",
+        ] {
+            let fragments = assistant_text_fragments(raw, true);
+            assert!(
+                fragments
+                    .iter()
+                    .any(|fragment| matches!(fragment, AssistantTextFragment::Visualization(None)))
+            );
+            assert!(fragments.iter().all(|fragment| match fragment {
+                AssistantTextFragment::Markdown(text) => {
+                    !text.contains(VISUALIZE_PREFIX) && !text.contains(VISUALIZE_SUFFIX)
+                }
+                AssistantTextFragment::Visualization(_) => true,
+            }));
+            let entry = assistant("a", MessageStatus::Streaming, vec![text_part("t", raw)]);
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert!(
+                rows.iter()
+                    .any(|row| matches!(row.kind, RowKind::Visualization { artifact: None }))
+            );
+        }
+    }
+
+    #[test]
     fn reasoning_joins_the_tool_group_accordion() {
         // Thought → tool → thought → tool folds into ONE group row (user
         // request: the thought process lives inside the combined accordion),
@@ -12287,6 +12954,7 @@ mod tests {
             path: "/w/a.rs".into(),
             old_text: Some(old.join("\n") + "\n"),
             new_text: new.join("\n") + "\n",
+            unified_diff: None,
         };
         let Some(ToolDetail::Diff {
             file,
@@ -12324,6 +12992,7 @@ mod tests {
             path: "/w/new.txt".into(),
             old_text: None,
             new_text: "only\n".into(),
+            unified_diff: None,
         };
         let Some(ToolDetail::Diff {
             file,
@@ -12356,6 +13025,142 @@ mod tests {
         // Nothing → no affordance.
         assert!(tool_detail(None, None, None).is_none());
         assert!(tool_detail(Some("\n\n"), None, None).is_none());
+    }
+
+    #[test]
+    fn unified_tool_patch_keeps_every_file_and_real_line_numbers() {
+        use crate::changes::{FileStatus, LineKind};
+        let patch = "diff --git a/src/a.rs b/src/a.rs\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -9,2 +9,2 @@\n\
+-old\n\
++new\n\
+ keep\n\
+diff --git a/src/b.rs b/src/b.rs\n\
+new file mode 100644\n\
+--- /dev/null\n\
++++ b/src/b.rs\n\
+@@ -0,0 +1,1 @@\n\
++created\n";
+        let diff = zeron_proto::ToolDiff {
+            path: "workspace".into(),
+            old_text: None,
+            new_text: String::new(),
+            unified_diff: Some(patch.into()),
+        };
+        let Some(ToolDetail::UnifiedPatch { files }) = tool_detail(None, Some(&diff), None) else {
+            panic!("expected unified patch detail");
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
+        let deletion = files[0].hunks[0]
+            .lines
+            .iter()
+            .find(|line| line.kind == LineKind::Del)
+            .unwrap();
+        assert_eq!(deletion.old_no, Some(9));
+        assert_eq!(files[1].path, "src/b.rs");
+        assert_eq!(files[1].status, FileStatus::Added);
+    }
+
+    #[test]
+    fn headerless_unified_tool_patch_uses_the_reported_path() {
+        let diff = zeron_proto::ToolDiff {
+            path: "src/path with spaces.rs".into(),
+            old_text: None,
+            new_text: String::new(),
+            unified_diff: Some("@@ -4,1 +4,1 @@\n-before\n+after\n".into()),
+        };
+        let Some(ToolDetail::UnifiedPatch { files }) = tool_detail(None, Some(&diff), None) else {
+            panic!("expected wrapped unified patch detail");
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/path with spaces.rs");
+        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
+        assert_eq!(files[0].hunks[0].lines[0].old_no, Some(4));
+    }
+
+    #[test]
+    fn multi_file_tool_patch_shares_one_inline_line_budget() {
+        let mut patch = String::new();
+        for (name, start) in [("a.rs", 1), ("b.rs", 401)] {
+            patch.push_str(&format!(
+                "diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -0,0 +1,400 @@\n"
+            ));
+            for line in start..start + 400 {
+                patch.push_str(&format!("+line {line}\n"));
+            }
+        }
+        let diff = zeron_proto::ToolDiff {
+            path: "workspace".into(),
+            old_text: None,
+            new_text: String::new(),
+            unified_diff: Some(patch),
+        };
+        let Some(ToolDetail::UnifiedPatch { files }) = tool_detail(None, Some(&diff), None) else {
+            panic!("expected unified patch detail");
+        };
+        let visible = files
+            .iter()
+            .flat_map(|file| &file.hunks)
+            .map(|hunk| hunk.lines.len())
+            .sum::<usize>();
+        assert_eq!(visible, DIFF_DETAIL_MAX_LINES);
+        assert!(
+            files[1]
+                .notices
+                .iter()
+                .any(|notice| notice.contains("showing first 200 of 400 lines"))
+        );
+    }
+
+    #[test]
+    fn opening_an_edit_chip_prefetches_only_its_diff_sidecar() {
+        let item = |call, diff_ref: Option<&str>| ToolItem {
+            part_id: "tool".into(),
+            call,
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: diff_ref.map(SharedString::from),
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            is_thought: false,
+        };
+        let edit = item(
+            ToolCall::EditFile {
+                path: "src/a.rs".into(),
+                old_string: None,
+                new_string: None,
+            },
+            Some("chat/tool.diff"),
+        );
+        assert_eq!(
+            edit_diff_ref_on_open(&edit).as_deref(),
+            Some("chat/tool.diff")
+        );
+        let run = item(
+            ToolCall::Exec {
+                command: "git diff".into(),
+            },
+            Some("chat/run.diff"),
+        );
+        assert!(edit_diff_ref_on_open(&run).is_none());
+        let edit_without_sidecar = item(
+            ToolCall::EditFile {
+                path: "src/a.rs".into(),
+                old_string: None,
+                new_string: None,
+            },
+            None,
+        );
+        assert!(edit_diff_ref_on_open(&edit_without_sidecar).is_none());
     }
 
     #[test]

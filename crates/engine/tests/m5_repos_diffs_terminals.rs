@@ -571,6 +571,104 @@ async fn diff_capture_tracked_untracked_and_checksum() {
     assert_ne!(snapshot.checksum, changed.checksum);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_submodule_move_expands_and_nested_file_rpc_reads_blobs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let nested_source = tmp.path().join("nested-source");
+    let checkout = tmp.path().join("checkout");
+    init_repo(&nested_source).await;
+    init_repo(&checkout).await;
+
+    let nested_source_arg = nested_source.to_string_lossy().into_owned();
+    git(
+        &checkout,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &nested_source_arg,
+            "deps/nested",
+        ],
+    )
+    .await;
+    git(&checkout, &["commit", "-am", "add nested repo"]).await;
+    let old_revision = git_stdout(&nested_source, &["rev-parse", "HEAD"]).await;
+
+    std::fs::write(nested_source.join("a.txt"), "one\ntwo changed\n").expect("change nested file");
+    git(&nested_source, &["add", "a.txt"]).await;
+    git(&nested_source, &["commit", "-m", "nested change"]).await;
+    let new_revision = git_stdout(&nested_source, &["rev-parse", "HEAD"]).await;
+    let nested_checkout = checkout.join("deps/nested");
+    git(&nested_checkout, &["fetch", "origin"]).await;
+    git(&nested_checkout, &["checkout", &new_revision]).await;
+
+    let core = assemble(&tmp.path().join("data"));
+    let snapshot = capture_diff(&core.repos, &checkout)
+        .await
+        .expect("expanded capture");
+    assert!(
+        snapshot.files.iter().any(|file| file.path == "deps/nested"),
+        "parent gitlink row remains present"
+    );
+    let section = snapshot
+        .submodules
+        .iter()
+        .find(|section| section.repository_path == "deps/nested")
+        .expect("submodule section");
+    assert!(section.expanded, "section should be locally expandable");
+    assert_eq!(section.parent_repository_path, None);
+    assert_eq!(section.old_revision.as_deref(), Some(old_revision.as_str()));
+    assert_eq!(section.new_revision.as_deref(), Some(new_revision.as_str()));
+    assert!(section.patch.contains("+two changed"));
+    assert!(section.files.iter().any(|file| file.path == "a.txt"));
+
+    let identity = core
+        .repos
+        .checkout_identity(&checkout)
+        .await
+        .expect("checkout identity");
+    let response = zeron_rpc::memory_client(core.rpc_service())
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": checkout,
+                "repositoryPath": "deps/nested",
+                "path": "a.txt",
+                "mode": "working",
+                "diffChecksum": snapshot.checksum,
+            }),
+        )
+        .await
+        .expect("nested file diff text");
+    let response: zeron_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed nested response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo changed\n"));
+    assert!(!response.stale);
+
+    // Historical commit capture must validate the declaration from the pinned
+    // target tree, not the live checkout's later `.gitmodules` state.
+    git(&checkout, &["add", "deps/nested"]).await;
+    git(&checkout, &["commit", "-m", "advance nested gitlink"]).await;
+    let historical_commit = git_stdout(&checkout, &["rev-parse", "HEAD"]).await;
+    git(&checkout, &["rm", "--cached", "deps/nested"]).await;
+    git(&checkout, &["rm", ".gitmodules"]).await;
+    git(&checkout, &["commit", "-m", "remove nested declaration"]).await;
+    let historical = capture_commit_diff(&core.repos, &checkout, &historical_commit)
+        .await
+        .expect("historical submodule capture");
+    assert!(
+        historical
+            .submodules
+            .iter()
+            .any(|section| section.repository_path == "deps/nested" && section.expanded),
+        "pinned commit's .gitmodules declaration should drive expansion"
+    );
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn git_status_preserves_index_changes_even_when_head_diff_is_empty() {
     use zeron_proto::GitFileState::*;
@@ -1684,6 +1782,146 @@ async fn project_actions_run_in_fresh_host_resolved_terminals() {
 // ---------------------------------------------------------------------------
 // RPC dispatch over the in-memory transport
 // ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retarget_is_atomic_and_checkout_diff_subscription_is_cwd_scoped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    init_repo(&first).await;
+    init_repo(&second).await;
+    std::fs::write(first.join("a.txt"), "first dirty\n").unwrap();
+    std::fs::write(second.join("a.txt"), "second dirty\n").unwrap();
+    std::fs::create_dir(second.join("nested")).unwrap();
+    let alias = tmp.path().join("second-alias");
+    std::os::unix::fs::symlink(&second, &alias).unwrap();
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-first",
+            &core.device_id,
+            &first.to_string_lossy(),
+            None,
+            true,
+        )
+        .unwrap();
+    core.workspace
+        .create_chat("chat-scope", Some("space-first"), None, None, None)
+        .unwrap();
+    core.diff_sync.reconcile_now().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while core.diff_sync.watch_diffs().borrow().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first diff captured"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let old_id = core.diff_sync.watch_diffs().borrow()[0].checkout_id.clone();
+    let second_identity = core
+        .repos
+        .checkout_identity(&second)
+        .await
+        .expect("second identity");
+    let nested_alias = alias.join("nested");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "setChatCwd",
+                "chatId": "chat-scope",
+                "cwd": nested_alias,
+            }),
+        )
+        .await
+        .expect("retarget chat");
+    let row = core.workspace.chat("chat-scope").unwrap().unwrap();
+    let canonical_nested = std::fs::canonicalize(second.join("nested"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(row.cwd.as_deref(), Some(canonical_nested.as_str()));
+    assert_eq!(
+        row.checkout_id.as_deref(),
+        Some(second_identity.id.as_str())
+    );
+    assert_ne!(row.checkout_id.as_deref(), Some(old_id.as_str()));
+
+    // The old snapshot intentionally remains during orphan grace, but a
+    // cwd-scoped subscriber can only receive the retargeted checkout.
+    core.diff_sync.reconcile_now().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !core
+        .diff_sync
+        .watch_diffs()
+        .borrow()
+        .iter()
+        .any(|diff| diff.checkout_id == second_identity.id)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second diff captured"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        core.diff_sync
+            .watch_diffs()
+            .borrow()
+            .iter()
+            .any(|diff| diff.checkout_id == old_id),
+        "fixture exercises orphan-grace overlap"
+    );
+
+    let mut stream = client
+        .subscribe(
+            methods::WATCH_CHECKOUT_DIFFS,
+            serde_json::json!({
+                "cwd": nested_alias,
+                "checkoutId": second_identity.id,
+            }),
+        )
+        .await
+        .expect("scoped diff stream");
+    let frame = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let diffs = frame.as_array().unwrap();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0]["checkoutId"], second_identity.id);
+    assert!(diffs.iter().all(|diff| diff["checkoutId"] != old_id));
+
+    let result = client
+        .subscribe_checked(
+            methods::WATCH_CHECKOUT_DIFFS,
+            serde_json::json!({ "cwd": second, "checkoutId": old_id }),
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("stale identity accepted against authoritative cwd"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("does not match canonical cwd"));
+
+    let error = client
+        .call(
+            methods::GET_CHECKOUT_DIFF,
+            serde_json::json!({
+                "cwd": second,
+                "checkoutId": old_id,
+                "mode": "workingTree",
+            }),
+        )
+        .await
+        .expect_err("stale checkout id must not select a scoped diff");
+    assert!(error.to_string().contains("does not match canonical cwd"));
+    core.shutdown().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_dispatch_for_m5_methods() {

@@ -304,6 +304,11 @@ pub struct ToolDiff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_text: Option<String>,
     pub new_text: String,
+    /// Provider-native unified patch when full before/after file bodies are
+    /// unavailable (Codex fileChange items). May contain multiple `diff --git`
+    /// sections; `path` is the single file path or `workspace` for an aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unified_diff: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -569,6 +574,28 @@ mod tests {
         assert_eq!(json["worktree"]["spaceId"], "space-1");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
+    }
+
+    #[test]
+    fn tool_diff_unified_patch_is_additive_wire_data() {
+        let old = r#"{"path":"src/a.rs","oldText":"old","newText":"new"}"#;
+        let decoded: ToolDiff = serde_json::from_str(old).unwrap();
+        assert!(decoded.unified_diff.is_none());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("unifiedDiff")
+                .is_none()
+        );
+
+        let patch = ToolDiff {
+            path: "src/a.rs".into(),
+            old_text: None,
+            new_text: String::new(),
+            unified_diff: Some("@@ -1 +1 @@\n-old\n+new\n".into()),
+        };
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(value["unifiedDiff"], patch.unified_diff.unwrap());
     }
 
     #[test]

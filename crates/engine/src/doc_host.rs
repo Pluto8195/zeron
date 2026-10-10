@@ -45,6 +45,49 @@ use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, Terminals, new_id, now_ms};
 
+const TOOL_BLOB_CACHE_DIR: &str = "tool-blobs";
+
+/// Parsed sidecar identity. Keeping validation in one place means the local
+/// cache has exactly the same path-safety contract as the edge route.
+pub(crate) struct ToolBlobKey<'a> {
+    pub chat_id: &'a str,
+    /// Harness tool id, without the transport-only `.diff` suffix.
+    pub part_id: &'a str,
+    pub is_diff: bool,
+    cache_name: &'a str,
+}
+
+pub(crate) fn parse_tool_blob_ref(blob_ref: &str) -> Result<ToolBlobKey<'_>, EngineError> {
+    let Some((chat_id, cache_name)) = blob_ref.split_once('/') else {
+        return Err(EngineError::Other(format!("bad blob ref: {blob_ref}")));
+    };
+    let valid = !chat_id.is_empty()
+        && chat_id.len() <= 128
+        && chat_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && !cache_name.is_empty()
+        && cache_name.len() <= 200
+        && cache_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:#~-".contains(&b));
+    if !valid {
+        return Err(EngineError::Other(format!("bad blob ref: {blob_ref}")));
+    }
+    let (part_id, is_diff) = cache_name
+        .strip_suffix(".diff")
+        .map_or((cache_name, false), |part| (part, true));
+    if part_id.is_empty() {
+        return Err(EngineError::Other(format!("bad blob ref: {blob_ref}")));
+    }
+    Ok(ToolBlobKey {
+        chat_id,
+        part_id,
+        is_diff,
+        cache_name,
+    })
+}
+
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
@@ -600,6 +643,11 @@ impl ChatDocHandle {
             self.publish_messages_locked();
         }
         rx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message_watcher_count(&self) -> usize {
+        self.messages_tx.receiver_count()
     }
 
     /// Queue watch — the composer's held messages, re-sent on every doc change.
@@ -3792,12 +3840,70 @@ impl DocHost {
         Ok(())
     }
 
+    fn tool_blob_cache_path(&self, key: &ToolBlobKey<'_>) -> std::path::PathBuf {
+        self.inner
+            .store
+            .root()
+            .join(TOOL_BLOB_CACHE_DIR)
+            .join(key.chat_id)
+            .join(key.cache_name)
+    }
+
+    /// Read a host-local full tool payload. Unlike the best-effort edge copy,
+    /// this survives app restarts and makes the transcript retry useful while
+    /// offline or before an upload has landed.
+    pub(crate) fn cached_tool_blob(&self, blob_ref: &str) -> Result<Option<String>, EngineError> {
+        let key = parse_tool_blob_ref(blob_ref)?;
+        let path = self.tool_blob_cache_path(&key);
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Persist one local blob atomically. Exposed to the RPC handler so an
+    /// older chat recovered from its run journal is backfilled on first read.
+    pub(crate) fn cache_tool_blob(&self, blob_ref: &str, text: &str) -> Result<(), EngineError> {
+        let key = parse_tool_blob_ref(blob_ref)?;
+        let path = self.tool_blob_cache_path(&key);
+        let Some(parent) = path.parent() else {
+            return Err(EngineError::Other(
+                "tool blob cache path has no parent".into(),
+            ));
+        };
+        std::fs::create_dir_all(parent)?;
+        let tmp = parent.join(format!(".{}.tmp-{}", key.cache_name, new_id()));
+        let publish = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(err) = publish {
+            let _ = std::fs::remove_file(tmp);
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
     /// Upload a tool result's full output/diff to the R2 sidecar
     /// (`PUT {edge}/blob/{chatId}/{partId}[.diff]`, docs/chat2-sync.md A2).
-    /// Fire-and-forget: the doc already carries the summary, so a lost upload
-    /// degrades to "full output unavailable" — it must never block or fail
-    /// the run. Offline/edge-less engines skip silently.
+    /// The local durable copy is written first; the edge mirror stays
+    /// fire-and-forget and never blocks or fails the run.
     pub fn upload_tool_sidecar(&self, chat_id: &str, payload: zeron_doc::SidecarPayload) {
+        let output_ref = format!("{chat_id}/{}", payload.part_id);
+        if let Some(output) = &payload.output
+            && let Err(err) = self.cache_tool_blob(&output_ref, output)
+        {
+            tracing::warn!(blob_ref = %output_ref, error = %err, "tool sidecar local cache failed");
+        }
+        let diff_ref = format!("{output_ref}.diff");
+        let diff_json = payload
+            .diff
+            .as_ref()
+            .and_then(|diff| serde_json::to_string(diff).ok());
+        if let Some(diff) = &diff_json
+            && let Err(err) = self.cache_tool_blob(&diff_ref, diff)
+        {
+            tracing::warn!(blob_ref = %diff_ref, error = %err, "tool sidecar local cache failed");
+        }
+
         let Some(edge) = self.inner.config.edge.clone() else {
             return;
         };
@@ -3823,10 +3929,12 @@ impl DocHost {
                     output.clone().into_bytes(),
                 ));
             }
-            if let Some(diff) = &payload.diff
-                && let Ok(json) = serde_json::to_vec(diff)
-            {
-                puts.push((format!("{base}.diff"), "application/json", json));
+            if let Some(json) = diff_json {
+                puts.push((
+                    format!("{base}.diff"),
+                    "application/json",
+                    json.into_bytes(),
+                ));
             }
             for (url, content_type, body) in puts {
                 let sent = http
@@ -3853,35 +3961,19 @@ impl DocHost {
     /// `…​.diff`) — the UI's lazy "Show full output" path, served over RPC
     /// because the UI crate has no HTTP client or edge bearer.
     pub async fn fetch_tool_blob(&self, blob_ref: &str) -> Result<String, EngineError> {
-        // Same shape `apply_sidecar_refs` writes; anything else is a forged ref.
-        let valid = blob_ref.split_once('/').is_some_and(|(chat, part)| {
-            !chat.is_empty()
-                && chat.len() <= 128
-                && chat
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                && !part.is_empty()
-                && part.len() <= 200
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._:#~-".contains(&b))
-        });
-        if !valid {
-            return Err(EngineError::Other(format!("bad blob ref: {blob_ref}")));
+        if let Some(text) = self.cached_tool_blob(blob_ref)? {
+            return Ok(text);
         }
+        let key = parse_tool_blob_ref(blob_ref)?;
         let Some(edge) = self.inner.config.edge.clone() else {
             return Err(EngineError::Other("offline: no edge configured".into()));
         };
         let bearer = edge.bearer().await?;
-        // `valid` above guarantees the split; re-split to encode the part
-        // segment for transport (PART_RE allows `#`, which a raw URL would
-        // truncate as a fragment — the 2026-08-10 silent-collision bug).
-        let (chat, part) = blob_ref.split_once('/').expect("validated above");
         let url = format!(
             "{}/blob/{}/{}",
             edge.url.trim_end_matches('/'),
-            chat,
-            encode_part_segment(part)
+            key.chat_id,
+            encode_part_segment(key.cache_name)
         );
         let res = self
             .inner
@@ -3899,12 +3991,18 @@ impl DocHost {
                 res.status().as_u16()
             )));
         }
-        res.text().await.map_err(|e| {
+        let text = res.text().await.map_err(|e| {
             EngineError::Other(format!(
                 "sidecar body read failed: {}",
                 describe_http_error(e)
             ))
-        })
+        })?;
+        // A remote read heals this device's cache, so repeat disclosure is
+        // instant and remains available offline.
+        if let Err(err) = self.cache_tool_blob(blob_ref, &text) {
+            tracing::warn!(%blob_ref, error = %err, "tool sidecar cache backfill failed");
+        }
+        Ok(text)
     }
 
     /// §2.2 writer discipline: we host a chat iff its workspace row's `deviceId` is
@@ -4493,10 +4591,14 @@ impl DocHost {
         let identity = repos.checkout_identity(path).await.ok()?;
         let branch = repos.current_branch(path).await.ok()?;
         let head_sha = repos.head_sha(path).await.ok().flatten();
+        let canonical_cwd = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
         Some(ConversationSourceContext {
             checkout_id: identity.id,
             repo_root: identity.root.to_string_lossy().into_owned(),
-            cwd: cwd.to_string(),
+            cwd: canonical_cwd,
             branch,
             head_sha,
             observed_at: chrono::Utc::now(),
@@ -4788,6 +4890,71 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tool_blob_cache_tests {
+    use super::*;
+
+    fn host(store: Arc<DocsStore>) -> DocHost {
+        DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-test".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn upload_caches_output_and_diff_across_host_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let first = host(store.clone());
+        let diff = zeron_proto::ToolDiff {
+            path: "src/main.rs".into(),
+            old_text: Some("before\n".into()),
+            new_text: "after\n".into(),
+            unified_diff: None,
+        };
+        first.upload_tool_sidecar(
+            "chat-1",
+            zeron_doc::SidecarPayload {
+                part_id: "call#1".into(),
+                output: Some("full output".into()),
+                diff: Some(diff.clone()),
+            },
+        );
+        drop(first);
+
+        let reopened = host(store);
+        assert_eq!(
+            reopened.fetch_tool_blob("chat-1/call#1").await.unwrap(),
+            "full output"
+        );
+        let encoded = reopened
+            .fetch_tool_blob("chat-1/call#1.diff")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<zeron_proto::ToolDiff>(&encoded).unwrap(),
+            diff
+        );
+    }
+
+    #[test]
+    fn cache_rejects_path_traversal_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(Arc::new(DocsStore::open(dir.path()).unwrap()));
+        for blob_ref in ["../part", "chat/../part", "chat/path/to/part", "chat/.diff"] {
+            assert!(
+                host.cache_tool_blob(blob_ref, "secret").is_err(),
+                "{blob_ref}"
+            );
+        }
+        assert!(!dir.path().join("part").exists());
+    }
 }
 
 #[cfg(test)]

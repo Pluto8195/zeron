@@ -653,6 +653,32 @@ fn spaces_round_trip_and_mutate() {
 }
 
 #[test]
+fn chat_retarget_clears_stale_checkout_and_reconcile_checks_cwd() {
+    let mut ws = RegistryDoc::new("dev-a");
+    let mut row = chat("chat-1", "dev-a");
+    row.cwd = Some("/old".into());
+    row.checkout_id = Some("old-id".into());
+    ws.upsert_chat(&row).unwrap();
+
+    assert!(
+        ws.set_chat_target("chat-1", "/new/subdir", Some("new-id"))
+            .unwrap()
+    );
+    assert!(
+        !ws.set_chat_checkout_for_cwd("chat-1", "/old", "old-id")
+            .unwrap()
+    );
+    let row = ws.chat("chat-1").unwrap().unwrap();
+    assert_eq!(row.cwd.as_deref(), Some("/new/subdir"));
+    assert_eq!(row.checkout_id.as_deref(), Some("new-id"));
+
+    assert!(ws.set_chat_cwd("chat-1", "/imported/missing").unwrap());
+    let row = ws.chat("chat-1").unwrap().unwrap();
+    assert_eq!(row.cwd.as_deref(), Some("/imported/missing"));
+    assert_eq!(row.checkout_id, None);
+}
+
+#[test]
 fn chat_seen_is_monotonic() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();

@@ -42,6 +42,7 @@ enum Entry {
     NewProject,
     Settings,
     Overview,
+    PrReviewChats,
     MyPrs,
     ImportSessionCanvasSessions,
     Theme(AppearanceMode),
@@ -55,6 +56,7 @@ impl Entry {
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
             Self::Overview => Some(("Open overview", icons::WIDGET)),
+            Self::PrReviewChats => Some(("Open PR review chats", icons::PULL_REQUEST)),
             Self::MyPrs => Some(("Toggle My PRs", icons::PULL_REQUEST)),
             Self::ImportSessionCanvasSessions => Some((
                 "Import all sessions from session_canvas",
@@ -84,6 +86,7 @@ fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
         Entry::NewProject,
         Entry::Settings,
         Entry::Overview,
+        Entry::PrReviewChats,
         Entry::MyPrs,
         Entry::ImportSessionCanvasSessions,
         Entry::Theme(if is_dark {
@@ -207,6 +210,7 @@ impl Shell {
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
             Entry::Overview => self.open_overview(cx),
+            Entry::PrReviewChats => self.open_pr_review_chats_focused(window, cx),
             Entry::MyPrs => self.toggle_my_prs(cx),
             Entry::ImportSessionCanvasSessions => self.bulk_import_session_canvas_sessions(cx),
             Entry::Theme(_) => unreachable!(),
@@ -263,6 +267,9 @@ impl Shell {
                         }))
                     }
                     Entry::Settings => Some(crate::settings::badge_combo("mod-,")),
+                    Entry::PrReviewChats => {
+                        Some(crate::settings::badge_combo(OPEN_PR_REVIEW_CHATS_COMBO))
+                    }
                     _ => None,
                 };
                 let entry = entry.clone();
@@ -559,6 +566,7 @@ mod tests {
                 Entry::NewProject,
                 Entry::Settings,
                 Entry::Overview,
+                Entry::PrReviewChats,
                 Entry::MyPrs,
                 Entry::ImportSessionCanvasSessions,
                 Entry::Theme(AppearanceMode::Light)
@@ -570,6 +578,10 @@ mod tests {
         );
         assert_eq!(actions_for("settings", true), vec![Entry::Settings]);
         assert_eq!(actions_for("prs", true), vec![Entry::MyPrs]);
+        assert_eq!(
+            actions_for("review chats", true),
+            vec![Entry::PrReviewChats]
+        );
         assert_eq!(
             actions_for("theme", true),
             vec![Entry::Theme(AppearanceMode::Light)]

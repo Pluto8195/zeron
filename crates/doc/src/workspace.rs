@@ -379,6 +379,7 @@ impl WorkspaceDoc {
             "sourceContext",
             LoroValue::from(serde_json::to_value(context)?),
         )?;
+        row.insert("cwd", context.cwd.as_str())?;
         row.insert("branch", context.branch.as_str())?;
         row.insert("checkoutId", context.checkout_id.as_str())?;
         self.doc.commit();
@@ -390,10 +391,24 @@ impl WorkspaceDoc {
     /// `false` when no such row. Harness resume is cwd-scoped, so the next
     /// run in the new folder starts a fresh harness conversation by design.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, DocError> {
+        self.set_chat_target(chat_id, cwd, None)
+    }
+
+    /// Atomically retarget a chat and replace its checkout identity. Callers
+    /// that have not resolved the new cwd yet must pass `None`: retaining the
+    /// previous checkout id would make readers select the old worktree until
+    /// asynchronous reconciliation catches up.
+    pub fn set_chat_target(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+        checkout_id: Option<&str>,
+    ) -> Result<bool, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
         row.insert("cwd", cwd)?;
+        set_opt_str(&row, "checkoutId", checkout_id)?;
         self.doc.commit();
         Ok(true)
     }
@@ -404,6 +419,31 @@ impl WorkspaceDoc {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
+        row.insert("checkoutId", checkout_id)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// Stamp a reconciled identity only if the row still points at the cwd
+    /// that was resolved. This prevents a slow checkout probe for an old cwd
+    /// from winning a race with a chat retarget.
+    pub fn set_chat_checkout_for_cwd(
+        &self,
+        chat_id: &str,
+        expected_cwd: &str,
+        checkout_id: &str,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        let matches_cwd = matches!(
+            row.get("cwd"),
+            Some(loro::ValueOrContainer::Value(LoroValue::String(value)))
+                if value.as_str() == expected_cwd
+        );
+        if !matches_cwd {
+            return Ok(false);
+        }
         row.insert("checkoutId", checkout_id)?;
         self.doc.commit();
         Ok(true)
@@ -975,6 +1015,7 @@ mod tests {
         assert!(ws.set_chat_source_context("chat-1", &context).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");
         assert_eq!(row.source_context, Some(context));
+        assert_eq!(row.cwd.as_deref(), Some("/repo/worktree"));
         assert_eq!(row.branch.as_deref(), Some("feature/sidebar"));
         assert_eq!(row.checkout_id.as_deref(), Some("checkout-a"));
     }
@@ -1066,6 +1107,39 @@ mod tests {
         let dev = &ws.read_devices().unwrap()[0];
         assert_eq!(dev.name, "workstation");
         assert_eq!(dev.last_seen_at, Some(ts(6_000)));
+    }
+
+    #[test]
+    fn chat_retarget_replaces_identity_atomically_and_reconcile_is_cwd_guarded() {
+        let ws = WorkspaceDoc::new();
+        let mut row = chat("chat-1", "dev-a");
+        row.cwd = Some("/old/repo".into());
+        row.checkout_id = Some("old-checkout".into());
+        ws.upsert_chat(&row).unwrap();
+
+        assert!(
+            ws.set_chat_target("chat-1", "/new/repo/subdir", Some("new-checkout"))
+                .unwrap()
+        );
+        let row = ws.chat("chat-1").unwrap().unwrap();
+        assert_eq!(row.cwd.as_deref(), Some("/new/repo/subdir"));
+        assert_eq!(row.checkout_id.as_deref(), Some("new-checkout"));
+
+        // A delayed resolver for the previous target cannot stamp its id.
+        assert!(
+            !ws.set_chat_checkout_for_cwd("chat-1", "/old/repo", "old-checkout")
+                .unwrap()
+        );
+        assert_eq!(
+            ws.chat("chat-1").unwrap().unwrap().checkout_id.as_deref(),
+            Some("new-checkout")
+        );
+
+        // Callers without a resolved identity clear it in the same commit.
+        assert!(ws.set_chat_cwd("chat-1", "/external/missing").unwrap());
+        let row = ws.chat("chat-1").unwrap().unwrap();
+        assert_eq!(row.cwd.as_deref(), Some("/external/missing"));
+        assert_eq!(row.checkout_id, None);
     }
 
     #[test]

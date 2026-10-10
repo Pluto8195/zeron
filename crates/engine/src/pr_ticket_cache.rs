@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -283,6 +283,10 @@ struct Inner {
     /// When the authored search last failed (`None` = last attempt succeeded
     /// or none yet); gates retries by `SEARCH_FAILURE_BACKOFF`.
     my_prs_failed_at: Mutex<Option<Instant>>,
+    /// Becomes true after the first authored-list search finishes, whether it
+    /// populated the list or recorded a failure. RPC can briefly await this to
+    /// avoid racing the sweep's immediate first tick.
+    my_prs_ready: tokio::sync::watch::Sender<bool>,
     /// `gh search prs --review-requested=@me` results. Own slot and TTL,
     /// swept on a different tick from the authored search.
     review_prs_list: Mutex<Option<(Vec<MyOpenPr>, Instant)>>,
@@ -298,6 +302,7 @@ pub struct PrTicketCache {
 
 impl PrTicketCache {
     pub fn new() -> Self {
+        let (my_prs_ready, _) = tokio::sync::watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 pr_cache: Mutex::new(HashMap::new()),
@@ -309,6 +314,7 @@ impl PrTicketCache {
                 my_prs_list: Mutex::new(None),
                 my_pr_detail: Mutex::new(HashMap::new()),
                 my_prs_failed_at: Mutex::new(None),
+                my_prs_ready,
                 review_prs_list: Mutex::new(None),
                 review_prs_failed_at: Mutex::new(None),
             }),
@@ -358,6 +364,8 @@ impl PrTicketCache {
         linked_ticket_id: Option<&str>,
     ) -> ChatLinkStatus {
         let mut status = ChatLinkStatus::default();
+        let automatic_cwd =
+            cwd.filter(|cwd| !crate::repos::is_automatic_access_blocked(std::path::Path::new(cwd)));
 
         for link in linked_pr_links.iter().filter(|link| !link.url.is_empty()) {
             let key = PrKey::Url(link.url.clone());
@@ -389,7 +397,7 @@ impl PrTicketCache {
         // Already-cached branch detail may still add a distinct inferred PR,
         // and URL de-duplication gives durable provenance precedence.
         let has_durable_pr_links = !status.pr_links.is_empty();
-        let branch_key = match (cwd, branch) {
+        let branch_key = match (automatic_cwd, branch) {
             (Some(cwd), Some(branch)) if !branch.is_empty() => Some(PrKey::Branch {
                 cwd: PathBuf::from(cwd),
                 branch: branch.to_string(),
@@ -446,7 +454,7 @@ impl PrTicketCache {
         // `git` shell-out gated the same way PR/ticket are — never inline, a
         // cache read that registers a miss for the sweep to fill.
         if let Some(cwd) = cwd {
-            status.is_worktree = is_worktree_cwd(cwd);
+            status.is_worktree = automatic_cwd.is_some() && is_worktree_cwd(cwd);
             if status.is_worktree {
                 let key = PathBuf::from(cwd);
                 let cache = lock(&self.inner.diff_stat_cache);
@@ -483,6 +491,19 @@ impl PrTicketCache {
                 MyPrItem { summary, detail }
             })
             .collect()
+    }
+
+    /// Wait at most `timeout` for the first authored-PR search to finish.
+    /// Returns `true` after either a successful list fill or a recorded
+    /// failure. Once ready, this is an immediate cache-state check.
+    pub async fn wait_for_my_open_prs_ready(&self, timeout: Duration) -> bool {
+        let mut ready = self.inner.my_prs_ready.subscribe();
+        if *ready.borrow_and_update() {
+            return true;
+        }
+        tokio::time::timeout(timeout, ready.wait_for(|ready| *ready))
+            .await
+            .is_ok()
     }
 
     /// Pure cache read: open PRs where review is currently requested from the
@@ -607,12 +628,16 @@ impl PrTicketCache {
     ///
     /// Returns `true` if a search was actually attempted this tick.
     async fn sweep_my_prs_list(&self) -> bool {
-        sweep_search_slot(
-            &self.inner.my_prs_list,
-            &self.inner.my_prs_failed_at,
-            fetch_my_open_prs,
-        )
-        .await
+        self.sweep_my_prs_list_with(fetch_my_open_prs).await
+    }
+
+    async fn sweep_my_prs_list_with(&self, fetch: fn() -> Option<Vec<MyOpenPr>>) -> bool {
+        let attempted =
+            sweep_search_slot(&self.inner.my_prs_list, &self.inner.my_prs_failed_at, fetch).await;
+        if attempted {
+            self.inner.my_prs_ready.send_replace(true);
+        }
+        attempted
     }
 
     /// Same as `sweep_my_prs_list` for the review-requested search.
@@ -842,7 +867,7 @@ pub(crate) fn workspace_submodule_paths(root_cwd: &Path) -> Vec<String> {
 }
 
 fn run_gh_pr_view(cwd: &Path, branch: &str) -> Option<Value> {
-    let output = Command::new("gh")
+    let output = gh_command()?
         .args(["pr", "view", branch, "--json", PR_VIEW_JSON_FIELDS])
         .current_dir(cwd)
         .output()
@@ -874,7 +899,7 @@ fn fetch_github_pr(cwd: &Path, branch: &str) -> Option<PrStatus> {
 /// still runs from SOME cwd, but `gh` resolves the target repo from the URL,
 /// not from where it happens to be invoked).
 fn fetch_github_pr_by_url(url: &str) -> Option<PrStatus> {
-    let output = Command::new("gh")
+    let output = gh_command()?
         .args(["pr", "view", url, "--json", PR_VIEW_JSON_FIELDS])
         .output()
         .ok()?;
@@ -962,7 +987,7 @@ fn fetch_review_requested_prs() -> Option<Vec<MyOpenPr>> {
 }
 
 fn run_pr_search(qualifier: &str, json_fields: &str) -> Option<Vec<MyOpenPr>> {
-    let output = Command::new("gh")
+    let output = gh_command()?
         .args([
             "search",
             "prs",
@@ -1044,7 +1069,7 @@ async fn sweep_search_slot(
 /// works from anywhere, no local checkout needed, matching how the list
 /// call itself has no cwd to begin with.
 fn fetch_github_pr_by_number(repo: &str, number: u64) -> Option<PrStatus> {
-    let output = Command::new("gh")
+    let output = gh_command()?
         .args([
             "pr",
             "view",
@@ -1061,6 +1086,17 @@ fn fetch_github_pr_by_number(repo: &str, number: u64) -> Option<PrStatus> {
     }
     let data: Value = serde_json::from_slice(&output.stdout).ok()?;
     Some(pr_json_to_status(&data))
+}
+
+/// Every GitHub CLI call shares the same non-interactive, GUI-safe process
+/// setup. In particular, app launches do not inherit the login shell PATH
+/// that commonly contains Homebrew's `gh`.
+fn gh_command() -> Option<Command> {
+    let executable = zeron_harness::resolve_login_shell_executable("gh")?;
+    let mut command = Command::new(executable);
+    zeron_harness::compose_login_shell_path_std(&mut command);
+    command.env("GH_PROMPT_DISABLED", "1").stdin(Stdio::null());
+    Some(command)
 }
 
 /// `fetch_linear_ticket` (`session_canvas_server.py:1595`). `linear` may not
@@ -1389,6 +1425,45 @@ mod tests {
             cwd: PathBuf::from("/tmp/repo"),
             branch: "eng-2715-fix-thing".to_string(),
         }));
+    }
+
+    #[test]
+    fn status_for_never_queues_cwd_probes_for_privacy_managed_history() {
+        let home = crate::repos::home_dir();
+        for child in ["Music", "Pictures", "Documents"] {
+            let cache = PrTicketCache::new();
+            let cwd = home
+                .join(child)
+                .join(".agent-worktrees")
+                .join("historical-chat");
+            let status = cache.status_for(cwd.to_str(), Some("eng-2715-fix-thing"), None, None);
+
+            assert!(status.pr.is_none());
+            assert!(!status.is_worktree);
+            assert!(lock(&cache.inner.pending_pr).is_empty());
+            assert!(lock(&cache.inner.pending_diff_stat).is_empty());
+            assert!(
+                lock(&cache.inner.pending_ticket).contains("ENG-2715"),
+                "ticket inference is path-independent and should remain available"
+            );
+        }
+    }
+
+    #[test]
+    fn status_for_still_queues_ordinary_project_cwds() {
+        let cache = PrTicketCache::new();
+        let cwd = crate::repos::home_dir()
+            .join("Projects")
+            .join("zeron")
+            .join(".agent-worktrees")
+            .join("feature");
+        cache.status_for(cwd.to_str(), Some("feature/privacy"), None, None);
+
+        assert!(lock(&cache.inner.pending_pr).contains(&PrKey::Branch {
+            cwd: cwd.clone(),
+            branch: "feature/privacy".into(),
+        }));
+        assert!(lock(&cache.inner.pending_diff_stat).contains(&cwd));
     }
 
     /// Same lookup-order change, ticket side: a durable `linked_ticket_id`
@@ -1783,6 +1858,38 @@ mod tests {
         assert!(sweep_search_slot(&list, &failed, ok).await);
         assert!(failed.lock().unwrap().is_none());
         assert!(list.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn authored_pr_readiness_waits_for_first_success_or_failure() {
+        fn succeed() -> Option<Vec<MyOpenPr>> {
+            Some(Vec::new())
+        }
+        fn fail() -> Option<Vec<MyOpenPr>> {
+            None
+        }
+
+        let successful = PrTicketCache::new();
+        assert!(
+            !successful
+                .wait_for_my_open_prs_ready(Duration::from_millis(1))
+                .await
+        );
+        assert!(successful.sweep_my_prs_list_with(succeed).await);
+        assert!(
+            successful
+                .wait_for_my_open_prs_ready(Duration::from_millis(1))
+                .await
+        );
+
+        let failed = PrTicketCache::new();
+        assert!(failed.sweep_my_prs_list_with(fail).await);
+        assert!(lock(&failed.inner.my_prs_failed_at).is_some());
+        assert!(
+            failed
+                .wait_for_my_open_prs_ready(Duration::from_millis(1))
+                .await
+        );
     }
 
     /// Live smoke test: `gh search prs --author=@me --state=open` (no

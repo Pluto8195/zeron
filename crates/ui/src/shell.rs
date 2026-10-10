@@ -80,6 +80,14 @@ struct ChatHeaderLinkCache {
     fetched_at: Instant,
 }
 
+struct ChatHeaderClassificationCache {
+    category_key: Option<String>,
+    category: Option<String>,
+    origin: Option<String>,
+    manual: bool,
+    fetched_at: Instant,
+}
+
 actions!(
     shell,
     [
@@ -96,9 +104,16 @@ actions!(
         NextSession,
         PrevSession,
         ArchiveSession,
-        OpenOverview
+        OpenOverview,
+        FocusOverviewSearch,
+        OpenRepositoryTopology,
+        OpenPrReviewChats
     ]
 );
+
+const FOCUS_OVERVIEW_SEARCH_COMBO: &str = "mod-f";
+const OPEN_REPOSITORY_TOPOLOGY_COMBO: &str = "mod-shift-g";
+pub(crate) const OPEN_PR_REVIEW_CHATS_COMBO: &str = "mod-shift-p";
 
 /// Restore a default focus only after an in-flight handoff has had a frame to
 /// claim the window. A synchronous focus-lost fallback can otherwise steal
@@ -144,6 +159,7 @@ pub(crate) fn restore_mounted_focus(
 enum ChatMenuPage {
     Root,
     Copy,
+    Classification,
 }
 
 #[derive(Clone)]
@@ -411,6 +427,23 @@ pub fn apply_keymap(
         // Fixed: ⌘⇧O (Ctrl+Shift+O elsewhere) opens the multi-chat overview.
         // Not (yet) a customizable `ShortcutId` — same tier as ⌘K above.
         KeyBinding::new(&platform_combo("mod-shift-o"), OpenOverview, None),
+        // Contextual overview navigation: Find targets the canvas search and
+        // ⌘⇧G moves from Canvas to the repository/worktree map.
+        KeyBinding::new(
+            &platform_combo(FOCUS_OVERVIEW_SEARCH_COMBO),
+            FocusOverviewSearch,
+            None,
+        ),
+        KeyBinding::new(
+            &platform_combo(OPEN_REPOSITORY_TOPOLOGY_COMBO),
+            OpenRepositoryTopology,
+            None,
+        ),
+        KeyBinding::new(
+            &platform_combo(OPEN_PR_REVIEW_CHATS_COMBO),
+            OpenPrReviewChats,
+            None,
+        ),
         KeyBinding::new(
             &valid_or_default(&keymap.open_model_picker, "mod-/"),
             OpenModelPicker,
@@ -490,6 +523,8 @@ pub enum Route {
     Overview,
     /// Workspace repository/submodule/worktree ownership graph.
     RepositoryTopology,
+    /// Dense inbox for chats whose authoritative category is PR review.
+    PrReviewChats,
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
@@ -597,6 +632,7 @@ pub enum NavEntry {
     Settings(SettingsSection),
     Overview,
     RepositoryTopology,
+    PrReviewChats,
 }
 
 /// Browser-style navigation history for the titlebar back/forward buttons
@@ -1467,9 +1503,10 @@ impl Render for SidebarPane {
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
                 // Overview and repository map keep the normal chat sidebar.
-                Route::Chat | Route::Overview | Route::RepositoryTopology => {
-                    shell.render_chat_sidebar(&theme, cx)
-                }
+                Route::Chat
+                | Route::Overview
+                | Route::RepositoryTopology
+                | Route::PrReviewChats => shell.render_chat_sidebar(&theme, cx),
             }
         });
         div().size_full().child(inner).into_any_element()
@@ -1572,6 +1609,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     overview_page: Option<Entity<crate::overview::Overview>>,
     repository_topology_page: Option<Entity<crate::repository_topology::RepositoryTopology>>,
+    pr_review_chats_page: Option<Entity<crate::chat_type_view::ChatTypeView>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
@@ -1654,6 +1692,8 @@ pub struct Shell {
     /// existing multi-PR `CHAT_LINK_STATUS` endpoint.
     chat_header_links: std::collections::HashMap<String, ChatHeaderLinkCache>,
     chat_header_links_pending: std::collections::HashSet<String>,
+    chat_header_classification: std::collections::HashMap<String, ChatHeaderClassificationCache>,
+    chat_header_classification_pending: std::collections::HashSet<String>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -1904,6 +1944,7 @@ impl Shell {
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             Some("topology") | Some("repository-topology") => Route::RepositoryTopology,
+            Some("pr-reviews") | Some("pr-review-chats") => Route::PrReviewChats,
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -1934,6 +1975,7 @@ impl Shell {
             Route::Settings(section) => NavEntry::Settings(section),
             Route::Overview => NavEntry::Overview,
             Route::RepositoryTopology => NavEntry::RepositoryTopology,
+            Route::PrReviewChats => NavEntry::PrReviewChats,
         });
         // Parent notifications carry presentation changes (session status,
         // elapsed labels, menus); sibling animation/caret ticks do not.
@@ -1994,6 +2036,7 @@ impl Shell {
             devices_page: None,
             overview_page: None,
             repository_topology_page: None,
+            pr_review_chats_page: None,
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
@@ -2046,6 +2089,8 @@ impl Shell {
             copied_chat_identity_clear: None,
             chat_header_links: Default::default(),
             chat_header_links_pending: Default::default(),
+            chat_header_classification: Default::default(),
+            chat_header_classification_pending: Default::default(),
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -3040,7 +3085,8 @@ impl Shell {
     }
 
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
-        let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        let chat_id = self.active_chat.clone();
+        let changes = cx.new(|cx| Changes::for_chat(self.state.clone(), chat_id, cx));
         self.register_diff_surface(changes, cx);
     }
 
@@ -3206,7 +3252,8 @@ impl Shell {
     /// The dedicated History surface. Keeping it as its own tab preserves its
     /// graph/search state while Diff tabs retain their ordinary scope picker.
     fn add_history_surface(&mut self, cx: &mut Context<Self>) {
-        let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
+        let chat_id = self.active_chat.clone();
+        let history = cx.new(|cx| Changes::history_for_chat(self.state.clone(), chat_id, cx));
         self.register_diff_surface(history, cx);
     }
 
@@ -3215,18 +3262,22 @@ impl Shell {
     fn add_commit_diff_surface(
         &mut self,
         commit: zeron_proto::GitHistoryCommit,
+        owner_chat_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
+        let chat_id = owner_chat_id.unwrap_or_else(|| self.active_chat.clone());
+        let changes =
+            cx.new(|cx| Changes::for_commit_for_chat(self.state.clone(), commit, chat_id, cx));
         self.register_diff_surface(changes, cx);
     }
 
     fn register_diff_surface(&mut self, changes: Entity<Changes>, cx: &mut Context<Self>) {
         self.diff_seq += 1;
         let id = self.diff_seq;
-        let sub = cx.subscribe(&changes, |this: &mut Self, _, event, cx| match event {
+        let sub = cx.subscribe(&changes, |this: &mut Self, source, event, cx| match event {
             ChangesEvent::OpenCommit(commit) => {
-                this.add_commit_diff_surface(commit.clone(), cx);
+                let owner_chat_id = source.read(cx).owner_chat_id().map(str::to_string);
+                this.add_commit_diff_surface(commit.clone(), owner_chat_id, cx);
             }
         });
         self.diffs.insert(id, changes);
@@ -3852,6 +3903,112 @@ impl Shell {
         }
     }
 
+    fn open_chat_classification_menu(&mut self, cx: &mut Context<Self>) {
+        let chat_id = self.chat_menu.open_mut().map(|menu| {
+            menu.page = ChatMenuPage::Classification;
+            menu.chat_id.clone()
+        });
+        if let Some(chat_id) = chat_id {
+            self.ensure_chat_header_classification(chat_id, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_chat_classification_at(
+        &mut self,
+        chat_id: String,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat_menu.open(ChatMenuState {
+            chat_id: chat_id.clone(),
+            position,
+            page: ChatMenuPage::Classification,
+            closeable: false,
+        });
+        self.ensure_chat_header_classification(chat_id, cx);
+        cx.notify();
+    }
+
+    fn set_chat_classification(
+        &mut self,
+        chat_id: String,
+        category: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat_header_classification_pending.contains(&chat_id) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.chat_header_classification_pending
+            .insert(chat_id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::SET_CHAT_CLASSIFICATION,
+                    serde_json::json!({ "chatId": chat_id, "category": category }),
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat_header_classification_pending.remove(&chat_id);
+                match result {
+                    Ok(value) => {
+                        let category_key = value
+                            .get("category")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        let (category, origin) =
+                            crate::chat_metadata::classification_labels(&value);
+                        let manual = value
+                            .get("manual")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        this.chat_header_classification.insert(
+                            chat_id.clone(),
+                            ChatHeaderClassificationCache {
+                                category_key,
+                                category,
+                                origin,
+                                manual,
+                                fetched_at: Instant::now(),
+                            },
+                        );
+                        if let Some(overview) = &this.overview_page {
+                            overview.update(cx, |overview, cx| {
+                                overview.classification_changed(&chat_id, &value, cx);
+                            });
+                        }
+                        if let Some(page) = &this.pr_review_chats_page {
+                            page.update(cx, |page, cx| {
+                                page.classification_changed(&chat_id, &value, cx);
+                            });
+                        }
+                        this.sidebar_notice = Some(
+                            if manual {
+                                "Task category updated"
+                            } else {
+                                "Task category returned to automatic"
+                            }
+                            .into(),
+                        );
+                        this.close_chat_menu(cx);
+                    }
+                    Err(error) => {
+                        this.sidebar_notice =
+                            Some(format!("Couldn’t update task category: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let link = {
             let state = self.state.read(cx);
@@ -3989,6 +4146,63 @@ impl Shell {
         .detach();
     }
 
+    fn ensure_chat_header_classification(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self
+            .chat_header_classification
+            .get(&chat_id)
+            .is_some_and(|entry| entry.fetched_at.elapsed() < CHAT_HEADER_LINK_REFRESH)
+            || self.chat_header_classification_pending.contains(&chat_id)
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.chat_header_classification_pending
+            .insert(chat_id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CHAT_CLASSIFICATION,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                this.chat_header_classification_pending.remove(&chat_id);
+                let (category, origin) = result
+                    .as_ref()
+                    .ok()
+                    .map(crate::chat_metadata::classification_labels)
+                    .unwrap_or_default();
+                let category_key = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.get("category"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                this.chat_header_classification.insert(
+                    chat_id,
+                    ChatHeaderClassificationCache {
+                        category_key,
+                        category,
+                        origin,
+                        manual: result
+                            .as_ref()
+                            .ok()
+                            .and_then(|value| value.get("manual"))
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        fetched_at: Instant::now(),
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn invalidate_chat_header_links(&mut self, chat_id: &str) {
         self.chat_header_links.remove(chat_id);
     }
@@ -4013,13 +4227,22 @@ impl Shell {
                 .cloned();
             (chat, space)
         };
+        if chat.harness_session_id.is_some() {
+            self.ensure_chat_header_classification(chat_id.clone(), cx);
+        }
         let links = self
             .chat_header_links
             .get(&chat_id)
             .and_then(|entry| entry.status.as_ref())
             .map(crate::chat_metadata::HeaderLinks::from_status);
-        let items =
-            crate::chat_metadata::metadata_items(&chat, space.as_ref(), links.as_ref(), None, None);
+        let classification = self.chat_header_classification.get(&chat_id);
+        let items = crate::chat_metadata::metadata_items(
+            &chat,
+            space.as_ref(),
+            links.as_ref(),
+            classification.and_then(|entry| entry.category.as_deref()),
+            classification.and_then(|entry| entry.origin.as_deref()),
+        );
         Some(
             div()
                 .id("full-chat-header-metadata-wrap")
@@ -4030,11 +4253,24 @@ impl Shell {
                 .border_b_1()
                 .border_color(theme.border.opacity(0.7))
                 .bg(theme.surface.opacity(0.94))
-                .child(crate::chat_metadata::metadata_strip(
-                    "full-chat-header",
-                    items,
-                    theme,
-                ))
+                .child({
+                    let shell = cx.entity();
+                    let edit_chat_id = chat_id.clone();
+                    crate::chat_metadata::metadata_strip(
+                        "full-chat-header",
+                        items,
+                        theme,
+                        Some(std::rc::Rc::new(move |event, _, app| {
+                            shell.update(app, |this, cx| {
+                                this.open_chat_classification_at(
+                                    edit_chat_id.clone(),
+                                    event.position(),
+                                    cx,
+                                );
+                            });
+                        })),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -4153,6 +4389,10 @@ impl Shell {
         cx.notify();
     }
 
+    pub(crate) fn repository_topology_shortcut_label(&self) -> String {
+        badge_combo(OPEN_REPOSITORY_TOPOLOGY_COMBO)
+    }
+
     fn repository_topology_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(page) = &self.repository_topology_page {
             return page.clone().into_any_element();
@@ -4163,6 +4403,51 @@ impl Shell {
             cx.new(|cx| crate::repository_topology::RepositoryTopology::new(state, shell, cx));
         self.repository_topology_page = Some(page.clone());
         page.into_any_element()
+    }
+
+    pub(crate) fn open_pr_review_chats(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::PrReviewChats;
+        self.nav.push(NavEntry::PrReviewChats);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_pr_review_chats_focused(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_pr_review_chats(cx);
+        let page = self.ensure_pr_review_chats_page(cx);
+        let focus = page.read(cx).focus_handle();
+        window.focus(&focus, cx);
+    }
+
+    fn ensure_pr_review_chats_page(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::chat_type_view::ChatTypeView> {
+        if let Some(page) = &self.pr_review_chats_page {
+            return page.clone();
+        }
+        let state = self.state.clone();
+        let shell = cx.entity().downgrade();
+        let page = cx.new(|cx| {
+            crate::chat_type_view::ChatTypeView::new(
+                state,
+                shell,
+                crate::chat_type_view::ChatViewKind::PrReview,
+                cx,
+            )
+        });
+        self.pr_review_chats_page = Some(page.clone());
+        page
+    }
+
+    fn pr_review_chats_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_pr_review_chats_page(cx).into_any_element()
     }
 
     /// Chat menu "Add PR / ticket…": the link editor lives in the
@@ -4225,6 +4510,9 @@ impl Shell {
             }
             NavEntry::RepositoryTopology => {
                 self.route = Route::RepositoryTopology;
+            }
+            NavEntry::PrReviewChats => {
+                self.route = Route::PrReviewChats;
             }
         }
         self.close_user_menu(cx);
@@ -4485,7 +4773,7 @@ impl Shell {
         }));
     }
 
-    fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.close_chat_menu(cx);
         let current = self
             .state
@@ -4519,12 +4807,60 @@ impl Shell {
         };
         let title = dialog.input.read(cx).text().trim().to_string();
         if !title.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id, "title": title }),
-                cx,
-            );
+            self.persist_chat_title(dialog.chat_id, title, cx);
         }
         cx.notify();
+    }
+
+    /// Rename through the single durable `renameChat` mutation while updating
+    /// the shared chat row optimistically. Sidebar, full-chat titlebar, Canvas,
+    /// and every other title consumer repaint from that same row immediately.
+    fn persist_chat_title(&mut self, chat_id: String, title: String, cx: &mut Context<Self>) {
+        let previous = self
+            .state
+            .update(cx, |state, cx| {
+                let previous = state.replace_chat_title(&chat_id, Some(title.clone()));
+                cx.notify();
+                previous
+            })
+            .flatten();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.state.update(cx, |state, cx| {
+                state.replace_chat_title(&chat_id, previous);
+                cx.notify();
+            });
+            self.sidebar_notice = Some("Engine not connected".into());
+            return;
+        };
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::MUTATE,
+                    serde_json::json!({ "op": "renameChat", "chatId": chat_id, "title": title }),
+                )
+                .await;
+            if let Err(err) = result {
+                this.update(cx, |shell, cx| {
+                    // Do not roll a newer local/remote rename backward.
+                    shell.state.update(cx, |state, cx| {
+                        let still_optimistic = state
+                            .chats
+                            .iter()
+                            .find(|chat| chat.id == chat_id)
+                            .and_then(|chat| chat.title.as_deref())
+                            == Some(title.as_str());
+                        if still_optimistic {
+                            state.replace_chat_title(&chat_id, previous);
+                            cx.notify();
+                        }
+                    });
+                    shell.sidebar_notice = Some(format!("Couldn’t rename chat: {err}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
     }
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -5724,6 +6060,25 @@ impl Shell {
                     );
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("repository-topology-header-titlebar", bar, cx)
+                    .into_any_element()
+            }
+            Route::PrReviewChats => {
+                let theme = Theme::of(cx).clone();
+                let inner = div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pl(px(self.title_bar_content_start()))
+                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("PR review chats")),
+                    );
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+                self.titlebar_drag_region("pr-review-chats-header-titlebar", bar, cx)
                     .into_any_element()
             }
         }
@@ -8480,6 +8835,19 @@ impl Shell {
                             .child(SharedString::from("Rename…")),
                     )
                     .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-classification-{chat_id}"),
+                        )
+                        .id("chat-menu-classification")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.open_chat_classification_menu(cx)),
+                        )
+                        .child(icon(icons::TAG).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from("Change task category…")),
+                    )
+                    .child(
                         popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
                             .id("chat-menu-pin")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -8679,6 +9047,82 @@ impl Shell {
                             .child(SharedString::from("Harness session ID")),
                         )
                     })
+                }
+                ChatMenuPage::Classification => {
+                    let current = self
+                        .chat_header_classification
+                        .get(&chat_id)
+                        .and_then(|entry| entry.category_key.clone());
+                    let manual = self
+                        .chat_header_classification
+                        .get(&chat_id)
+                        .is_some_and(|entry| entry.manual);
+                    let back_id = chat_id.clone();
+                    let mut menu = menu
+                        .child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-classification-back-{chat_id}"),
+                            )
+                            .id("chat-classification-back")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(menu) = this.chat_menu.open_mut() {
+                                    menu.page = ChatMenuPage::Root;
+                                    debug_assert_eq!(menu.chat_id, back_id);
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                icon(icons::ALT_ARROW_LEFT)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Task category")),
+                        )
+                        .child(popover::menu_separator());
+                    for (value, label) in crate::chat_metadata::CATEGORY_CHOICES {
+                        let selected = manual && current.as_deref() == Some(value);
+                        let set_id = chat_id.clone();
+                        let category = value.to_string();
+                        menu = menu.child(
+                            popover::menu_row(
+                                &theme,
+                                selected,
+                                format!("chat-classification-{value}-{chat_id}"),
+                            )
+                            .id(SharedString::from(format!(
+                                "chat-classification-choice-{value}"
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_chat_classification(
+                                    set_id.clone(),
+                                    Some(category.clone()),
+                                    cx,
+                                )
+                            }))
+                            .child(div().w(px(16.0)).flex_none().when(selected, |el| {
+                                el.child(icon(icons::CHECK).size(px(13.0)).text_color(theme.accent))
+                            }))
+                            .child(SharedString::from(label)),
+                        );
+                    }
+                    let auto_id = chat_id.clone();
+                    menu.child(popover::menu_separator()).child(
+                        popover::menu_row(
+                            &theme,
+                            !manual,
+                            format!("chat-classification-auto-{chat_id}"),
+                        )
+                        .id("chat-classification-auto")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_classification(auto_id.clone(), None, cx)
+                        }))
+                        .child(div().w(px(16.0)).flex_none().when(!manual, |el| {
+                            el.child(icon(icons::CHECK).size(px(13.0)).text_color(theme.accent))
+                        }))
+                        .child(SharedString::from("Automatic")),
+                    )
                 }
             }
             .into_any_element();
@@ -8946,6 +9390,19 @@ impl Shell {
 
         if let Route::RepositoryTopology = self.route {
             let outlet = self.repository_topology_outlet(cx);
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+
+        if let Route::PrReviewChats = self.route {
+            let outlet = self.pr_review_chats_outlet(cx);
             return div()
                 .flex_1()
                 .min_w_0()
@@ -11405,6 +11862,33 @@ impl Render for Shell {
                     this.open_overview(cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &FocusOverviewSearch, window, cx| {
+                if !this.overlay_owns_keyboard(cx) {
+                    match this.route {
+                        Route::Overview => {
+                            let page = this.ensure_overview_page(cx);
+                            page.update(cx, |overview, cx| {
+                                overview.focus_canvas_search(window, cx);
+                            });
+                        }
+                        Route::PrReviewChats => {
+                            let page = this.ensure_pr_review_chats_page(cx);
+                            page.update(cx, |page, cx| page.focus_search(window, cx));
+                        }
+                        _ => {}
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenRepositoryTopology, _, cx| {
+                if matches!(this.route, Route::Overview) && !this.overlay_owns_keyboard(cx) {
+                    this.open_repository_topology(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenPrReviewChats, window, cx| {
+                if !this.overlay_owns_keyboard(cx) {
+                    this.open_pr_review_chats_focused(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenMyPrs, _, cx| {
                 if !this.overlay_owns_keyboard(cx) {
                     this.toggle_my_prs(cx);
@@ -11906,6 +12390,30 @@ mod tests {
                 Keystroke::parse(&combo).is_ok(),
                 "{} default {combo:?} does not parse",
                 id.label()
+            );
+        }
+    }
+
+    #[test]
+    fn overview_navigation_shortcuts_parse_and_do_not_conflict_with_defaults() {
+        let fixed = [
+            FOCUS_OVERVIEW_SEARCH_COMBO,
+            OPEN_REPOSITORY_TOPOLOGY_COMBO,
+            OPEN_PR_REVIEW_CHATS_COMBO,
+            "mod-k",
+            "mod-shift-o",
+        ];
+        for (index, combo) in fixed.iter().enumerate() {
+            assert!(Keystroke::parse(&platform_combo(combo)).is_ok());
+            assert!(
+                fixed[index + 1..].iter().all(|other| combo != other),
+                "duplicate fixed shortcut {combo}"
+            );
+            assert!(
+                ShortcutId::ALL
+                    .into_iter()
+                    .all(|id| id.default_combo() != *combo),
+                "fixed shortcut {combo} conflicts with a customizable default"
             );
         }
     }
@@ -12753,6 +13261,14 @@ mod tests {
     }
 
     #[test]
+    fn pr_review_chats_is_a_first_class_history_entry() {
+        let mut nav = NavHistory::new(NavEntry::Overview);
+        nav.push(NavEntry::PrReviewChats);
+        assert_eq!(nav.back(), Some(NavEntry::Overview));
+        assert_eq!(nav.forward(), Some(NavEntry::PrReviewChats));
+    }
+
+    #[test]
     fn nav_push_dedups_the_current_route() {
         let mut nav = NavHistory::new(chat("a"));
         nav.push(chat("a"));
@@ -12818,6 +13334,91 @@ mod tests {
 mod exit_regressions {
     use super::*;
     use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn repo_map_new_chat_targets_the_exact_existing_worktree(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_spaces(vec![zeron_proto::Space {
+                        id: "repo".into(),
+                        device_id: "local".into(),
+                        path: "/repo".into(),
+                        name: None,
+                        git_detected: true,
+                        git_checked_at: None,
+                        checkout_id: None,
+                        created_at: Utc::now(),
+                    }]);
+                    state.selected_chat = Some("old-chat".into());
+                });
+
+                shell.open_new_session_in_worktree(
+                    "repo".into(),
+                    "/repo/.worktrees/audit".into(),
+                    Some("feature/audit".into()),
+                    cx,
+                );
+
+                assert!(matches!(shell.route, Route::Chat));
+                assert!(shell.state.read(cx).selected_chat.is_none());
+                assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("repo"));
+                let pickers = shell.composer.read(cx).pickers().clone();
+                assert_eq!(
+                    pickers.read(cx).draft_worktree_scope(cx),
+                    Some(crate::pickers::DraftWorktreeScope {
+                        path: "/repo/.worktrees/audit".into(),
+                        worktree_name: "audit".into(),
+                        repo_name: "repo".into(),
+                        branch: "feature/audit".into(),
+                    }),
+                    "the blank draft visibly derives the same exact target that send consumes"
+                );
+                assert_eq!(
+                    pickers.read(cx).checkout_plan(),
+                    crate::pickers::CheckoutPlan::ReuseWorktree {
+                        path: "/repo/.worktrees/audit".into(),
+                        branch: "feature/audit".into(),
+                    }
+                );
+
+                // `+` while already on this unsent draft creates a genuinely
+                // fresh tab/draft instead of invisibly carrying the pin.
+                shell.open_new_session(cx);
+                assert!(pickers.read(cx).draft_worktree_scope(cx).is_none());
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn appshot_destinations_retain_last_session_and_use_new_canvas_defaults(

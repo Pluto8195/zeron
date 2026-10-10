@@ -21,7 +21,8 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs {checkoutId?, cwd?}` → stream
+//!   of `CheckoutDiff[]` (a target limits the array to one canonical checkout)
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
@@ -81,6 +82,7 @@ use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
+const MY_OPEN_PRS_INITIAL_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +176,14 @@ struct CheckSessionLivenessParams {
 #[serde(rename_all = "camelCase")]
 struct SyncExternalSessionParams {
     chat_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetChatClassificationParams {
+    chat_id: String,
+    /// `None` clears the manual override and restores automatic classification.
+    category: Option<String>,
 }
 
 /// `READ_SUBAGENT_TRANSCRIPT` request: `{chatId, agentId}` — never a path;
@@ -277,12 +287,16 @@ fn validated_closeout_cwd(
     Ok(stored)
 }
 
-fn shared_closeout_error(shared: &[String]) -> RpcError {
+fn shared_closeout_error(shared: &[crate::chat_workspace_plan::CloseoutChatReference]) -> RpcError {
     RpcError::Failed(format!(
         "refusing to close out: this worktree is used by {} open chat{}: {}",
         shared.len(),
         if shared.len() == 1 { "" } else { "s" },
-        shared.join(", ")
+        shared
+            .iter()
+            .map(|chat| format!("{} ({})", chat.title, chat.id))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
@@ -566,6 +580,19 @@ struct ReadAttachmentChunkParams {
 struct FetchToolBlobParams {
     /// Doc-resident sidecar ref (`{chatId}/{partId}` or `…​.diff`).
     blob_ref: String,
+}
+
+/// Optional checkout scope for `WatchCheckoutDiffs`. Legacy clients send null
+/// (or an empty object) and continue to receive every local checkout. New
+/// clients send cwd plus the identity they expect; cwd is resolved afresh and
+/// a mismatched id is rejected before the stream starts.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchCheckoutDiffsParams {
+    #[serde(default)]
+    checkout_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
@@ -895,7 +922,7 @@ impl EngineRpc {
         &self,
         excluded_chat_id: Option<&str>,
         cwd: &std::path::Path,
-    ) -> Result<Vec<String>, RpcError> {
+    ) -> Result<Vec<crate::chat_workspace_plan::CloseoutChatReference>, RpcError> {
         let target =
             self.repos.checkout_identity(cwd).await.map_err(|e| {
                 RpcError::Failed(format!("could not resolve close-out checkout: {e}"))
@@ -936,12 +963,13 @@ impl EngineRpc {
                 }
             };
             if same_checkout {
-                shared.push(
-                    match chat.title.as_deref().filter(|title| !title.is_empty()) {
-                        Some(title) => format!("{title} ({})", chat.id),
-                        None => chat.id,
-                    },
-                );
+                shared.push(crate::chat_workspace_plan::CloseoutChatReference {
+                    id: chat.id,
+                    title: chat
+                        .title
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| "Untitled chat".into()),
+                });
             }
         }
         Ok(shared)
@@ -1073,15 +1101,26 @@ impl EngineRpc {
 
         if let Ok(Some(chat)) = self.workspace.chat(chat_id) {
             let diffs = self.diff_sync.watch_diffs().borrow().clone();
-            let diff = chat
-                .checkout_id
-                .as_deref()
-                .and_then(|id| diffs.iter().find(|diff| diff.checkout_id == id))
-                .or_else(|| {
-                    chat.cwd
-                        .as_deref()
-                        .and_then(|cwd| diffs.iter().find(|diff| diff.cwd == cwd))
-                });
+            // Cwd is authoritative. Never let a stale checkoutId select an
+            // old diff after retargeting, and never match another device by a
+            // path string. Canonicalization makes symlink aliases and nested
+            // chat cwds resolve to the checkout-root snapshot.
+            let diff = chat.cwd.as_deref().and_then(|cwd| {
+                let canonical = std::fs::canonicalize(cwd).ok()?;
+                diffs.iter().find(|diff| {
+                    if diff.device_id != self.engine_info.device_id {
+                        return false;
+                    }
+                    let Ok(root) = std::fs::canonicalize(&diff.cwd) else {
+                        return false;
+                    };
+                    (canonical == root || canonical.starts_with(&root))
+                        && chat
+                            .checkout_id
+                            .as_deref()
+                            .is_none_or(|id| id == diff.checkout_id)
+                })
+            });
             if let Some(diff) = diff {
                 for file in &diff.files {
                     if paths.len() == FILE_SEARCH_FEATURED_PATHS {
@@ -1173,7 +1212,7 @@ impl EngineRpc {
         }
     }
 
-    fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
+    async fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
             MutateParams::CreateChat {
@@ -1245,11 +1284,38 @@ impl EngineRpc {
                 .set_chat_branch(&chat_id, &branch)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatCwd { chat_id, cwd } => self
-                .workspace
-                .set_chat_cwd(&chat_id, &cwd)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatCwd { chat_id, cwd } => {
+                // The cwd is authoritative. Resolve it on the chat's owning
+                // device, then commit cwd + checkoutId together. When it is an
+                // imported/missing/non-Git path, keep the requested cwd but
+                // explicitly clear the previous id.
+                let chat = self.workspace.chat(&chat_id).map_err(failed)?;
+                let is_local = chat
+                    .as_ref()
+                    .is_none_or(|chat| chat.device_id == self.engine_info.device_id);
+                let path = std::path::Path::new(&cwd);
+                let resolved = if is_local && !crate::repos::is_automatic_access_blocked(path) {
+                    self.repos.checkout_identity(path).await.ok()
+                } else {
+                    None
+                };
+                let canonical_cwd = if resolved.is_some() {
+                    std::fs::canonicalize(path)
+                        .unwrap_or_else(|_| path.to_path_buf())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    cwd
+                };
+                self.workspace
+                    .set_chat_target(
+                        &chat_id,
+                        &canonical_cwd,
+                        resolved.as_ref().map(|identity| identity.id.as_str()),
+                    )
+                    .map_err(failed)
+                    .map(drop)
+            }
             MutateParams::SetChatActivity {
                 chat_id,
                 last_message_at,
@@ -1475,6 +1541,45 @@ where
     .boxed()
 }
 
+/// Filter the shared latest-only cache down to one checkout while retaining
+/// the historical array-shaped wire payload. The device check is deliberate:
+/// checkout identities are device-derived, and no device-agnostic cwd/id
+/// fallback should leak a similarly named remote checkout into this stream.
+fn scoped_checkout_diff_stream(
+    rx: watch::Receiver<Vec<zeron_proto::CheckoutDiff>>,
+    checkout_id: String,
+    device_id: String,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (rx, checkout_id, device_id, None, false),
+        |(mut rx, checkout_id, device_id, mut previous, emitted): (
+            _,
+            _,
+            _,
+            Option<Vec<zeron_proto::CheckoutDiff>>,
+            _,
+        )| async move {
+            loop {
+                if emitted {
+                    rx.changed().await.ok()?;
+                }
+                let next: Vec<_> = rx
+                    .borrow_and_update()
+                    .iter()
+                    .filter(|diff| diff.checkout_id == checkout_id && diff.device_id == device_id)
+                    .cloned()
+                    .collect();
+                if !emitted || previous.as_ref() != Some(&next) {
+                    let value = serde_json::to_value(&next).ok()?;
+                    previous = Some(next);
+                    return Some((value, (rx, checkout_id, device_id, previous, true)));
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
 /// The transcript watch as delta frames (`zeron_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
@@ -1573,12 +1678,18 @@ async fn opening_doc_messages_stream(
     .await
     .map_err(|e| RpcError::Failed(e.to_string()))?
     .map_err(|e| RpcError::Failed(e.to_string()))?;
-    // Do not build the full mirror before yielding the preview.
-    // The next poll attaches normally and begins with a complete
-    // authoritative reset; subsequent frames use normal deltas.
+    // Start the authoritative attachment now, independently of the consumer
+    // polling the second stream item.  Deferring the spawn itself to the next
+    // poll left a restored viewport with only its provisional frame when the
+    // RPC/GPUI pumps went quiet after first paint; the next user mutation woke
+    // the pipeline and made the old transcript appear, which looked as if the
+    // send had recovered it.  The blocking work still runs off-thread and we
+    // still yield `preview` first, but history hydration no longer depends on
+    // another UI event.
+    let full_attach =
+        tokio::task::spawn_blocking(move || (handle.watch_messages(), handle.doc_arc()));
     let full = futures::stream::once(async move {
-        match tokio::task::spawn_blocking(move || (handle.watch_messages(), handle.doc_arc())).await
-        {
+        match full_attach.await {
             Ok((rx, doc)) => doc_messages_stream(rx, doc),
             Err(error) => {
                 tracing::warn!(%error, "transcript opening failed");
@@ -2438,11 +2549,12 @@ impl RpcService for EngineRpc {
                 let p: ChatLinkStatusParams = parse_params(params)?;
                 let importer = self.external_importer()?.clone();
                 let context_usage = self.context_usage()?.clone();
-                let (classification, tool_usage) = tokio::task::spawn_blocking(move || {
+                let (classification, manual, tool_usage) = tokio::task::spawn_blocking(move || {
                     importer.ensure_native_classification(&context_usage, &p.chat_id)?;
                     let classification = importer.classification_for(&p.chat_id)?;
+                    let manual = importer.classification_is_manual(&p.chat_id)?;
                     let tool_usage = importer.tool_usage_for(&p.chat_id)?;
-                    Ok::<_, crate::EngineError>((classification, tool_usage))
+                    Ok::<_, crate::EngineError>((classification, manual, tool_usage))
                 })
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?
@@ -2452,6 +2564,37 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({
                     "category": category,
                     "origin": origin,
+                    "manual": manual,
+                    "toolCounts": tool_counts,
+                    "skillsLoaded": skills_loaded,
+                }))
+            }
+            methods::SET_CHAT_CLASSIFICATION => {
+                let p: SetChatClassificationParams = parse_params(params)?;
+                let importer = self.external_importer()?.clone();
+                let context_usage = self.context_usage()?.clone();
+                let chat_id = p.chat_id;
+                let category = p.category;
+                let (classification, manual, tool_usage) = tokio::task::spawn_blocking(move || {
+                    importer.set_manual_classification(
+                        &context_usage,
+                        &chat_id,
+                        category.as_deref(),
+                    )?;
+                    let classification = importer.classification_for(&chat_id)?;
+                    let manual = importer.classification_is_manual(&chat_id)?;
+                    let tool_usage = importer.tool_usage_for(&chat_id)?;
+                    Ok::<_, crate::EngineError>((classification, manual, tool_usage))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let (category, origin) = classification.unzip();
+                let (tool_counts, skills_loaded) = tool_usage.unzip();
+                RpcReply::value(&serde_json::json!({
+                    "category": category,
+                    "origin": origin,
+                    "manual": manual,
                     "toolCounts": tool_counts,
                     "skillsLoaded": skills_loaded,
                 }))
@@ -2482,7 +2625,11 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "contextPct": pct }))
             }
             methods::MY_OPEN_PRS => {
-                let items = self.pr_ticket_cache()?.my_open_prs();
+                let cache = self.pr_ticket_cache()?;
+                cache
+                    .wait_for_my_open_prs_ready(MY_OPEN_PRS_INITIAL_WAIT)
+                    .await;
+                let items = cache.my_open_prs();
                 RpcReply::value(&items)
             }
             methods::REVIEW_REQUESTED_PRS => {
@@ -2519,10 +2666,22 @@ impl RpcService for EngineRpc {
                 // error doesn't fail worktree creation itself — the worktree
                 // is real and usable either way, just not yet wired to this
                 // chat's next send.
-                match self
-                    .workspace
-                    .set_chat_cwd(&p.chat_id, &worktree.worktree_path)
-                {
+                let worktree_identity = self
+                    .repos
+                    .checkout_identity(std::path::Path::new(&worktree.worktree_path))
+                    .await
+                    .ok();
+                let canonical_worktree = worktree_identity
+                    .as_ref()
+                    .map(|identity| identity.root.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| worktree.worktree_path.clone());
+                match self.workspace.set_chat_target(
+                    &p.chat_id,
+                    &canonical_worktree,
+                    worktree_identity
+                        .as_ref()
+                        .map(|identity| identity.id.as_str()),
+                ) {
                     Ok(true) => {}
                     Ok(false) => tracing::warn!(
                         chat = %p.chat_id,
@@ -2543,13 +2702,12 @@ impl RpcService for EngineRpc {
                 let chat_id = p.chat_id.as_deref();
                 let cwd = self.resolved_closeout_cwd(chat_id, &p.cwd)?;
                 let shared = self.open_chats_on_checkout(chat_id, &cwd).await?;
-                if !shared.is_empty() {
-                    return Err(shared_closeout_error(&shared));
-                }
                 let canonical_cwd = cwd.to_string_lossy().into_owned();
                 let chat_live = self.closeout_is_live(chat_id, &canonical_cwd).await;
                 let plan = tokio::task::spawn_blocking(move || {
-                    crate::chat_workspace_plan::plan_chat_closeout(&cwd, chat_live)
+                    let mut plan = crate::chat_workspace_plan::plan_chat_closeout(&cwd, chat_live);
+                    plan.shared_chats = shared;
+                    plan
                 })
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
@@ -2601,7 +2759,7 @@ impl RpcService for EngineRpc {
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
                 let sidebar_pins = matches!(&p, MutateParams::ChangeSidebarPin { .. });
-                self.mutate(p)?;
+                self.mutate(p).await?;
                 if sidebar_pins {
                     return RpcReply::value(&serde_json::json!({
                         "ok": true, "sidebarPreferences": self.workspace.sidebar_preferences_snapshot(),
@@ -2610,7 +2768,41 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
-                Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
+                let p = if params.is_null() {
+                    WatchCheckoutDiffsParams::default()
+                } else {
+                    parse_params(params)?
+                };
+                let scope = match p.cwd.as_deref() {
+                    Some(cwd) => {
+                        let identity = self
+                            .repos
+                            .checkout_identity(std::path::Path::new(cwd))
+                            .await
+                            .map_err(|error| {
+                                RpcError::Failed(format!(
+                                    "could not resolve checkout diff cwd: {error}"
+                                ))
+                            })?;
+                        if let Some(expected) = p.checkout_id.as_deref()
+                            && expected != identity.id
+                        {
+                            return Err(RpcError::Failed(
+                                "checkoutId does not match canonical cwd".into(),
+                            ));
+                        }
+                        Some(identity.id)
+                    }
+                    None => p.checkout_id,
+                };
+                match scope {
+                    None => Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs()))),
+                    Some(checkout_id) => Ok(RpcReply::Stream(scoped_checkout_diff_stream(
+                        self.diff_sync.watch_diffs(),
+                        checkout_id,
+                        self.engine_info.device_id.clone(),
+                    ))),
+                }
             }
             methods::WATCH_WORKSPACE_GIT_STATUS => {
                 let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
@@ -2669,6 +2861,8 @@ impl RpcService for EngineRpc {
                     struct P {
                         cwd: String,
                         #[serde(default)]
+                        checkout_id: Option<String>,
+                        #[serde(default)]
                         mode: String,
                         base_ref: Option<String>,
                         chat_id: Option<String>,
@@ -2680,6 +2874,13 @@ impl RpcService for EngineRpc {
                         .checkout_identity(std::path::Path::new(&p.cwd))
                         .await
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if let Some(expected) = p.checkout_id.as_deref()
+                        && expected != identity.id
+                    {
+                        return Err(RpcError::Failed(
+                            "checkoutId does not match canonical cwd".into(),
+                        ));
+                    }
                     let root = identity.root.as_path();
                     let snapshot = match p.mode.as_str() {
                         "branch" => {
@@ -2724,6 +2925,7 @@ impl RpcService for EngineRpc {
                         cwd: identity.root.to_string_lossy().to_string(),
                         patch: snapshot.patch,
                         files: snapshot.files,
+                        submodules: snapshot.submodules,
                         additions: snapshot.additions,
                         deletions: snapshot.deletions,
                         truncated: snapshot.truncated,
@@ -2824,21 +3026,45 @@ impl RpcService for EngineRpc {
                     if snapshot.checksum != p.diff_checksum {
                         return RpcReply::value(&stale());
                     }
-                    let file = snapshot
-                        .files
-                        .iter()
-                        .find(|file| file.path == p.path)
-                        .ok_or_else(|| {
-                            RpcError::Failed("path is not part of diff snapshot".into())
-                        })?;
-                    let pair = Box::pin(crate::diff_sync::read_diff_file_text_at(
-                        root,
-                        &base,
-                        target.as_deref(),
-                        file,
-                    ))
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    let pair = if let Some(repository_path) = p.repository_path.as_deref() {
+                        let section = snapshot
+                            .submodules
+                            .iter()
+                            .find(|section| {
+                                section.repository_path == repository_path && section.expanded
+                            })
+                            .ok_or_else(|| {
+                                RpcError::Failed("repository is not part of diff snapshot".into())
+                            })?;
+                        let file = section
+                            .files
+                            .iter()
+                            .find(|file| file.path == p.path)
+                            .ok_or_else(|| {
+                                RpcError::Failed("path is not part of diff snapshot".into())
+                            })?;
+                        Box::pin(crate::diff_sync::read_submodule_diff_file_text(
+                            root, section, file,
+                        ))
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                    } else {
+                        let file = snapshot
+                            .files
+                            .iter()
+                            .find(|file| file.path == p.path)
+                            .ok_or_else(|| {
+                                RpcError::Failed("path is not part of diff snapshot".into())
+                            })?;
+                        Box::pin(crate::diff_sync::read_diff_file_text_at(
+                            root,
+                            &base,
+                            target.as_deref(),
+                            file,
+                        ))
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?
+                    };
                     let current = match p.mode.as_str() {
                         "branch" => {
                             Box::pin(crate::diff_sync::capture_diff_against(
@@ -2901,10 +3127,11 @@ impl RpcService for EngineRpc {
                     .read_chats()
                     .map_err(|error| RpcError::Failed(error.to_string()))?
                     .into_iter()
-                    .filter(|chat| {
-                        chat.space_id.as_deref() == Some(space.id.as_str())
-                            && chat.device_id == space.device_id
-                    })
+                    // A chat can live in a Space rooted at a linked worktree
+                    // while this map is opened from the repository's parent
+                    // Space. Checkout/path identity below is the repository
+                    // boundary; filtering by Space here drops those chats.
+                    .filter(|chat| chat.device_id == space.device_id)
                     .collect();
                 let mut linked_pr_urls = std::collections::HashMap::new();
                 for chat in &chats {
@@ -3528,11 +3755,37 @@ impl RpcService for EngineRpc {
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
-                let text = self
-                    .doc_host
-                    .fetch_tool_blob(&p.blob_ref)
-                    .await
+                let key = crate::doc_host::parse_tool_blob_ref(&p.blob_ref)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Local cache first. For pre-cache chats, recover the exact
+                // ToolResult from the durable run journal before touching the
+                // network; this is what makes the visible "tap to retry"
+                // affordance repair already-recorded edits too.
+                let text = match self
+                    .doc_host
+                    .cached_tool_blob(&p.blob_ref)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                {
+                    Some(text) => text,
+                    None => match self
+                        .sessions
+                        .tool_blob_from_journal(key.chat_id, key.part_id, key.is_diff)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                    {
+                        Some(text) => {
+                            if let Err(err) = self.doc_host.cache_tool_blob(&p.blob_ref, &text) {
+                                tracing::warn!(blob_ref = %p.blob_ref, error = %err,
+                                    "journal tool blob cache backfill failed");
+                            }
+                            text
+                        }
+                        None => self
+                            .doc_host
+                            .fetch_tool_blob(&p.blob_ref)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    },
+                };
                 RpcReply::value(&serde_json::json!({ "text": text }))
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
@@ -3929,6 +4182,49 @@ mod tests {
         }
         assert_eq!(entries.len(), 3);
         assert_eq!(entries.last().unwrap().id, "live");
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_chat_attaches_full_history_without_waiting_for_another_ui_poll() {
+        use crate::doc_host::{DocHost, DocHostConfig};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "viewer".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("restored").unwrap();
+        handle
+            .write_user_message("old", "visible immediately after restart", 1)
+            .unwrap();
+
+        // Construct the subscription exactly as a restored full-chat tab
+        // does, then deliberately do not poll even the preview.  Full-history
+        // attachment is eager and therefore cannot depend on a later input
+        // event waking the viewport's stream consumer.
+        let mut stream = opening_doc_messages_stream(host.clone(), "restored".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.message_watcher_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authoritative transcript watch attaches without another poll");
+
+        let preview = stream.next().await.unwrap();
+        assert_eq!(preview["historyPending"], true);
+        let full = stream.next().await.unwrap();
+        assert!(full.get("historyPending").is_none());
+        assert_eq!(full["reset"][0]["id"], "old");
         host.shutdown_workers().await;
     }
 

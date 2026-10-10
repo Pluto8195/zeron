@@ -13,11 +13,12 @@ use zeron_proto::{
 };
 
 use crate::EngineError;
-use crate::repos::{Repos, is_broad_workspace_root_resolved};
+use crate::repos::{Repos, is_automatic_access_blocked, is_broad_workspace_root_resolved};
 
 const NESTED_REPO_SCAN_MAX_DIRS: usize = 20_000;
 const NESTED_REPO_SCAN_MAX_DEPTH: usize = 12;
 const NESTED_REPO_SCAN_MAX_REPOS: usize = 128;
+const WORKSPACE_ROOT_MARKER: &str = ".workspace-root";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeRecord {
@@ -210,7 +211,7 @@ pub async fn build(
         });
     }
 
-    attach_chats(repos, &mut topology_repos, chats, sessions, linked_pr_urls).await;
+    attach_chats(&mut topology_repos, chats, sessions, linked_pr_urls).await;
     let root_repo = topology_repos
         .iter()
         .find(|repo| repo.kind == RepositoryTopologyKind::Workspace);
@@ -228,7 +229,6 @@ pub async fn build(
 }
 
 async fn attach_chats(
-    repos: &Repos,
     repositories: &mut [RepositoryTopologyRepository],
     chats: Vec<Chat>,
     sessions: Vec<Session>,
@@ -239,35 +239,60 @@ async fn attach_chats(
         .map(|session| (session.chat_id.clone(), session))
         .collect();
     let mut checkout_positions = HashMap::new();
+    let mut worktree_roots = Vec::new();
     for (repo_ix, repo) in repositories.iter().enumerate() {
         for (worktree_ix, worktree) in repo.worktrees.iter().enumerate() {
             if let Some(checkout_id) = &worktree.checkout_id {
                 checkout_positions.insert(checkout_id.clone(), (repo_ix, worktree_ix));
             }
+            worktree_roots.push((
+                normalize_lexical(Path::new(&worktree.path)),
+                repo_ix,
+                worktree_ix,
+            ));
         }
     }
+    // A nested repository's checkout is also below the outer worktree root.
+    // Prefer its more specific root when matching a chat cwd.
+    worktree_roots.sort_by_key(|(root, _, _)| std::cmp::Reverse(root.components().count()));
 
     for chat in chats {
-        let mut checkout_id = chat
-            .source_context
-            .as_ref()
-            .map(|source| source.checkout_id.clone())
-            .or_else(|| chat.checkout_id.clone());
-        if checkout_id
-            .as_ref()
-            .is_none_or(|id| !checkout_positions.contains_key(id))
-            && let Some(cwd) = &chat.cwd
-            && let Ok(identity) = repos.checkout_identity(Path::new(cwd)).await
-        {
-            checkout_id = Some(identity.id);
-        }
-        let Some((repo_ix, worktree_ix)) = checkout_id
-            .as_ref()
-            .and_then(|id| checkout_positions.get(id))
-            .copied()
-        else {
+        let cwd_position = chat.cwd.as_deref().and_then(|cwd| {
+            let cwd = Path::new(cwd);
+            let cwd = if is_automatic_access_blocked(cwd) {
+                normalize_lexical(cwd)
+            } else {
+                std::fs::canonicalize(cwd).unwrap_or_else(|_| normalize_lexical(cwd))
+            };
+            worktree_roots
+                .iter()
+                .find(|(root, _, _)| cwd == *root || cwd.starts_with(root))
+                .map(|(_, repo_ix, worktree_ix)| (*repo_ix, *worktree_ix))
+        });
+        // The current cwd is direct evidence of where the chat operates. Old
+        // source context can legitimately name another still-existing
+        // checkout after a chat is retargeted, so it must not win merely
+        // because that stale id remains valid. Avoid probing arbitrary chat
+        // paths with git here; known worktree roots are enough.
+        let position = cwd_position
+            .or_else(|| {
+                chat.checkout_id
+                    .as_ref()
+                    .and_then(|id| checkout_positions.get(id))
+                    .copied()
+            })
+            .or_else(|| {
+                chat.source_context
+                    .as_ref()
+                    .and_then(|source| checkout_positions.get(&source.checkout_id))
+                    .copied()
+            });
+        let Some((repo_ix, worktree_ix)) = position else {
             continue;
         };
+        let checkout_id = repositories[repo_ix].worktrees[worktree_ix]
+            .checkout_id
+            .clone();
         let live_branch = repositories[repo_ix].worktrees[worktree_ix]
             .branch
             .as_deref();
@@ -320,9 +345,7 @@ async fn inspect_checkout(
         )
         .await
     {
-        Ok(output) if output.is_empty() => RepositoryTopologyStatus::Clean,
-        Ok(output) if has_conflict(&output) => RepositoryTopologyStatus::Conflicted,
-        Ok(_) => RepositoryTopologyStatus::Modified,
+        Ok(output) => checkout_status(&output, path.join(WORKSPACE_ROOT_MARKER).is_file()),
         Err(_) => RepositoryTopologyStatus::Unknown,
     };
     let divergence = repos
@@ -342,11 +365,37 @@ async fn inspect_checkout(
     (status, ahead, behind)
 }
 
-fn has_conflict(status: &str) -> bool {
-    status.split('\0').any(|entry| {
+/// Classify only user-authored working-copy changes. Zeron-created linked
+/// worktrees intentionally contain two kinds of untracked runtime metadata:
+/// the `.workspace-root` ownership marker and project `.claude/` config copied
+/// from the main checkout. Close-out inspection already excludes both; the
+/// topology must use the same convention or every fresh agent worktree is
+/// shown as dirty before anyone edits it.
+fn checkout_status(status: &str, ignore_managed_metadata: bool) -> RepositoryTopologyStatus {
+    let mut relevant = status.split('\0').filter(|entry| {
         let code = entry.as_bytes().get(..2).unwrap_or_default();
-        matches!(code, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU")
-    })
+        let path = entry.get(3..).unwrap_or_default();
+        !(ignore_managed_metadata
+            && code == b"??"
+            && (path == WORKSPACE_ROOT_MARKER || path == ".claude" || path.starts_with(".claude/")))
+    });
+    let mut changed = false;
+    let mut conflicted = false;
+    for entry in relevant.by_ref() {
+        if entry.is_empty() {
+            continue;
+        }
+        changed = true;
+        let code = entry.as_bytes().get(..2).unwrap_or_default();
+        conflicted |= matches!(code, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU");
+    }
+    if conflicted {
+        RepositoryTopologyStatus::Conflicted
+    } else if changed {
+        RepositoryTopologyStatus::Modified
+    } else {
+        RepositoryTopologyStatus::Clean
+    }
 }
 
 async fn submodule_paths(repos: &Repos, repo: &Path) -> Vec<PathBuf> {
@@ -556,9 +605,44 @@ mod tests {
 
     #[test]
     fn status_detects_unmerged_codes() {
-        assert!(has_conflict("UU src/lib.rs\0"));
-        assert!(has_conflict(" M normal\0AA both-added\0"));
-        assert!(!has_conflict(" M src/lib.rs\0?? new.txt\0"));
+        assert_eq!(
+            checkout_status("UU src/lib.rs\0", false),
+            RepositoryTopologyStatus::Conflicted
+        );
+        assert_eq!(
+            checkout_status(" M normal\0AA both-added\0", false),
+            RepositoryTopologyStatus::Conflicted
+        );
+        assert_eq!(
+            checkout_status(" M src/lib.rs\0?? new.txt\0", false),
+            RepositoryTopologyStatus::Modified
+        );
+    }
+
+    #[test]
+    fn status_ignores_zeron_worktree_metadata_but_not_real_changes() {
+        assert_eq!(checkout_status("", false), RepositoryTopologyStatus::Clean);
+        assert_eq!(
+            checkout_status("?? .workspace-root\0?? .claude/\0", true),
+            RepositoryTopologyStatus::Clean
+        );
+        assert_eq!(
+            checkout_status(
+                "?? .workspace-root\0?? .claude/skills/copied.md\0?? notes.txt\0",
+                true,
+            ),
+            RepositoryTopologyStatus::Modified
+        );
+        assert_eq!(
+            checkout_status("?? .workspace-root\0?? .claude/\0", false),
+            RepositoryTopologyStatus::Modified
+        );
+        // A tracked file under `.claude` is authored repository content and
+        // remains a real change; only untracked seeded copies are metadata.
+        assert_eq!(
+            checkout_status(" M .claude/settings.json\0", true),
+            RepositoryTopologyStatus::Modified
+        );
     }
 
     #[test]
@@ -576,6 +660,7 @@ mod tests {
         init_repo(&root);
         let nested = root.join("packages/nested");
         init_repo(&nested);
+        std::fs::create_dir_all(nested.join("src/deep")).unwrap();
         std::fs::write(
             root.join(".gitmodules"),
             "[submodule \"missing\"]\n\tpath = deps/missing\n\turl = ../missing\n",
@@ -593,6 +678,16 @@ mod tests {
                 linked.to_str().unwrap(),
             ],
         );
+        // These are runtime metadata seeded into Zeron-created worktrees,
+        // not user changes. The topology should agree with close-out's dirty
+        // inspection and report this otherwise untouched checkout as clean.
+        std::fs::write(
+            linked.join(WORKSPACE_ROOT_MARKER),
+            root.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(linked.join(".claude/skills/copied")).unwrap();
+        std::fs::write(linked.join(".claude/skills/copied/SKILL.md"), "seeded\n").unwrap();
 
         let repos = Repos::with_worktrees_root(
             &temp.path().join("data"),
@@ -600,22 +695,23 @@ mod tests {
             temp.path().join("managed-worktrees"),
         );
         let checkout = repos.checkout_identity(&linked).await.unwrap();
+        let main_checkout = repos.checkout_identity(&root).await.unwrap();
         let now = Utc::now();
         let chat = Chat {
             id: "chat-1".into(),
             device_id: "device-1".into(),
             title: Some("Build topology".into()),
-            archived: false,
-            // Source checkout identity is authoritative even if this older
-            // cwd field happens to point at the main checkout.
-            cwd: Some(root.to_string_lossy().into_owned()),
+            archived: true,
+            // Current cwd wins even though the older source context still
+            // names another valid checkout.
+            cwd: Some(linked.to_string_lossy().into_owned()),
             branch: Some("feature/topology".into()),
             checkout_id: None,
             source_context: Some(ConversationSourceContext {
-                checkout_id: checkout.id.clone(),
-                repo_root: linked.to_string_lossy().into_owned(),
-                cwd: linked.to_string_lossy().into_owned(),
-                branch: "feature/topology".into(),
+                checkout_id: main_checkout.id.clone(),
+                repo_root: root.to_string_lossy().into_owned(),
+                cwd: root.to_string_lossy().into_owned(),
+                branch: "main".into(),
                 head_sha: None,
                 observed_at: now,
             }),
@@ -632,7 +728,9 @@ mod tests {
             created_at: now,
             harness_session_id: None,
             harness_session_cwd: None,
-            space_id: Some("space-1".into()),
+            // The topology RPC intentionally admits same-device chats from a
+            // worktree-specific Space and lets this checkout join scope them.
+            space_id: Some("worktree-space".into()),
             last_seen_at: Some(now),
             room_gen: None,
             parent_chat_id: None,
@@ -641,6 +739,14 @@ mod tests {
             linked_ticket_id: Some("ENG-42".into()),
             linked_ticket_source: None,
         };
+        let mut nested_chat = chat.clone();
+        nested_chat.id = "chat-nested".into();
+        nested_chat.title = Some("Nested checkout".into());
+        nested_chat.archived = false;
+        nested_chat.cwd = Some(nested.join("src/deep").to_string_lossy().into_owned());
+        nested_chat.checkout_id = Some(main_checkout.id.clone());
+        nested_chat.source_context = None;
+        nested_chat.linked_ticket_id = None;
         let session = Session {
             last_completed_turn: None,
             chat_id: chat.id.clone(),
@@ -664,7 +770,7 @@ mod tests {
             &repos,
             "device-1",
             &space,
-            vec![chat],
+            vec![chat, nested_chat],
             vec![session],
             HashMap::from([(
                 "chat-1".into(),
@@ -695,7 +801,14 @@ mod tests {
             .find(|worktree| worktree.checkout_id.as_deref() == Some(checkout.id.as_str()))
             .unwrap();
         assert!(!linked.is_main);
+        assert_eq!(linked.status, RepositoryTopologyStatus::Clean);
         assert_eq!(linked.chats.len(), 1);
+        assert!(linked.chats[0].archived);
+        assert_eq!(linked.chats[0].id, "chat-1");
+        assert_eq!(
+            linked.chats[0].checkout_id.as_deref(),
+            Some(checkout.id.as_str())
+        );
         assert_eq!(
             linked.chats[0].indicator,
             RepositoryTopologyActivity::Working
@@ -703,5 +816,19 @@ mod tests {
         assert_eq!(linked.chats[0].agents[0].kind, Some(HarnessId::Codex));
         assert_eq!(linked.chats[0].linked_ticket_id.as_deref(), Some("ENG-42"));
         assert_eq!(linked.chats[0].linked_pr_urls.len(), 1);
+
+        let nested_repo = topology
+            .workspace
+            .repositories
+            .iter()
+            .find(|repo| repo.path.ends_with("packages/nested"))
+            .unwrap();
+        let nested_main = nested_repo
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .unwrap();
+        assert_eq!(nested_main.chats.len(), 1);
+        assert_eq!(nested_main.chats[0].id, "chat-nested");
     }
 }

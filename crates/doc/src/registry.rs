@@ -1075,6 +1075,7 @@ impl RegistryDoc {
             OpKind::Update,
             fields([
                 ("sourceContext", serde_json::to_value(context)?),
+                ("cwd", json!(context.cwd)),
                 ("branch", json!(context.branch)),
                 ("checkoutId", json!(context.checkout_id)),
             ]),
@@ -1086,6 +1087,17 @@ impl RegistryDoc {
     /// existing worktree" move. Harness resume is cwd-scoped, so the next run
     /// in the new folder starts a fresh harness conversation by design.
     pub fn set_chat_cwd(&mut self, chat_id: &str, cwd: &str) -> Result<bool, DocError> {
+        self.set_chat_target(chat_id, cwd, None)
+    }
+
+    /// Atomically replace cwd and checkout identity. A missing identity is an
+    /// explicit invalidation, not permission to retain a stale checkout id.
+    pub fn set_chat_target(
+        &mut self,
+        chat_id: &str,
+        cwd: &str,
+        checkout_id: Option<&str>,
+    ) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);
         }
@@ -1093,7 +1105,7 @@ impl RegistryDoc {
             KIND_CHATS,
             chat_id,
             OpKind::Update,
-            fields([("cwd", json!(cwd))]),
+            fields([("cwd", json!(cwd)), ("checkoutId", opt_str(checkout_id))]),
         );
         Ok(true)
     }
@@ -1104,6 +1116,27 @@ impl RegistryDoc {
         checkout_id: &str,
     ) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("checkoutId", json!(checkout_id))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_checkout_for_cwd(
+        &mut self,
+        chat_id: &str,
+        expected_cwd: &str,
+        checkout_id: &str,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        if row.fields.get("cwd").and_then(Value::as_str) != Some(expected_cwd) {
             return Ok(false);
         }
         self.write(

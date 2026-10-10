@@ -216,6 +216,47 @@ impl SessionsEngine {
         lock(&self.inner.doc_host).take();
     }
 
+    /// Recover a full tool payload from the host's durable run journal.
+    ///
+    /// Thin transcript docs retain only stats plus a sidecar ref. Older runs
+    /// can therefore have a valid ref but no local cache (and a missed edge
+    /// upload). The journal is the durable source that still contains the
+    /// original `ToolResult`; scan newest-first because tool ids may be reused
+    /// by a resumed harness and the sidecar key is latest-write-wins too.
+    pub(crate) fn tool_blob_from_journal(
+        &self,
+        chat_id: &str,
+        part_id: &str,
+        is_diff: bool,
+    ) -> Result<Option<String>, EngineError> {
+        let events = self.inner.journal.replay(chat_id, 0)?;
+        for (_, mut event) in events.into_iter().rev() {
+            // Subagent traffic is journaled on the parent chat wrapped in one
+            // or more routing envelopes. Its thin child doc uses the leaf
+            // tool id for the same sidecar contract, so unwrap all envelopes.
+            while let AgentEvent::Subagent { event: inner, .. } = event {
+                event = *inner;
+            }
+            let AgentEvent::ToolResult {
+                id, output, diff, ..
+            } = event
+            else {
+                continue;
+            };
+            if id != part_id {
+                continue;
+            }
+            if is_diff {
+                return diff
+                    .map(|diff| serde_json::to_string(&diff))
+                    .transpose()
+                    .map_err(|err| EngineError::Other(format!("tool diff serialize: {err}")));
+            }
+            return Ok(output.filter(|text| !text.trim().is_empty()));
+        }
+        Ok(None)
+    }
+
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
     pub fn set_generated_images(
         &self,
@@ -2754,6 +2795,81 @@ fn restart_marker_is_fresh(marked_at: i64, now: i64, freshness_ms: i64) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_tool_blobs_recover_from_the_latest_journal_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let old = AgentEvent::ToolResult {
+            id: "call-1".into(),
+            is_error: false,
+            output: Some("old output".into()),
+            diff: None,
+        };
+        journal.append("chat-1", &old).unwrap();
+        let diff = zeron_proto::ToolDiff {
+            path: "src/lib.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: "new\n".into(),
+            unified_diff: None,
+        };
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::ToolResult {
+                    id: "call-1".into(),
+                    is_error: false,
+                    output: Some("latest output".into()),
+                    diff: Some(diff.clone()),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::Subagent {
+                    parent_tool_use_id: "agent-1".into(),
+                    event: Box::new(AgentEvent::ToolResult {
+                        id: "wrapped-call".into(),
+                        is_error: false,
+                        output: Some("wrapped output".into()),
+                        diff: Some(diff.clone()),
+                    }),
+                },
+            )
+            .unwrap();
+        let sessions =
+            SessionsEngine::new("host".into(), journal, Arc::new(HarnessRegistry::new()));
+
+        assert_eq!(
+            sessions
+                .tool_blob_from_journal("chat-1", "call-1", false)
+                .unwrap()
+                .as_deref(),
+            Some("latest output")
+        );
+        let encoded = sessions
+            .tool_blob_from_journal("chat-1", "call-1", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<zeron_proto::ToolDiff>(&encoded).unwrap(),
+            diff
+        );
+        assert_eq!(
+            sessions
+                .tool_blob_from_journal("chat-1", "wrapped-call", false)
+                .unwrap()
+                .as_deref(),
+            Some("wrapped output")
+        );
+        assert!(
+            sessions
+                .tool_blob_from_journal("chat-1", "missing", false)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn legacy_home_cwds_resolve_to_projectless_scratch() {

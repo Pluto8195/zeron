@@ -167,6 +167,10 @@ impl Shell {
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // Pressing `+` while already on an unsent Repo Map draft is still a
+        // request for a fresh draft; never carry its exact-path pin forward.
+        let pickers = self.composer.read(cx).pickers().clone();
+        pickers.update(cx, |pickers, cx| pickers.reset_new_session_scope(cx));
         let target = {
             let state = self.state.read(cx);
             self.settings
@@ -187,6 +191,30 @@ impl Shell {
                 }
             }
             s.select_chat(None, cx);
+        });
+        cx.notify();
+    }
+
+    /// Open a fresh draft whose first send is rooted in an exact, already
+    /// materialized worktree selected from Repo Map. The project still owns
+    /// device/config defaults; only the checkout target is pinned.
+    pub(crate) fn open_new_session_in_worktree(
+        &mut self,
+        space_id: String,
+        worktree_path: String,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_palette = None;
+        self.route = Route::Chat;
+        self.focus_composer(cx);
+        self.state.update(cx, |state, cx| {
+            state.select_space(Some(space_id.clone()), cx);
+            state.select_chat(None, cx);
+        });
+        let pickers = self.composer.read(cx).pickers().clone();
+        pickers.update(cx, |pickers, cx| {
+            pickers.target_existing_worktree(worktree_path.clone(), branch.clone(), cx);
         });
         cx.notify();
     }
@@ -471,6 +499,20 @@ impl Shell {
                 // Putting a 20px icon inside that overflow-hidden flex group
                 // made the only copy affordance disappear first when a long
                 // chat name or narrow window squeezed the titlebar.
+                .when_some(chat_id.clone(), |el, chat_id| {
+                    el.child(
+                        header_icon_button(
+                            "rename-chat-titlebar",
+                            icons::PEN,
+                            &theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_rename_chat(chat_id.clone(), cx)
+                            }),
+                        )
+                        .role(gpui::Role::Button)
+                        .aria_label("Edit chat name"),
+                    )
+                })
                 .when_some(chat_id, |el, chat_id| {
                     let copied = self.copied_chat_identity.as_deref() == Some(chat_id.as_str());
                     el.child(chat_identity_button(

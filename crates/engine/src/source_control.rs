@@ -785,10 +785,15 @@ struct SystemProcessRunner;
 #[async_trait]
 impl ProcessRunner for SystemProcessRunner {
     async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
-        let mut command = tokio::process::Command::new(&request.program);
-        if request.program == "gh" {
+        let mut command = if request.program == "gh" {
+            let executable = zeron_harness::resolve_login_shell_executable("gh")
+                .ok_or(ProcessRunError::Spawn(io::ErrorKind::NotFound))?;
+            let mut command = tokio::process::Command::new(executable);
             zeron_harness::compose_login_shell_path(&mut command);
-        }
+            command
+        } else {
+            tokio::process::Command::new(&request.program)
+        };
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

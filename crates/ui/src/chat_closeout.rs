@@ -15,6 +15,7 @@
 //! without a gpui context; the dialog itself lives in `shell/closeout_ui.rs`.
 
 use serde_json::Value;
+use zeron_proto::GitHistoryCommit;
 
 /// `{chatId, cwd, force}` → `{removed, branchDeleted, archived}`; errors carry
 /// human-readable refusal reasons.
@@ -45,6 +46,9 @@ pub fn is_closeout_candidate(cwd: Option<&str>) -> bool {
         return false;
     };
     let cwd = std::path::Path::new(cwd);
+    if zeron_engine::repos::is_automatic_access_blocked(cwd) {
+        return false;
+    }
     cwd.join(".workspace-root").is_file() || cwd.join(".git").is_file()
 }
 
@@ -60,10 +64,22 @@ pub struct CloseoutPlan {
     /// blocker because force cannot safely distinguish or preserve work.
     pub dirty_inspection_error: Option<String>,
     pub unmerged_commits: u32,
+    /// Newest-first commit rows supplied by the engine. Older engines omit
+    /// this field; the count still keeps their warning behavior intact.
+    pub unmerged_commit_details: Vec<GitHistoryCommit>,
     pub default_branch: Option<String>,
     /// Why merge inspection could not be completed. Unlike dirty inspection,
     /// this is forceable after the destructive two-step acknowledgement.
     pub merge_inspection_error: Option<String>,
+    /// Other active chats attached to this checkout. Planning still succeeds
+    /// so the dialog can name them; the destructive close remains blocked.
+    pub shared_chats: Vec<CloseoutChatReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseoutChatReference {
+    pub id: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +117,32 @@ pub fn decode_plan(value: &Value) -> Result<CloseoutPlan, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let unmerged_commit_details = value
+        .get("unmergedCommitDetails")
+        .cloned()
+        .map(serde_json::from_value::<Vec<GitHistoryCommit>>)
+        .transpose()
+        .map_err(|error| format!("invalid unmerged commit details: {error}"))?
+        .unwrap_or_default();
+    let shared_chats = value
+        .get("sharedChats")
+        .and_then(Value::as_array)
+        .map(|chats| {
+            chats
+                .iter()
+                .filter_map(|chat| {
+                    let id = chat.get("id")?.as_str()?.to_string();
+                    let title = chat
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or("Untitled chat")
+                        .to_string();
+                    Some(CloseoutChatReference { id, title })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(CloseoutPlan {
         is_worktree: flag("isWorktree")?,
         chat_live: flag("chatLive")?,
@@ -116,8 +158,10 @@ pub fn decode_plan(value: &Value) -> Result<CloseoutPlan, String> {
             .and_then(Value::as_u64)
             .map(|n| n.min(u32::MAX as u64) as u32)
             .unwrap_or(0),
+        unmerged_commit_details,
         default_branch: opt_str("defaultBranch"),
         merge_inspection_error: opt_str("mergeInspectionError"),
+        shared_chats,
     })
 }
 
@@ -148,6 +192,9 @@ pub enum CloseoutVerdict {
     /// Git could not establish whether uncommitted work exists. The engine
     /// refuses even with force, so the user must fix/retry inspection.
     DirtyInspectionFailed,
+    /// One or more other active chats still own this checkout. The plan names
+    /// them so the user can inspect/open them before trying again.
+    InUse,
     /// Nothing to lose — a normal destructive "Close out" (`force: false`).
     Clean,
     /// Dirty and/or unmerged (or unverifiable) — only "Force close out"
@@ -218,6 +265,8 @@ pub fn verdict(plan: &CloseoutPlan) -> CloseoutVerdict {
         CloseoutVerdict::Live
     } else if plan.dirty_inspection_error.is_some() {
         CloseoutVerdict::DirtyInspectionFailed
+    } else if !plan.shared_chats.is_empty() {
+        CloseoutVerdict::InUse
     } else if plan.dirty || plan.unmerged_commits > 0 || merge_unverifiable(plan) {
         CloseoutVerdict::NeedsForce
     } else {
@@ -336,6 +385,13 @@ pub fn body_copy(plan: &CloseoutPlan) -> String {
         ),
         CloseoutVerdict::DirtyInspectionFailed => "Couldn\u{2019}t safely inspect this worktree for uncommitted changes. Close out is blocked until inspection succeeds."
             .to_string(),
+        CloseoutVerdict::InUse => {
+            let count = plan.shared_chats.len();
+            format!(
+                "This worktree is still attached to {count} other active chat{}. Open or archive those chats before closing it out.",
+                if count == 1 { "" } else { "s" }
+            )
+        }
         CloseoutVerdict::Clean => match plan.branch.as_deref() {
             Some(branch) => format!(
                 "Removes the worktree, deletes its branch {branch}, and archives this chat. \
@@ -419,8 +475,10 @@ mod tests {
             dirty_files: vec![],
             dirty_inspection_error: None,
             unmerged_commits: 0,
+            unmerged_commit_details: vec![],
             default_branch: Some("main".into()),
             merge_inspection_error: None,
+            shared_chats: vec![],
         }
     }
 
@@ -435,8 +493,18 @@ mod tests {
             "dirtyFiles": ["src/a.rs", "b.txt"],
             "dirtyInspectionError": "git status timed out",
             "unmergedCommits": 2,
+            "unmergedCommitDetails": [{
+                "sha": "0123456789abcdef",
+                "parentShas": ["fedcba9876543210"],
+                "subject": "inspect close-out work",
+                "authorName": "Test",
+                "authorEmail": "test@example.com",
+                "authoredAt": "2026-10-06T12:00:00-04:00",
+                "refs": [],
+            }],
             "defaultBranch": "main",
             "mergeInspectionError": "rev-list timed out",
+            "sharedChats": [{"id": "chat-2", "title": "Other work"}],
         }))
         .unwrap();
         assert_eq!(
@@ -450,8 +518,21 @@ mod tests {
                 dirty_files: vec!["src/a.rs".into(), "b.txt".into()],
                 dirty_inspection_error: Some("git status timed out".into()),
                 unmerged_commits: 2,
+                unmerged_commit_details: vec![GitHistoryCommit {
+                    sha: "0123456789abcdef".into(),
+                    parent_shas: vec!["fedcba9876543210".into()],
+                    subject: "inspect close-out work".into(),
+                    author_name: "Test".into(),
+                    author_email: "test@example.com".into(),
+                    authored_at: "2026-10-06T12:00:00-04:00".into(),
+                    refs: vec![],
+                }],
                 default_branch: Some("main".into()),
                 merge_inspection_error: Some("rev-list timed out".into()),
+                shared_chats: vec![CloseoutChatReference {
+                    id: "chat-2".into(),
+                    title: "Other work".into(),
+                }],
             }
         );
     }
@@ -512,6 +593,15 @@ mod tests {
         assert_eq!(verdict(&live), CloseoutVerdict::Live);
         assert!(!verdict(&live).can_proceed());
         assert_eq!(verdict(&live).button_label(), None);
+
+        let mut in_use = plan();
+        in_use.shared_chats.push(CloseoutChatReference {
+            id: "other".into(),
+            title: "Other work".into(),
+        });
+        assert_eq!(verdict(&in_use), CloseoutVerdict::InUse);
+        assert!(!verdict(&in_use).can_proceed());
+        assert!(body_copy(&in_use).contains("other active chat"));
 
         let mut default = plan();
         default.branch = Some("main".into());
@@ -768,6 +858,21 @@ mod tests {
         std::fs::create_dir(unrelated.path().join(".git")).unwrap();
         std::fs::create_dir(unrelated.path().join(".workspace-root")).unwrap();
         assert!(!is_closeout_candidate(unrelated.path().to_str()));
+    }
+
+    #[test]
+    fn closeout_candidate_rejects_privacy_managed_history_before_metadata_probes() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("test requires HOME");
+        for child in ["Music", "Pictures", "Documents"] {
+            let cwd = home.join(child).join("historical-chat");
+            assert!(!is_closeout_candidate(cwd.to_str()));
+        }
+
+        let ordinary = tempfile::tempdir().unwrap();
+        std::fs::write(ordinary.path().join(".workspace-root"), "/r\n").unwrap();
+        assert!(is_closeout_candidate(ordinary.path().to_str()));
     }
 
     #[test]

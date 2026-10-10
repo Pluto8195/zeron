@@ -217,6 +217,122 @@ fn file_change_call(changes: &[(String, String)]) -> ToolCall {
     }
 }
 
+/// Decode both the legacy bare-string kind and codex app-server 0.154+'s
+/// schema shape (`kind: { type, move_path? }`). Unknown values retain the
+/// historical update fallback.
+fn file_change_kind(change: &Value) -> String {
+    change
+        .get("kind")
+        .and_then(|kind| {
+            kind.as_str()
+                .or_else(|| kind.get("type").and_then(Value::as_str))
+        })
+        .filter(|kind| matches!(*kind, "add" | "delete" | "update"))
+        .unwrap_or("update")
+        .to_owned()
+}
+
+fn file_change_move_path(change: &Value) -> Option<&str> {
+    change
+        .get("kind")
+        .and_then(|kind| kind.get("move_path").or_else(|| kind.get("movePath")))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+}
+
+fn is_hunk_diff(diff: &str) -> bool {
+    diff.trim_start_matches(['\r', '\n'])
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("@@ -") && line.contains(" +") && line.contains(" @@"))
+}
+
+fn push_content_hunk(patch: &mut String, content: &str, added: bool) {
+    let line_count = content.lines().count();
+    if line_count == 0 {
+        return;
+    }
+    if added {
+        patch.push_str(&format!("@@ -0,0 +1,{line_count} @@\n"));
+    } else {
+        patch.push_str(&format!("@@ -1,{line_count} +0,0 @@\n"));
+    }
+    let marker = if added { '+' } else { '-' };
+    for line in content.lines() {
+        patch.push(marker);
+        patch.push_str(line);
+        patch.push('\n');
+    }
+    if !content.ends_with('\n') {
+        patch.push_str("\\ No newline at end of file\n");
+    }
+}
+
+/// Codex supplies hunk-only unified diffs for updates, but full file content
+/// for adds and deletes. Normalize both forms into ordinary git-style sections
+/// so the document can derive per-file stats and the UI can reuse the checkout
+/// patch parser. Already-hunked and full git patches pass through unchanged.
+fn file_change_diff(changes: &[&Value]) -> Option<zeron_proto::ToolDiff> {
+    let mut patch = String::new();
+    let mut paths = Vec::new();
+    for change in changes {
+        let path = str_field(change, &["path"]);
+        let Some(raw) = change.get("diff").and_then(Value::as_str) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        paths.push(path.clone());
+        if !patch.is_empty() && !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        if raw
+            .trim_start_matches(['\r', '\n'])
+            .starts_with("diff --git ")
+        {
+            patch.push_str(raw.trim_end_matches(['\r', '\n']));
+            if !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+            continue;
+        }
+
+        let kind = file_change_kind(change);
+        let new_path = file_change_move_path(change).unwrap_or(&path);
+        patch.push_str(&format!("diff --git a/{path} b/{new_path}\n"));
+        if new_path != path {
+            patch.push_str(&format!("rename from {path}\nrename to {new_path}\n"));
+        }
+        match kind.as_str() {
+            "add" => patch.push_str(&format!("--- /dev/null\n+++ b/{new_path}\n")),
+            "delete" => patch.push_str(&format!("--- a/{path}\n+++ /dev/null\n")),
+            _ => patch.push_str(&format!("--- a/{path}\n+++ b/{new_path}\n")),
+        }
+        if !is_hunk_diff(raw) && matches!(kind.as_str(), "add" | "delete") {
+            push_content_hunk(&mut patch, raw, kind == "add");
+            continue;
+        }
+        patch.push_str(raw.trim_end_matches(['\r', '\n']));
+        if !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+    }
+    if patch.is_empty() {
+        return None;
+    }
+    let path = match paths.as_slice() {
+        [path] => path.clone(),
+        _ => "workspace".to_owned(),
+    };
+    Some(zeron_proto::ToolDiff {
+        path,
+        old_text: None,
+        new_text: String::new(),
+        unified_diff: Some(patch),
+    })
+}
+
 pub(crate) fn item_type(item: &Value) -> &str {
     item.get("type").and_then(Value::as_str).unwrap_or("")
 }
@@ -341,28 +457,36 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
             }
         },
         "fileChange" | "file_change" => {
-            let changes: Vec<(String, String)> = item
+            let raw_changes: Vec<&Value> = item
                 .get("changes")
                 .and_then(Value::as_array)
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|c| {
-                    // Unknown kinds degrade to "update", like codex.ts.
-                    let kind = c
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .filter(|k| matches!(*k, "add" | "delete" | "update"))
-                        .unwrap_or("update");
-                    (str_field(c, &["path"]), kind.to_owned())
-                })
                 .collect();
-            tool_lifecycle(
-                phase,
-                id,
-                file_change_call(&changes),
-                status == "failed" || status == "declined",
-            )
+            let changes = raw_changes
+                .iter()
+                .map(|change| (str_field(change, &["path"]), file_change_kind(change)))
+                .collect::<Vec<_>>();
+            let call = file_change_call(&changes);
+            let is_error = status == "failed" || status == "declined";
+            match phase {
+                Phase::Started => vec![AgentEvent::ToolCall { id, call }],
+                Phase::Completed => vec![
+                    AgentEvent::ToolCall {
+                        id: id.clone(),
+                        call,
+                    },
+                    AgentEvent::ToolResult {
+                        id,
+                        is_error,
+                        output: None,
+                        diff: (!is_error)
+                            .then(|| file_change_diff(&raw_changes))
+                            .flatten(),
+                    },
+                ],
+            }
         }
         "mcpToolCall" | "mcp_tool_call" => match phase {
             Phase::Started => {
@@ -811,7 +935,9 @@ mod tests {
     fn file_change_variants_map_to_typed_calls() {
         let add = map_item(
             Phase::Started,
-            &json!({"type": "fileChange", "id": "f1", "changes": [{"path": "/a.rs", "kind": "add"}]}),
+            &json!({"type": "fileChange", "id": "f1", "changes": [{
+                "path": "/a.rs", "kind": {"type": "add"}, "diff": "@@ -0,0 +1 @@\n+new"
+            }]}),
         );
         assert_eq!(
             add,
@@ -850,7 +976,7 @@ mod tests {
         let multi = map_item(
             Phase::Started,
             &json!({"type": "fileChange", "id": "f3",
-                    "changes": [{"path": "/a"}, {"path": "/b", "kind": "delete"}]}),
+                    "changes": [{"path": "/a"}, {"path": "/b", "kind": {"type": "delete"}}]}),
         );
         assert_eq!(
             multi,
@@ -859,6 +985,148 @@ mod tests {
                 call: ToolCall::ApplyPatch { path: None },
             }]
         );
+    }
+
+    #[test]
+    fn successful_file_change_preserves_every_unified_diff() {
+        let events = map_item(
+            Phase::Completed,
+            &json!({
+                "type": "fileChange",
+                "id": "f4",
+                "status": "completed",
+                "changes": [
+                    {"path": "src/a.rs", "kind": {"type": "update"},
+                     "diff": "@@ -1 +1 @@\n-old\n+new"},
+                    {"path": "src/b.rs", "kind": {"type": "add"},
+                     "diff": "@@ -0,0 +1,2 @@\n+one\n+two"}
+                ]
+            }),
+        );
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall {
+                id,
+                call: ToolCall::ApplyPatch { path: None }
+            } if id == "f4"
+        ));
+        let AgentEvent::ToolResult {
+            is_error: false,
+            diff: Some(diff),
+            ..
+        } = &events[1]
+        else {
+            panic!("completed file change must carry its patch: {events:?}");
+        };
+        assert_eq!(diff.path, "workspace");
+        assert!(diff.old_text.is_none());
+        assert!(diff.new_text.is_empty());
+        let patch = diff.unified_diff.as_deref().unwrap();
+        assert!(patch.contains("diff --git a/src/a.rs b/src/a.rs"));
+        assert!(patch.contains("@@ -1 +1 @@\n-old\n+new"));
+        assert!(patch.contains("diff --git a/src/b.rs b/src/b.rs"));
+        assert!(patch.contains("--- /dev/null\n+++ b/src/b.rs"));
+        assert!(patch.contains("@@ -0,0 +1,2 @@\n+one\n+two"));
+    }
+
+    #[test]
+    fn file_change_full_content_add_and_delete_become_hunks() {
+        let events = map_item(
+            Phase::Completed,
+            &json!({
+                "type": "fileChange",
+                "id": "f5",
+                "status": "completed",
+                "changes": [
+                    {"path": "src/new.txt", "kind": {"type": "add"},
+                     "diff": "one\n+literal\n"},
+                    {"path": "src/old.txt", "kind": {"type": "delete"},
+                     "diff": "old\n-literal"}
+                ]
+            }),
+        );
+        let AgentEvent::ToolResult {
+            diff: Some(diff), ..
+        } = &events[1]
+        else {
+            panic!("completed file change must carry its patch: {events:?}");
+        };
+        let patch = diff.unified_diff.as_deref().unwrap();
+        assert!(
+            patch.contains("--- /dev/null\n+++ b/src/new.txt\n@@ -0,0 +1,2 @@\n+one\n++literal\n")
+        );
+        assert!(patch.contains(
+            "--- a/src/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n--literal\n\\ No newline at end of file\n"
+        ));
+    }
+
+    #[test]
+    fn successful_legacy_file_change_without_diff_keeps_none() {
+        let events = map_item(
+            Phase::Completed,
+            &json!({
+                "type": "fileChange",
+                "id": "legacy",
+                "status": "completed",
+                "changes": [{"path": "src/new.txt", "kind": "add"}]
+            }),
+        );
+        assert!(matches!(
+            &events[1],
+            AgentEvent::ToolResult {
+                id,
+                is_error: false,
+                diff: None,
+                ..
+            } if id == "legacy"
+        ));
+
+        let empty_file = map_item(
+            Phase::Completed,
+            &json!({
+                "type": "fileChange",
+                "id": "empty",
+                "status": "completed",
+                "changes": [{"path": "src/empty.txt", "kind": {"type": "add"}, "diff": ""}]
+            }),
+        );
+        let AgentEvent::ToolResult {
+            diff: Some(diff), ..
+        } = &empty_file[1]
+        else {
+            panic!("an explicit empty-file diff must be preserved: {empty_file:?}");
+        };
+        assert_eq!(
+            diff.unified_diff.as_deref(),
+            Some(
+                "diff --git a/src/empty.txt b/src/empty.txt\n--- /dev/null\n+++ b/src/empty.txt\n"
+            )
+        );
+    }
+
+    #[test]
+    fn file_change_full_git_patch_passes_through() {
+        let raw = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n+++ b/src/a.rs\n",
+            "@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let events = map_item(
+            Phase::Completed,
+            &json!({
+                "type": "fileChange",
+                "id": "full",
+                "status": "completed",
+                "changes": [{"path": "src/a.rs", "kind": {"type": "update"}, "diff": raw}]
+            }),
+        );
+        let AgentEvent::ToolResult {
+            diff: Some(diff), ..
+        } = &events[1]
+        else {
+            panic!("full git patch must be preserved: {events:?}");
+        };
+        assert_eq!(diff.unified_diff.as_deref(), Some(raw));
     }
 
     #[test]

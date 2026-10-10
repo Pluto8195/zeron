@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +44,7 @@ use gpui::{
 };
 use unicode_width::UnicodeWidthChar as _;
 
-use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
+use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit, SubmoduleDiffSummary};
 use zeron_rpc::methods;
 
 use crate::comments::{self, CommentSide, ReviewComment};
@@ -58,6 +59,73 @@ use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 use zeron_syntax::LanguageId as Lang;
+
+/// The chat/worktree identity a Changes surface was created for.
+///
+/// `chat_id` never changes. The remaining fields may be refreshed only from
+/// that chat's authoritative registry row; selecting another chat must never
+/// retarget a hidden or restored Changes surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangesTarget {
+    pub chat_id: String,
+    pub device_id: String,
+    pub cwd: Option<String>,
+    pub checkout_id: Option<String>,
+    pub branch: Option<String>,
+}
+
+impl ChangesTarget {
+    fn from_chat(chat: &Chat) -> Self {
+        Self {
+            chat_id: chat.id.clone(),
+            device_id: chat.device_id.clone(),
+            cwd: chat.cwd.clone(),
+            checkout_id: chat.checkout_id.clone(),
+            branch: chat.branch.clone(),
+        }
+    }
+
+    fn resolve<'a>(&self, diffs: &'a [CheckoutDiff]) -> Option<&'a CheckoutDiff> {
+        if let Some(checkout_id) = self.checkout_id.as_deref()
+            && let Some(diff) = diffs.iter().find(|diff| diff.checkout_id == checkout_id)
+        {
+            return Some(diff);
+        }
+        let cwd = self.cwd.as_deref()?;
+        diffs
+            .iter()
+            .find(|diff| diff.device_id == self.device_id && diff.cwd == cwd)
+    }
+
+    fn repo_and_worktree(&self) -> (String, String) {
+        let Some(cwd) = self.cwd.as_deref() else {
+            return ("Unknown repo".to_string(), "Unknown worktree".to_string());
+        };
+        let path = Path::new(cwd);
+        let worktree = path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .unwrap_or(cwd)
+            .to_string();
+        let parent = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|part| part.to_str());
+        let repo = if matches!(parent, Some(".worktrees" | "worktrees")) {
+            path.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|part| part.to_str())
+                .unwrap_or(&worktree)
+                .to_string()
+        } else {
+            // For an ordinary checkout the checkout folder is the repository
+            // name. Avoid claiming its containing projects folder is the repo.
+            worktree.clone()
+        };
+        (repo, worktree)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -825,8 +893,9 @@ pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
 // Resolution + states (pure)
 // ---------------------------------------------------------------------------
 
-/// The diff shown for a chat: `checkout_id` match first, then device+cwd,
-/// then cwd alone (§1.11).
+/// The diff shown for a chat: `checkout_id` match first, then exact
+/// device+cwd. Never fall across devices merely because two hosts expose the
+/// same path string.
 pub fn resolve_diff<'a>(diffs: &'a [CheckoutDiff], chat: &Chat) -> Option<&'a CheckoutDiff> {
     if let Some(checkout_id) = chat.checkout_id.as_deref()
         && let Some(diff) = diffs.iter().find(|d| d.checkout_id == checkout_id)
@@ -837,7 +906,6 @@ pub fn resolve_diff<'a>(diffs: &'a [CheckoutDiff], chat: &Chat) -> Option<&'a Ch
     diffs
         .iter()
         .find(|d| d.device_id == chat.device_id && d.cwd == cwd)
-        .or_else(|| diffs.iter().find(|d| d.cwd == cwd))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -855,6 +923,22 @@ pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
         Some(diff) if diff.patch.trim().is_empty() && diff.files.is_empty() => DiffPhase::Clean,
         Some(_) => DiffPhase::List,
     }
+}
+
+fn pane_diff_phase(
+    no_chat: bool,
+    pinned_checkout: bool,
+    resolved: Option<&CheckoutDiff>,
+) -> DiffPhase {
+    if no_chat && !pinned_checkout {
+        DiffPhase::Clean
+    } else {
+        diff_phase(resolved)
+    }
+}
+
+fn shows_scoped_error(no_chat: bool, pinned_checkout: bool, scope: DiffScope) -> bool {
+    (!no_chat || pinned_checkout) && (scope != DiffScope::WorkingTree || pinned_checkout)
 }
 
 /// Header label: "N Uncommitted change(s)".
@@ -894,9 +978,9 @@ impl DiffScope {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::WorkingTree => "Working tree",
-            Self::Branch => "Branch changes",
-            Self::LatestTurn => "Latest turn",
+            Self::WorkingTree => "All changes in this worktree",
+            Self::Branch => "Branch changes in this worktree",
+            Self::LatestTurn => "Checkout changes since this chat’s latest turn",
             Self::History => "History",
             Self::Commit => "Commit",
         }
@@ -993,6 +1077,30 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
             false
         }
     }
+}
+
+fn watch_checkout_params(
+    target: Option<&str>,
+    checkout_id: Option<&str>,
+    cwd: Option<&str>,
+) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    if let Some(target) = target {
+        params.insert(
+            "targetDeviceId".into(),
+            serde_json::Value::String(target.to_string()),
+        );
+    }
+    if let Some(checkout_id) = checkout_id {
+        params.insert(
+            "checkoutId".into(),
+            serde_json::Value::String(checkout_id.to_string()),
+        );
+    }
+    if let Some(cwd) = cwd {
+        params.insert("cwd".into(), serde_json::Value::String(cwd.to_string()));
+    }
+    serde_json::Value::Object(params)
 }
 
 fn comment_state_key(
@@ -1166,6 +1274,27 @@ fn full_highlights(
     Some(DiffHighlights { old, new })
 }
 
+fn file_diff_text_request(
+    diff: &CheckoutDiff,
+    origin: &FileOrigin,
+    mode: String,
+    base_ref: Option<String>,
+    chat_id: Option<String>,
+    commit_sha: Option<String>,
+) -> zeron_proto::GetCheckoutFileDiffTextRequest {
+    zeron_proto::GetCheckoutFileDiffTextRequest {
+        checkout_id: diff.checkout_id.clone(),
+        cwd: diff.cwd.clone(),
+        path: origin.repository_relative_path.clone(),
+        repository_path: origin.repository_path.clone(),
+        mode,
+        base_ref,
+        chat_id,
+        commit_sha,
+        diff_checksum: diff.checksum.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -1245,6 +1374,285 @@ struct ParsedDiff {
     /// Indexed like `files`; survives row virtualization and folding.
     horizontal: Vec<FileHorizontalState>,
     files: Arc<Vec<FileDiff>>,
+    origins: Arc<Vec<FileOrigin>>,
+    submodules: Arc<Vec<SubmoduleGroup>>,
+    layout: Arc<Vec<DiffTreeNode>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileOrigin {
+    repository_relative_path: String,
+    repository_path: Option<String>,
+    nesting_depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubmoduleGroup {
+    repository_path: String,
+    parent_repository_path: Option<String>,
+    old_revision: Option<String>,
+    new_revision: Option<String>,
+    additions: u32,
+    deletions: u32,
+    file_count: usize,
+    truncated: bool,
+    /// The parent gitlink's post-change SHA carried Git's `-dirty` suffix.
+    /// Expanded children replace that SHA row, so the group must retain it.
+    dirty: bool,
+    nesting_depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffTreeNode {
+    File(u32),
+    Submodule {
+        group: u32,
+        children: Vec<DiffTreeNode>,
+    },
+}
+
+fn nested_display_path(repository_path: &str, path: &str) -> String {
+    if path.is_empty() {
+        repository_path.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            repository_path.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+}
+
+fn submodule_local_path<'a>(
+    repository_path: &'a str,
+    parent_repository_path: Option<&str>,
+) -> Option<&'a str> {
+    match parent_repository_path {
+        None => Some(repository_path),
+        Some(parent) => repository_path.strip_prefix(parent)?.strip_prefix('/'),
+    }
+}
+
+fn gitlink_has_dirty_marker(file: &FileDiff) -> bool {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .any(|line| line.kind == LineKind::Add && line.text.trim_end().ends_with("-dirty"))
+}
+
+/// Parse root and nested patches into one file arena plus an ordered tree.
+/// Expanded group nodes replace their owning gitlink file; unavailable
+/// sections are deliberately ignored so the root SHA-only file remains.
+fn parse_diff_tree(
+    root_patch: &str,
+    submodules: &[SubmoduleDiffSummary],
+) -> (
+    Vec<FileDiff>,
+    Vec<FileOrigin>,
+    Vec<SubmoduleGroup>,
+    Vec<DiffTreeNode>,
+) {
+    let mut files = parse_patch(root_patch);
+    let mut origins = files
+        .iter()
+        .map(|file| FileOrigin {
+            repository_relative_path: file.path.clone(),
+            repository_path: None,
+            nesting_depth: 0,
+        })
+        .collect::<Vec<_>>();
+    let root_files = (0..files.len() as u32).collect::<Vec<_>>();
+    let mut repository_files: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut groups = Vec::new();
+
+    for section in submodules.iter().filter(|section| section.expanded) {
+        let section_files = parse_patch(&section.patch);
+        // An expanded section without renderable children must not replace
+        // the root/parent gitlink. This occurs when a combined payload is
+        // truncated before the nested patch arrives; the SHA transition is
+        // still the only useful fallback in that case.
+        if section_files.is_empty() {
+            continue;
+        }
+        let depth = {
+            let mut depth = 0usize;
+            let mut parent = section.parent_repository_path.as_deref();
+            let mut seen = std::collections::HashSet::new();
+            while let Some(path) = parent {
+                if !seen.insert(path) || depth >= 16 {
+                    break;
+                }
+                depth += 1;
+                parent = submodules
+                    .iter()
+                    .find(|candidate| candidate.repository_path == path)
+                    .and_then(|candidate| candidate.parent_repository_path.as_deref());
+            }
+            depth
+        };
+        let group_ix = groups.len() as u32;
+        groups.push(SubmoduleGroup {
+            repository_path: section.repository_path.clone(),
+            parent_repository_path: section.parent_repository_path.clone(),
+            old_revision: section.old_revision.clone(),
+            new_revision: section.new_revision.clone(),
+            additions: section.additions,
+            deletions: section.deletions,
+            file_count: section.files.len(),
+            truncated: section.truncated,
+            dirty: false,
+            nesting_depth: depth,
+        });
+
+        let mut indices = Vec::with_capacity(section_files.len());
+        for mut file in section_files {
+            let repository_relative_path = file.path.clone();
+            file.path = nested_display_path(&section.repository_path, &file.path);
+            file.old_path = file
+                .old_path
+                .take()
+                .map(|path| nested_display_path(&section.repository_path, &path));
+            indices.push(files.len() as u32);
+            files.push(file);
+            origins.push(FileOrigin {
+                repository_relative_path,
+                repository_path: Some(section.repository_path.clone()),
+                nesting_depth: depth + 1,
+            });
+        }
+        repository_files.insert(section.repository_path.clone(), indices);
+        debug_assert_eq!(group_ix as usize + 1, groups.len());
+    }
+
+    // Expanded groups replace their parent gitlink rows. Preserve the one
+    // extra state encoded only in those rows: Git's post-change `-dirty`
+    // suffix. This works recursively because nested section files share the
+    // same arena and carry their owning repository in `origins`.
+    for group in &mut groups {
+        let local_path = submodule_local_path(
+            &group.repository_path,
+            group.parent_repository_path.as_deref(),
+        );
+        let owner_files = match group.parent_repository_path.as_deref() {
+            None => Some(root_files.as_slice()),
+            Some(parent) => repository_files.get(parent).map(Vec::as_slice),
+        };
+        group.dirty = local_path
+            .zip(owner_files)
+            .and_then(|(local_path, owner_files)| {
+                owner_files.iter().find_map(|file_ix| {
+                    let ix = *file_ix as usize;
+                    (origins.get(ix)?.repository_relative_path == local_path)
+                        .then(|| files.get(ix))
+                        .flatten()
+                })
+            })
+            .is_some_and(gitlink_has_dirty_marker);
+    }
+
+    fn build_repository(
+        parent: Option<&str>,
+        file_indices: &[u32],
+        origins: &[FileOrigin],
+        groups: &[SubmoduleGroup],
+        repository_files: &HashMap<String, Vec<u32>>,
+        ancestors: &mut Vec<String>,
+    ) -> Vec<DiffTreeNode> {
+        let candidate_groups = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.parent_repository_path.as_deref() == parent)
+            .filter_map(|(ix, group)| {
+                submodule_local_path(&group.repository_path, parent)
+                    .map(|local| (local.to_string(), ix))
+            })
+            .collect::<Vec<_>>();
+        let mut used = std::collections::HashSet::new();
+        let mut nodes = Vec::new();
+        for &file_ix in file_indices {
+            let Some(origin) = origins.get(file_ix as usize) else {
+                continue;
+            };
+            let Some(group_ix) = candidate_groups.iter().find_map(|(path, group_ix)| {
+                (path == &origin.repository_relative_path).then_some(*group_ix)
+            }) else {
+                nodes.push(DiffTreeNode::File(file_ix));
+                continue;
+            };
+            let group = &groups[group_ix];
+            if ancestors.contains(&group.repository_path) {
+                nodes.push(DiffTreeNode::File(file_ix));
+                continue;
+            }
+            used.insert(group_ix);
+            ancestors.push(group.repository_path.clone());
+            let children = build_repository(
+                Some(&group.repository_path),
+                repository_files
+                    .get(&group.repository_path)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                origins,
+                groups,
+                repository_files,
+                ancestors,
+            );
+            ancestors.pop();
+            nodes.push(DiffTreeNode::Submodule {
+                group: group_ix as u32,
+                children,
+            });
+        }
+        // A truncated parent patch can omit the gitlink header while the
+        // structured section still arrived. Keep that section reachable.
+        for (_, group_ix) in candidate_groups {
+            if used.contains(&group_ix) {
+                continue;
+            }
+            let group = &groups[group_ix];
+            if ancestors.contains(&group.repository_path) {
+                continue;
+            }
+            ancestors.push(group.repository_path.clone());
+            let children = build_repository(
+                Some(&group.repository_path),
+                repository_files
+                    .get(&group.repository_path)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                origins,
+                groups,
+                repository_files,
+                ancestors,
+            );
+            ancestors.pop();
+            nodes.push(DiffTreeNode::Submodule {
+                group: group_ix as u32,
+                children,
+            });
+        }
+        nodes
+    }
+
+    let layout = build_repository(
+        None,
+        &root_files,
+        &origins,
+        &groups,
+        &repository_files,
+        &mut Vec::new(),
+    );
+    (files, origins, groups, layout)
+}
+
+fn logical_file_count(layout: &[DiffTreeNode]) -> usize {
+    layout
+        .iter()
+        .map(|node| match node {
+            DiffTreeNode::File(_) => 1,
+            DiffTreeNode::Submodule { children, .. } => logical_file_count(children),
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,6 +1667,9 @@ struct ParsedDiff {
 /// are measured by the list at the current pane width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffRow {
+    SubmoduleHeader {
+        group: u32,
+    },
     FileHeader {
         file: u32,
     },
@@ -1307,8 +1718,9 @@ pub enum DiffRow {
 }
 
 impl DiffRow {
-    fn file(self) -> usize {
+    fn file(self) -> Option<usize> {
         match self {
+            Self::SubmoduleHeader { .. } => None,
             Self::FileHeader { file }
             | Self::Notice { file, .. }
             | Self::HunkHeader { file, .. }
@@ -1317,7 +1729,7 @@ impl DiffRow {
             | Self::CommentCard { file, .. }
             | Self::CommentDraft { file }
             | Self::BodyPad { file }
-            | Self::FoldingBody { file } => file as usize,
+            | Self::FoldingBody { file } => Some(file as usize),
         }
     }
 
@@ -1325,6 +1737,7 @@ impl DiffRow {
     /// height sum.
     fn height(self, comments: &[ReviewComment], line_h: f32) -> f32 {
         match self {
+            DiffRow::SubmoduleHeader { .. } => FILE_HEADER_HEIGHT,
             DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
             DiffRow::Notice { .. } => NOTICE_HEIGHT,
             DiffRow::HunkHeader { .. } => HUNK_HEADER_HEIGHT,
@@ -1452,6 +1865,100 @@ pub fn flatten_rows(
     (rows, ranges)
 }
 
+fn flatten_diff_tree(
+    files: &[FileDiff],
+    groups: &[SubmoduleGroup],
+    layout: &[DiffTreeNode],
+    comments: &[ReviewComment],
+    draft: Option<(&str, CommentSide, u32)>,
+    mode: DiffMode,
+    mut file_collapsed: impl FnMut(usize) -> bool,
+    mut group_collapsed: impl FnMut(usize) -> bool,
+) -> (
+    Vec<DiffRow>,
+    Vec<Option<std::ops::Range<usize>>>,
+    Vec<usize>,
+) {
+    struct FlattenContext<'a, FC, GC> {
+        files: &'a [FileDiff],
+        groups: &'a [SubmoduleGroup],
+        comments: &'a [ReviewComment],
+        draft: Option<(&'a str, CommentSide, u32)>,
+        mode: DiffMode,
+        file_collapsed: &'a mut FC,
+        group_collapsed: &'a mut GC,
+        rows: Vec<DiffRow>,
+        ranges: Vec<Option<std::ops::Range<usize>>>,
+        section_headers: Vec<usize>,
+    }
+
+    impl<FC: FnMut(usize) -> bool, GC: FnMut(usize) -> bool> FlattenContext<'_, FC, GC> {
+        fn push_nodes(&mut self, nodes: &[DiffTreeNode]) {
+            for node in nodes {
+                match node {
+                    DiffTreeNode::File(file_ix) => {
+                        let file_ix = *file_ix as usize;
+                        let Some(file) = self.files.get(file_ix) else {
+                            continue;
+                        };
+                        let start = self.rows.len();
+                        self.section_headers.push(start);
+                        self.rows.push(DiffRow::FileHeader {
+                            file: file_ix as u32,
+                        });
+                        if !(self.file_collapsed)(file_ix) {
+                            let file_comments = self
+                                .comments
+                                .iter()
+                                .filter(|comment| !comment.is_file() && comment.path == file.path)
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let file_draft = self
+                                .draft
+                                .filter(|(path, _, _)| *path == file.path)
+                                .map(|(_, side, line)| (side, line));
+                            self.rows.extend(body_rows(
+                                file_ix as u32,
+                                file,
+                                &file_comments,
+                                file_draft,
+                                self.mode,
+                            ));
+                        }
+                        self.ranges[file_ix] = Some(start..self.rows.len());
+                    }
+                    DiffTreeNode::Submodule { group, children } => {
+                        let group_ix = *group as usize;
+                        if self.groups.get(group_ix).is_none() {
+                            continue;
+                        }
+                        self.section_headers.push(self.rows.len());
+                        self.rows.push(DiffRow::SubmoduleHeader { group: *group });
+                        if !(self.group_collapsed)(group_ix) {
+                            self.push_nodes(children);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut context = FlattenContext {
+        files,
+        groups,
+        comments,
+        draft,
+        mode,
+        file_collapsed: &mut file_collapsed,
+        group_collapsed: &mut group_collapsed,
+        rows: Vec::new(),
+        ranges: vec![None; files.len()],
+        section_headers: Vec::new(),
+    };
+    context.push_nodes(layout);
+    (context.rows, context.ranges, context.section_headers)
+}
+
 /// The file header that should remain visible for a logical list position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StickyFileHeader {
@@ -1465,25 +1972,30 @@ struct StickyFileHeader {
 /// This remains independent of the rendered list so folds and diff resets
 /// cannot leave a second, stale active-file state behind.
 fn sticky_file_header(
-    row_ranges: &[std::ops::Range<usize>],
+    row_ranges: &[Option<std::ops::Range<usize>>],
+    section_headers: &[usize],
     item_ix: usize,
     offset_in_item: f32,
 ) -> Option<StickyFileHeader> {
-    let file_ix = row_ranges
-        .partition_point(|range| range.start <= item_ix)
-        .checked_sub(1)?;
-    let range = row_ranges.get(file_ix)?;
+    let (file_ix, range) = row_ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(file_ix, range)| range.as_ref().map(|range| (file_ix, range)))
+        .find(|(_, range)| range.contains(&item_ix))?;
 
     // A reset can briefly leave ListState pointing past the replacement
     // model. Treat that frame as having no sticky header.
-    if !range.contains(&item_ix) || (item_ix == range.start && offset_in_item <= 0.0) {
+    if item_ix == range.start && offset_in_item <= 0.0 {
         return None;
     }
 
     Some(StickyFileHeader {
         file_ix,
         header_row: range.start,
-        next_header_row: row_ranges.get(file_ix + 1).map(|range| range.start),
+        next_header_row: section_headers
+            .iter()
+            .copied()
+            .find(|header| *header > range.start),
     })
 }
 
@@ -1637,6 +2149,9 @@ struct CommentDraft {
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
     state: Entity<AppState>,
+    /// Immutable owner identity plus the latest authoritative target for that
+    /// owner. This is deliberately independent of AppState's global selection.
+    owner: Option<ChangesTarget>,
     diffs: Vec<CheckoutDiff>,
     started: bool,
     error: Option<SharedString>,
@@ -1645,15 +2160,22 @@ pub struct Changes {
     /// carries the TARGET device's checkouts, so a selection change onto a
     /// chat hosted elsewhere tears the watch down and re-subscribes.
     watch_target: Option<String>,
+    /// Device + expected checkout identity + cwd for the running stream.
+    watch_for: Option<String>,
     watch_task: Option<Task<()>>,
     parsed: Option<ParsedDiff>,
     parse_task: Option<Task<()>>,
     folds: HashMap<String, FileFold>,
+    /// UI disclosure state for successfully expanded committed submodules.
+    /// Missing means open, matching ordinary files' expanded default.
+    submodule_folds: HashMap<String, bool>,
     highlights: HashMap<String, HighlightSlot>,
     /// The flattened row model the list virtualizes over (line granularity;
     /// collapsed bodies excluded) + each file's row span within it.
     rows: Vec<DiffRow>,
-    row_ranges: Vec<std::ops::Range<usize>>,
+    row_ranges: Vec<Option<std::ops::Range<usize>>>,
+    /// Ordered file and submodule headers; sticky file headers stop at either.
+    section_headers: Vec<usize>,
     /// Sweeps [`DiffRow::FoldingBody`] stand-ins back to steady-state rows
     /// once their tween window elapses.
     fold_settle: Option<Task<()>>,
@@ -1693,6 +2215,9 @@ pub struct Changes {
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
     /// the fetch and the surface-tab title).
     commit: Option<GitHistoryCommit>,
+    /// Checkout selected outside chat navigation (Repo Map close-out
+    /// inspection). Pinned panes must not silently follow the selected chat.
+    pinned_cwd: Option<String>,
     _observe: Subscription,
 }
 
@@ -1704,7 +2229,7 @@ pub enum ChangesEvent {
 
 impl gpui::EventEmitter<ChangesEvent> for Changes {}
 
-struct DiffHeaderTooltip(&'static str);
+struct DiffHeaderTooltip(SharedString);
 
 impl Render for DiffHeaderTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1719,30 +2244,72 @@ impl Render for DiffHeaderTooltip {
             .shadow_md()
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.0)
+            .child(self.0.clone())
     }
 }
 
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let owner = state
+            .read(cx)
+            .selected_chat_row()
+            .map(ChangesTarget::from_chat);
+        Self::with_owner(state, owner, cx)
+    }
+
+    /// Create a normal Changes surface owned by `chat_id`. This is the shell's
+    /// preferred constructor: ownership is captured before the tab is hidden
+    /// and survives global chat selection changes.
+    pub(crate) fn for_chat(
+        state: Entity<AppState>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let owner = state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(ChangesTarget::from_chat)
+            .or_else(|| {
+                Some(ChangesTarget {
+                    chat_id,
+                    device_id: String::new(),
+                    cwd: None,
+                    checkout_id: None,
+                    branch: None,
+                })
+            });
+        Self::with_owner(state, owner, cx)
+    }
+
+    fn with_owner(
+        state: Entity<AppState>,
+        owner: Option<ChangesTarget>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
         let settings = crate::settings::current(cx);
         let mode = DiffMode::from_split(settings.diff_split);
         Self {
             state,
+            owner,
             mode,
             wrap_lines: settings.diff_wrap,
             diffs: Vec::new(),
             started: false,
             error: None,
             watch_target: None,
+            watch_for: None,
             watch_task: None,
             parsed: None,
             parse_task: None,
             folds: HashMap::new(),
+            submodule_folds: HashMap::new(),
             highlights: HashMap::new(),
             rows: Vec::new(),
             row_ranges: Vec::new(),
+            section_headers: Vec::new(),
             fold_settle: None,
             // Rows are single lines now — a deep overdraw is cheap and keeps
             // fast wheel flicks from outrunning measurement.
@@ -1769,6 +2336,7 @@ impl Changes {
             history_view_button: None,
             history_events: None,
             commit: None,
+            pinned_cwd: None,
             _observe: observe,
         }
     }
@@ -1780,22 +2348,89 @@ impl Changes {
         commit: GitHistoryCommit,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut changes = Self::new(state, cx);
+        let owner = state
+            .read(cx)
+            .selected_chat_row()
+            .map(ChangesTarget::from_chat);
+        Self::for_commit_with_owner(state, commit, owner, None, cx)
+    }
+
+    pub(crate) fn for_commit_for_chat(
+        state: Entity<AppState>,
+        commit: GitHistoryCommit,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let owner = state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(ChangesTarget::from_chat);
+        Self::for_commit_with_owner(state, commit, owner, None, cx)
+    }
+
+    /// A commit diff pinned to an explicit checkout. Repo Map uses this for
+    /// unmatched worktrees and must not depend on the active chat's cwd.
+    pub fn for_commit_at_cwd(
+        state: Entity<AppState>,
+        commit: GitHistoryCommit,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_commit_with_owner(state, commit, None, cwd, cx)
+    }
+
+    fn for_commit_with_owner(
+        state: Entity<AppState>,
+        commit: GitHistoryCommit,
+        owner: Option<ChangesTarget>,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::with_owner(state, owner, cx);
         changes.scope = DiffScope::Commit;
         changes.commit = Some(commit);
+        changes.pinned_cwd = cwd;
+        changes
+    }
+
+    /// One-shot uncommitted diff for an explicit Repo Map checkout.
+    pub fn for_checkout(state: Entity<AppState>, cwd: String, cx: &mut Context<Self>) -> Self {
+        let mut changes = Self::with_owner(state, None, cx);
+        changes.scope = DiffScope::WorkingTree;
+        changes.pinned_cwd = Some(cwd);
         changes
     }
 
     /// A dedicated History surface. It shares the commit-opening event path
     /// with diffs, but is never offered as an item in a Diff tab's scope menu.
     pub fn for_history(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let mut changes = Self::new(state, cx);
+        let owner = state
+            .read(cx)
+            .selected_chat_row()
+            .map(ChangesTarget::from_chat);
+        let mut changes = Self::with_owner(state, owner, cx);
+        changes.scope = DiffScope::History;
+        changes
+    }
+
+    pub(crate) fn history_for_chat(
+        state: Entity<AppState>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::for_chat(state, chat_id, cx);
         changes.scope = DiffScope::History;
         changes
     }
 
     pub fn is_history(&self) -> bool {
         self.scope == DiffScope::History
+    }
+
+    pub(crate) fn owner_chat_id(&self) -> Option<&str> {
+        self.owner.as_ref().map(|owner| owner.chat_id.as_str())
     }
 
     /// The surface-tab title (contextual, user request): the pinned commit's
@@ -1811,14 +2446,68 @@ impl Changes {
         gpui::SharedString::from(self.scope.label())
     }
 
-    /// The selected chat's host device when it differs from the connected
+    /// Refresh only this surface's owning chat from the registry. A global
+    /// selection change is intentionally irrelevant. Returns true when the
+    /// authoritative worktree target changed.
+    fn sync_owner(&mut self, cx: &App) -> bool {
+        let Some(owner) = self.owner.as_ref() else {
+            return false;
+        };
+        let Some(chat) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == owner.chat_id)
+        else {
+            return false;
+        };
+        let next = ChangesTarget::from_chat(chat);
+        if self.owner.as_ref() == Some(&next) {
+            return false;
+        }
+        self.owner = Some(next);
+        self.diffs.clear();
+        self.parsed = None;
+        self.rows.clear();
+        self.row_ranges.clear();
+        self.section_headers.clear();
+        self.list.reset(0);
+        self.branches_for = None;
+        self.branches.clear();
+        self.scoped = None;
+        self.scoped_for = None;
+        self.scoped_inflight = None;
+        self.scoped_task = None;
+        self.error = None;
+        self.watch_task = None;
+        self.started = false;
+        self.watch_for = None;
+        true
+    }
+
+    fn owner_chat_id_owned(&self) -> Option<String> {
+        self.owner.as_ref().map(|owner| owner.chat_id.clone())
+    }
+
+    fn owner_branch(&self) -> Option<String> {
+        self.owner.as_ref().and_then(|owner| owner.branch.clone())
+    }
+
+    /// The owning chat's host device when it differs from the connected
     /// engine's own — diffs are produced where the checkout lives, so a
     /// remote chat's watch must relay-forward (`targetDeviceId`) to its host.
     /// Without this the local stream simply never carries the remote checkout
     /// and the pane sits on "Preparing diff…" forever (user report).
     fn desired_target(&self, cx: &App) -> Option<String> {
+        if self.pinned_cwd.is_some() {
+            return None;
+        }
         let state = self.state.read(cx);
-        let device = state.selected_chat_row()?.device_id.clone();
+        let device = self.owner.as_ref()?.device_id.clone();
+        if device.is_empty() {
+            return None;
+        }
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -1826,8 +2515,30 @@ impl Changes {
     /// Retries with a flat 2 s delay if the stream fails or ends; the last
     /// content stays visible under an error banner meanwhile.
     pub fn ensure_watch(&mut self, cx: &mut Context<Self>) {
+        if self.pinned_cwd.is_none()
+            && self.owner.as_ref().is_none_or(|owner| {
+                owner.device_id.is_empty()
+                    || (owner.checkout_id.is_none() && owner.cwd.as_deref().is_none())
+            })
+        {
+            return;
+        }
         let target = self.desired_target(cx);
-        if self.started && self.watch_target == target {
+        let checkout_id = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.checkout_id.clone());
+        let cwd = self
+            .pinned_cwd
+            .clone()
+            .or_else(|| self.owner.as_ref().and_then(|owner| owner.cwd.clone()));
+        let watch_for = format!(
+            "{}|{}|{}",
+            target.as_deref().unwrap_or("local"),
+            checkout_id.as_deref().unwrap_or(""),
+            cwd.as_deref().unwrap_or("")
+        );
+        if self.started && self.watch_for.as_deref() == Some(watch_for.as_str()) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1842,29 +2553,27 @@ impl Changes {
         }
         self.started = true;
         self.watch_target = target.clone();
-        self.watch_task = Some(Self::spawn_watch(engine, target, cx));
+        self.watch_for = Some(watch_for);
+        self.watch_task = Some(Self::spawn_watch(engine, target, checkout_id, cwd, cx));
     }
 
     fn spawn_watch(
         engine: EngineHandle,
         target: Option<String>,
+        checkout_id: Option<String>,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let mut params = serde_json::Map::new();
-                if let Some(target) = &target {
-                    params.insert(
-                        "targetDeviceId".into(),
-                        serde_json::Value::String(target.clone()),
-                    );
-                }
+                let params = watch_checkout_params(
+                    target.as_deref(),
+                    checkout_id.as_deref(),
+                    cwd.as_deref(),
+                );
                 let subscribed = engine
                     .client()
-                    .subscribe(
-                        methods::WATCH_CHECKOUT_DIFFS,
-                        serde_json::Value::Object(params),
-                    )
+                    .subscribe_checked(methods::WATCH_CHECKOUT_DIFFS, params)
                     .await;
                 match subscribed {
                     Ok(mut rx) => {
@@ -1909,25 +2618,33 @@ impl Changes {
         })
     }
 
-    fn resolved(&self, cx: &App) -> Option<CheckoutDiff> {
-        let state = self.state.read(cx);
-        let chat = state.selected_chat_row()?;
-        resolve_diff(&self.diffs, chat).cloned()
+    fn resolved(&self, _cx: &App) -> Option<CheckoutDiff> {
+        if self.pinned_cwd.is_some() {
+            // A pinned watch is server-scoped by canonical cwd, so its frame
+            // can contain at most the intended checkout. This snapshot drives
+            // one-shot refreshes without consulting global chat selection.
+            return self.diffs.first().cloned();
+        }
+        self.owner.as_ref()?.resolve(&self.diffs).cloned()
     }
 
     /// The checkout root the scoped RPCs address: the watch-resolved diff's
     /// canonical cwd when available, else the chat row's own.
     fn scoped_cwd(&self, cx: &App) -> Option<String> {
+        if let Some(cwd) = &self.pinned_cwd {
+            return Some(cwd.clone());
+        }
         if let Some(diff) = self.resolved(cx) {
             return Some(diff.cwd);
         }
-        self.state.read(cx).selected_chat_row()?.cwd.clone()
+        self.owner.as_ref()?.cwd.clone()
     }
 
     /// The diff the pane currently displays: the watch stream for the working
     /// tree, the one-shot scoped capture otherwise.
     fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
         match self.scope {
+            DiffScope::WorkingTree if self.pinned_cwd.is_some() => self.scoped.clone(),
             DiffScope::WorkingTree => self.resolved(cx),
             DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
             DiffScope::History => None,
@@ -1966,7 +2683,16 @@ impl Changes {
             return;
         };
         let target = self.desired_target(cx);
-        let key = format!("{}:{}", target.as_deref().unwrap_or("local"), cwd);
+        let checkout_id = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.checkout_id.clone());
+        let key = format!(
+            "{}:{}:{}",
+            target.as_deref().unwrap_or("local"),
+            checkout_id.as_deref().unwrap_or(""),
+            cwd
+        );
         if self.branches_for.as_deref() == Some(key.as_str()) {
             return;
         }
@@ -1977,6 +2703,9 @@ impl Changes {
         self.branches_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("repoPath".into(), serde_json::Value::String(cwd));
+            if let Some(checkout_id) = checkout_id {
+                params.insert("checkoutId".into(), serde_json::Value::String(checkout_id));
+            }
             if let Some(target) = target {
                 params.insert("targetDeviceId".into(), serde_json::Value::String(target));
             }
@@ -1997,11 +2726,7 @@ impl Changes {
                             .as_ref()
                             .is_some_and(|base| changes.branches.contains(base));
                         if !keep {
-                            let current = changes
-                                .state
-                                .read(cx)
-                                .selected_chat_row()
-                                .and_then(|chat| chat.branch.clone());
+                            let current = changes.owner_branch();
                             changes.base_ref =
                                 default_base_ref(&changes.branches, current.as_deref());
                         }
@@ -2026,19 +2751,17 @@ impl Changes {
     /// checksum-only refresh keeps the old diff visible until the new one
     /// lands.
     fn ensure_scoped(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.scope, DiffScope::WorkingTree | DiffScope::History) {
+        if self.scope == DiffScope::History
+            || (self.scope == DiffScope::WorkingTree && self.pinned_cwd.is_none())
+        {
             self.scoped_inflight = None;
             self.scoped_task = None;
             return;
         }
-        let Some(chat_id) = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .map(|chat| chat.id.clone())
-        else {
+        let chat_id = self.owner_chat_id_owned();
+        if self.scope == DiffScope::LatestTurn && chat_id.is_none() {
             return;
-        };
+        }
         let Some(cwd) = self.scoped_cwd(cx) else {
             return;
         };
@@ -2057,10 +2780,15 @@ impl Changes {
             _ => None,
         };
         let target = self.desired_target(cx);
+        let checkout_id = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.checkout_id.clone());
         let context = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             target.as_deref().unwrap_or("local"),
-            chat_id,
+            chat_id.as_deref().unwrap_or(""),
+            checkout_id.as_deref().unwrap_or(""),
             cwd,
             self.scope.mode(),
             base.as_deref().unwrap_or(""),
@@ -2089,8 +2817,13 @@ impl Changes {
         self.scoped_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("cwd".into(), serde_json::Value::String(cwd));
+            if let Some(checkout_id) = checkout_id {
+                params.insert("checkoutId".into(), serde_json::Value::String(checkout_id));
+            }
             params.insert("mode".into(), serde_json::Value::String(mode.to_string()));
-            params.insert("chatId".into(), serde_json::Value::String(chat_id));
+            if let Some(chat_id) = chat_id {
+                params.insert("chatId".into(), serde_json::Value::String(chat_id));
+            }
             if let Some(base) = base {
                 params.insert("baseRef".into(), serde_json::Value::String(base));
             }
@@ -2158,7 +2891,12 @@ impl Changes {
         if let Some(history) = &self.history {
             return history.clone();
         }
-        let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
+        let state = self.state.clone();
+        let owner_chat_id = self.owner_chat_id_owned();
+        let history = cx.new(|cx| match owner_chat_id {
+            Some(chat_id) => GitHistory::for_chat(state, chat_id, cx),
+            None => GitHistory::new(state, cx),
+        });
         self.history_events =
             Some(
                 cx.subscribe(&history, |this: &mut Self, _, event, cx| match event {
@@ -2246,16 +2984,19 @@ impl Changes {
 
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_owner(cx);
         self.discard_stale_draft(cx);
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
-        self.ensure_watch(cx);
+        if self.pinned_cwd.is_none() {
+            self.ensure_watch(cx);
+        }
         if self.scope == DiffScope::History {
             self.history_pane(cx)
                 .update(cx, |history, cx| history.ensure_loaded(cx));
             return;
         }
-        if self.scope != DiffScope::Commit {
+        if self.scope != DiffScope::Commit && self.pinned_cwd.is_none() {
             self.ensure_branches(cx);
         }
         self.ensure_scoped(cx);
@@ -2263,8 +3004,10 @@ impl Changes {
             if self.parsed.take().is_some() {
                 self.rows.clear();
                 self.row_ranges.clear();
+                self.section_headers.clear();
                 self.list.reset(0);
                 self.folds.clear();
+                self.submodule_folds.clear();
                 self.highlights.clear();
                 cx.notify();
             }
@@ -2281,10 +3024,11 @@ impl Changes {
         let additions = diff.additions;
         let deletions = diff.deletions;
         let file_count = diff.files.len();
+        let submodules = diff.submodules.clone();
         self.parse_task = Some(cx.spawn(async move |this, cx| {
-            let files = cx
+            let (files, origins, submodules, layout) = cx
                 .background_executor()
-                .spawn(async move { parse_patch(&patch) })
+                .spawn(async move { parse_diff_tree(&patch, &submodules) })
                 .await;
             this.update(cx, |changes, cx| {
                 // Late results for a superseded diff are re-checked by key.
@@ -2292,23 +3036,30 @@ impl Changes {
                 if current.as_deref() != Some(key.as_str()) {
                     return;
                 }
-                let file_count = if file_count > 0 {
+                let logical_count = logical_file_count(&layout);
+                let file_count = if logical_count > 0 {
+                    logical_count
+                } else if file_count > 0 {
                     file_count
                 } else {
                     files.len()
                 };
                 let horizontal = files.iter().map(FileHorizontalState::new).collect();
                 changes.folds.clear();
+                changes.submodule_folds.clear();
                 changes.highlights.clear();
                 let staged = changes.staged_comments(cx);
                 let draft = changes.draft_anchor();
-                let (rows, ranges) = flatten_rows(
+                let (rows, ranges, section_headers) = flatten_diff_tree(
                     &files,
+                    &submodules,
+                    &layout,
                     &staged,
                     draft
                         .as_ref()
                         .map(|(path, side, line)| (path.as_str(), *side, *line)),
                     changes.mode,
+                    |_| false,
                     |_| false,
                 );
                 changes.comment_key = comment_state_key(&staged, draft.as_ref());
@@ -2321,6 +3072,7 @@ impl Changes {
                     .reset_with_uniform_height(rows.len(), row_height);
                 changes.rows = rows;
                 changes.row_ranges = ranges;
+                changes.section_headers = section_headers;
                 changes.parsed = Some(ParsedDiff {
                     key,
                     truncated,
@@ -2329,6 +3081,9 @@ impl Changes {
                     file_count,
                     horizontal,
                     files: Arc::new(files),
+                    origins: Arc::new(origins),
+                    submodules: Arc::new(submodules),
+                    layout: Arc::new(layout),
                 });
                 cx.notify();
             })
@@ -2341,7 +3096,7 @@ impl Changes {
     /// `splice` shifts the logical scroll anchor by the count delta, so
     /// content below the fold stays put.
     fn replace_file_body(&mut self, file_ix: usize, new_body: Vec<DiffRow>) {
-        let Some(range) = self.row_ranges.get(file_ix).cloned() else {
+        let Some(range) = self.row_ranges.get(file_ix).and_then(Clone::clone) else {
             return;
         };
         let body = range.start + 1..range.end;
@@ -2371,9 +3126,23 @@ impl Changes {
         let mid: Vec<DiffRow> = new_body[prefix..new_body.len() - suffix].to_vec();
         self.list.splice(changed.clone(), mid.len());
         self.rows.splice(changed, mid);
-        self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
-        for r in &mut self.row_ranges[file_ix + 1..] {
-            *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
+        self.row_ranges[file_ix] = Some(range.start..(range.end as isize + delta) as usize);
+        for (ix, range) in self.row_ranges.iter_mut().enumerate() {
+            if ix == file_ix {
+                continue;
+            }
+            let Some(range) = range else {
+                continue;
+            };
+            if range.start >= body.end {
+                *range =
+                    (range.start as isize + delta) as usize..(range.end as isize + delta) as usize;
+            }
+        }
+        for header in &mut self.section_headers {
+            if *header >= body.end {
+                *header = (*header as isize + delta) as usize;
+            }
         }
     }
 
@@ -2441,6 +3210,23 @@ impl Changes {
         self.ensure_fold_settle(cx);
     }
 
+    fn toggle_submodule(&mut self, group_ix: usize, cx: &mut Context<Self>) {
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let Some(group) = parsed.submodules.get(group_ix) else {
+            return;
+        };
+        let collapsed = !self
+            .submodule_folds
+            .get(&group.repository_path)
+            .copied()
+            .unwrap_or(false);
+        self.submodule_folds
+            .insert(group.repository_path.clone(), collapsed);
+        self.reflatten(cx);
+    }
+
     /// Keep a sweep alive while any [`DiffRow::FoldingBody`] stand-ins
     /// remain; each tick settles the ones whose tween window has elapsed.
     fn ensure_fold_settle(&mut self, cx: &mut Context<Self>) {
@@ -2471,7 +3257,9 @@ impl Changes {
         let files = parsed.files.clone();
         let mut pending = false;
         for file_ix in (0..self.row_ranges.len()).rev() {
-            let range = &self.row_ranges[file_ix];
+            let Some(range) = &self.row_ranges[file_ix] else {
+                continue;
+            };
             let folding = self.rows.get(range.start + 1)
                 == Some(&DiffRow::FoldingBody {
                     file: file_ix as u32,
@@ -2509,12 +3297,28 @@ impl Changes {
         let Some(parsed) = &self.parsed else {
             return false;
         };
-        !parsed.files.is_empty()
-            && parsed.files.iter().all(|file| {
-                self.folds
-                    .get(&file.path)
-                    .is_some_and(|fold| fold.collapsed)
-            })
+        let visible_files = self
+            .row_ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, range)| range.as_ref().map(|_| ix))
+            .collect::<Vec<_>>();
+        let files_collapsed = visible_files.is_empty()
+            || visible_files.into_iter().all(|ix| {
+                parsed.files.get(ix).is_some_and(|file| {
+                    self.folds
+                        .get(&file.path)
+                        .is_some_and(|fold| fold.collapsed)
+                })
+            });
+        let groups_collapsed = parsed.submodules.is_empty()
+            || parsed.submodules.iter().all(|group| {
+                self.submodule_folds
+                    .get(&group.repository_path)
+                    .copied()
+                    .unwrap_or(false)
+            });
+        files_collapsed && groups_collapsed
     }
 
     /// Collapse every file section, or expand them all when everything is
@@ -2529,15 +3333,26 @@ impl Changes {
         };
         let collapse = !self.all_collapsed();
         let files = parsed.files.clone();
+        let groups = parsed.submodules.clone();
         for file in files.iter() {
             let fold = self.folds.entry(file.path.clone()).or_default();
             fold.collapsed = collapse;
             fold.toggled_at = None;
         }
+        for group in groups.iter() {
+            self.submodule_folds
+                .insert(group.repository_path.clone(), collapse);
+        }
+        if !groups.is_empty() {
+            self.reflatten(cx);
+            return;
+        }
         let staged = self.staged_comments(cx);
         let draft = self.draft_anchor();
         for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
-            let range = &self.row_ranges[file_ix];
+            let Some(range) = &self.row_ranges[file_ix] else {
+                continue;
+            };
             let body = range.start + 1..range.end;
             let new_len = if collapse {
                 0
@@ -2571,7 +3386,12 @@ impl Changes {
             |_| collapse,
         );
         self.rows = rows;
-        self.row_ranges = ranges;
+        self.row_ranges = ranges.into_iter().map(Some).collect();
+        self.section_headers = self
+            .row_ranges
+            .iter()
+            .filter_map(|range| range.as_ref().map(|range| range.start))
+            .collect();
         cx.notify();
     }
 
@@ -2624,11 +3444,17 @@ impl Changes {
             return;
         };
         let files = parsed.files.clone();
+        let groups = parsed.submodules.clone();
+        let layout = parsed.layout.clone();
         let top = self.list.logical_scroll_top().item_ix;
         let anchor_file = self
             .row_ranges
             .iter()
-            .position(|range| range.contains(&top));
+            .position(|range| range.as_ref().is_some_and(|range| range.contains(&top)));
+        let anchor_group = self.rows.get(top).and_then(|row| match row {
+            DiffRow::SubmoduleHeader { group } => Some(*group as usize),
+            _ => None,
+        });
         let collapsed: Vec<bool> = files
             .iter()
             .map(|file| {
@@ -2639,23 +3465,46 @@ impl Changes {
             .collect();
         let staged = self.staged_comments(cx);
         let draft = self.draft_anchor();
-        let (rows, ranges) = flatten_rows(
+        let group_collapsed = groups
+            .iter()
+            .map(|group| {
+                self.submodule_folds
+                    .get(&group.repository_path)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let (rows, ranges, section_headers) = flatten_diff_tree(
             &files,
+            &groups,
+            &layout,
             &staged,
             draft
                 .as_ref()
                 .map(|(path, side, line)| (path.as_str(), *side, *line)),
             self.mode,
             |ix| collapsed.get(ix).copied().unwrap_or(false),
+            |ix| group_collapsed.get(ix).copied().unwrap_or(false),
         );
         let row_height = px(diff_line_height(Theme::of(cx)));
         self.list.reset_with_uniform_height(rows.len(), row_height);
         self.rows = rows;
         self.row_ranges = ranges;
-        if let Some(start) = anchor_file
+        self.section_headers = section_headers;
+        let anchor = anchor_file
             .and_then(|ix| self.row_ranges.get(ix))
-            .map(|r| r.start)
-        {
+            .and_then(|range| range.as_ref())
+            .map(|range| range.start)
+            .or_else(|| {
+                anchor_group.and_then(|group| {
+                    self.rows.iter().position(|row| {
+                        *row == DiffRow::SubmoduleHeader {
+                            group: group as u32,
+                        }
+                    })
+                })
+            });
+        if let Some(start) = anchor {
             self.list.scroll_to_reveal_item(start);
         }
         cx.notify();
@@ -2663,9 +3512,20 @@ impl Changes {
 
     /// Cloned because rendering borrows `self` mutably a moment later.
     fn staged_comments(&self, cx: &App) -> Vec<ReviewComment> {
+        // Explicit-checkout panes are read-only inspection surfaces. They may
+        // represent an unmatched worktree, so the selected chat's composer
+        // key is unrelated and must never leak comments into this diff.
+        if self.pinned_cwd.is_some() {
+            return Vec::new();
+        }
+        let key = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.chat_id.as_str())
+            .unwrap_or("");
         let state = self.state.read(cx);
         state
-            .review_comments(&state.composer_key())
+            .review_comments(key)
             .iter()
             .filter(|comment| {
                 self.draft
@@ -2699,7 +3559,11 @@ impl Changes {
     /// swaps both the diff under it and the composer it would stage onto, so
     /// the half-written note is dropped rather than following the user across.
     fn discard_stale_draft(&mut self, cx: &mut Context<Self>) {
-        let key = self.state.read(cx).composer_key();
+        let key = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.chat_id.clone())
+            .unwrap_or_default();
         if self.draft.as_ref().is_some_and(|draft| draft.key != key) {
             self.draft = None;
             self.sync_comment_rows(cx);
@@ -2736,6 +3600,9 @@ impl Changes {
         };
         let files = parsed.files.clone();
         for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
+            let Some(range) = self.row_ranges[file_ix].clone() else {
+                continue;
+            };
             let file = &files[file_ix];
             // A mid-tween stand-in is the settle sweep's to replace.
             if self
@@ -2745,7 +3612,6 @@ impl Changes {
             {
                 continue;
             }
-            let range = &self.row_ranges[file_ix];
             if self.rows.get(range.start + 1)
                 == Some(&DiffRow::FoldingBody {
                     file: file_ix as u32,
@@ -2776,6 +3642,12 @@ impl Changes {
         anchor: Option<(CommentSide, u32)>,
         cx: &mut Context<Self>,
     ) {
+        if self.pinned_cwd.is_some() {
+            if self.hover.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         let next = anchor.map(|(side, line)| HoverRow {
             path: path.to_string(),
             side,
@@ -2808,6 +3680,9 @@ impl Changes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pinned_cwd.is_some() {
+            return;
+        }
         let input = cx.new(|cx| ComposerInput::new("Request a change…", cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.commit_draft(cx),
@@ -2815,7 +3690,7 @@ impl Changes {
             _ => {}
         });
         let handle = input.read(cx).focus_handle(cx);
-        let key = self.state.read(cx).composer_key();
+        let key = self.owner_chat_id_owned().unwrap_or_default();
         let old_path = self.old_path_of(&path);
         self.draft = Some(CommentDraft {
             editing_id: None,
@@ -2833,9 +3708,10 @@ impl Changes {
     }
 
     fn edit_comment(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.owner_chat_id_owned().unwrap_or_default();
         let state = self.state.read(cx);
         let Some(comment) = state
-            .review_comments(&state.composer_key())
+            .review_comments(&key)
             .iter()
             .find(|comment| comment.id == id && !comment.is_file())
             .cloned()
@@ -2893,8 +3769,8 @@ impl Changes {
     }
 
     fn remove_comment(&mut self, id: &str, cx: &mut Context<Self>) {
+        let key = self.owner_chat_id_owned().unwrap_or_default();
         self.state.update(cx, |state, cx| {
-            let key = state.composer_key();
             state.remove_review_comment(&key, id);
             cx.notify();
         });
@@ -3017,6 +3893,7 @@ impl Changes {
     fn request_highlight(
         &mut self,
         file: &FileDiff,
+        origin: &FileOrigin,
         parsed_key: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
@@ -3045,6 +3922,7 @@ impl Changes {
             return None;
         }
         let path = file.path.clone();
+        let fetch_origin = origin.clone();
         let excerpt_file = file.clone();
         let excerpt_path = path.clone();
         let excerpt_task = cx.spawn(async move |this, cx| {
@@ -3070,11 +3948,7 @@ impl Changes {
         let active = self.active_diff(cx);
         let engine = self.state.read(cx).engine().cloned();
         let target = self.desired_target(cx);
-        let chat_id = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .map(|chat| chat.id.clone());
+        let chat_id = self.owner_chat_id_owned();
         let mode = self.scope.mode().to_string();
         let base_ref = self.base_ref.clone();
         let commit_sha = (self.scope == DiffScope::Commit)
@@ -3084,16 +3958,14 @@ impl Changes {
         let fetch_path = path.clone();
         let fetch_task = match (active, engine) {
             (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
-                let request = zeron_proto::GetCheckoutFileDiffTextRequest {
-                    checkout_id: diff.checkout_id,
-                    cwd: diff.cwd,
-                    path: fetch_path.clone(),
+                let request = file_diff_text_request(
+                    &diff,
+                    &fetch_origin,
                     mode,
                     base_ref,
                     chat_id,
                     commit_sha,
-                    diff_checksum: diff.checksum,
-                };
+                );
                 let mut params = serde_json::to_value(request)
                     .ok()
                     .and_then(|value| value.as_object().cloned())
@@ -3154,16 +4026,34 @@ impl Changes {
             return gpui::Empty.into_any_element();
         };
         let files = parsed.files.clone();
+        let origins = parsed.origins.clone();
+        let submodules = parsed.submodules.clone();
         let parsed_key = parsed.key.clone();
         let Some(row) = self.rows.get(ix).copied() else {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
+        if let DiffRow::SubmoduleHeader { group } = row {
+            let group_ix = group as usize;
+            let Some(group) = submodules.get(group_ix) else {
+                return gpui::Empty.into_any_element();
+            };
+            let collapsed = self
+                .submodule_folds
+                .get(&group.repository_path)
+                .copied()
+                .unwrap_or(false);
+            return self.render_submodule_header(group_ix, group, collapsed, &theme, cx);
+        }
+        let Some(file_ix) = row.file() else {
+            return gpui::Empty.into_any_element();
+        };
         let highlight = files
-            .get(row.file())
-            .and_then(|file| self.request_highlight(file, &parsed_key, cx));
-        let horizontal = &self.parsed.as_ref().unwrap().horizontal[row.file()];
-        let code_width = match files.get(row.file()) {
+            .get(file_ix)
+            .zip(origins.get(file_ix))
+            .and_then(|(file, origin)| self.request_highlight(file, origin, &parsed_key, cx));
+        let horizontal = &self.parsed.as_ref().unwrap().horizontal[file_ix];
+        let code_width = match files.get(file_ix) {
             Some(file) if !self.wrap_lines => DiffCodeWidth::Scrollable(horizontal.metrics(
                 file,
                 highlight.as_ref(),
@@ -3178,6 +4068,7 @@ impl Changes {
             prefix: SharedString::from(format!("changes-code-row-{ix}")),
         };
         match row {
+            DiffRow::SubmoduleHeader { .. } => gpui::Empty.into_any_element(),
             DiffRow::FileHeader { file } => {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
@@ -3186,6 +4077,10 @@ impl Changes {
                 self.render_file_header(
                     file as usize,
                     file_diff,
+                    origins
+                        .get(file as usize)
+                        .map(|origin| origin.nesting_depth)
+                        .unwrap_or(0),
                     &fold,
                     FileHeaderPresentation::Row,
                     &theme,
@@ -3438,10 +4333,139 @@ impl Changes {
         }
     }
 
+    fn render_submodule_header(
+        &mut self,
+        group_ix: usize,
+        group: &SubmoduleGroup,
+        collapsed: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let repository_path = group.repository_path.clone();
+        let revision = match (&group.old_revision, &group.new_revision) {
+            (Some(old), Some(new)) => Some(format!(
+                "{} → {}",
+                &old[..old.len().min(7)],
+                &new[..new.len().min(7)]
+            )),
+            _ => None,
+        };
+        let left_pad = Theme::SPACE_MD + group.nesting_depth as f32 * 16.0;
+        div()
+            .id(("submodule-hdr", group_ix))
+            .w_full()
+            .h(px(FILE_HEADER_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .pl(px(left_pad))
+            .pr(px(Theme::SPACE_MD))
+            .bg(theme.ink(0.025))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.ink(0.05)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_submodule(group_ix, cx);
+            }))
+            .child(
+                crate::icons::icon(if collapsed {
+                    crate::icons::ALT_ARROW_RIGHT
+                } else {
+                    crate::icons::ALT_ARROW_DOWN
+                })
+                .size(px(13.0))
+                .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
+                crate::file_icons::icon(
+                    crate::file_icons::FileIconIdentity::directory(&repository_path, false),
+                    theme.appearance,
+                )
+                .size(px(14.0))
+                .flex_none(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(12.0))
+                    .text_color(theme.text_dim)
+                    .child(SharedString::from(repository_path)),
+            )
+            .when_some(revision, |el, revision| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(revision)),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!(
+                        "{} {}",
+                        group.file_count,
+                        if group.file_count == 1 {
+                            "file"
+                        } else {
+                            "files"
+                        }
+                    ))),
+            )
+            .when(group.truncated, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.0))
+                        .text_color(theme.warning.opacity(0.8))
+                        .child("PARTIAL"),
+                )
+            })
+            .when(group.dirty, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.0))
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(3.0))
+                        .bg(theme.warning.opacity(0.08))
+                        .text_color(theme.warning.opacity(0.85))
+                        .child("DIRTY"),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(add_color(theme))
+                    .child(SharedString::from(format!("+{}", group.additions))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(del_color(theme))
+                    .child(SharedString::from(format!("−{}", group.deletions))),
+            )
+            .into_any_element()
+    }
+
     fn render_file_header(
         &mut self,
         ix: usize,
         file: &FileDiff,
+        nesting_depth: usize,
         fold: &FileFold,
         presentation: FileHeaderPresentation,
         theme: &Theme,
@@ -3515,7 +4539,8 @@ impl Changes {
             .flex_row()
             .items_center()
             .gap(px(8.0))
-            .px(px(Theme::SPACE_MD))
+            .pl(px(Theme::SPACE_MD + nesting_depth as f32 * 16.0))
+            .pr(px(Theme::SPACE_MD))
             .bg(rest_bg)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
@@ -3582,6 +4607,7 @@ impl Changes {
         let scroll_top = self.list.logical_scroll_top();
         let sticky = sticky_file_header(
             &self.row_ranges,
+            &self.section_headers,
             scroll_top.item_ix,
             scroll_top.offset_in_item.as_f32(),
         )?;
@@ -3592,6 +4618,7 @@ impl Changes {
             })
         );
         let files = self.parsed.as_ref()?.files.clone();
+        let origins = self.parsed.as_ref()?.origins.clone();
         let file = files.get(sticky.file_ix)?;
         let fold = self.folds.get(&file.path).copied().unwrap_or_default();
         let next_header_y = sticky.next_header_row.and_then(|row| {
@@ -3603,6 +4630,10 @@ impl Changes {
         let header = self.render_file_header(
             sticky.file_ix,
             file,
+            origins
+                .get(sticky.file_ix)
+                .map(|origin| origin.nesting_depth)
+                .unwrap_or(0),
             &fold,
             FileHeaderPresentation::Sticky,
             theme,
@@ -3716,7 +4747,10 @@ impl Changes {
             cx.stop_propagation();
             this.toggle_wrap(cx);
         }))
-        .tooltip(|_, cx| cx.new(|_| DiffHeaderTooltip("Wrap long lines")).into())
+        .tooltip(|_, cx| {
+            cx.new(|_| DiffHeaderTooltip("Wrap long lines".into()))
+                .into()
+        })
         .tooltip_show_delay(Duration::from_millis(350))
         .into_any_element()
     }
@@ -3774,14 +4808,39 @@ impl Changes {
                 )
                 .into_any_element();
         }
+        // Repo Map inspection is deliberately pinned to one checkout. Do not
+        // expose the normal scope menu, which would imply it can follow the
+        // currently selected chat or latest-turn state.
+        if self.pinned_cwd.is_some() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(crate::surface_chrome::CONTROL_GAP))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(theme.text)
+                        .child("Uncommitted changes"),
+                )
+                .child(self.split_toggle(&theme, cx))
+                .child(self.wrap_toggle(&theme, cx))
+                .child(
+                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_collapse_all(cx);
+                        })),
+                )
+                .into_any_element();
+        }
         let scope = self.scope;
-        let history_branch = (scope == DiffScope::History).then(|| {
-            self.state
-                .read(cx)
-                .selected_chat_row()
-                .and_then(|chat| chat.branch.clone())
-                .unwrap_or_else(|| "HEAD".to_string())
-        });
+        let history_branch = (scope == DiffScope::History)
+            .then(|| self.owner_branch().unwrap_or_else(|| "HEAD".to_string()));
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
         let history_search_control =
             (scope == DiffScope::History).then(|| self.history_search_control(cx));
@@ -3793,7 +4852,9 @@ impl Changes {
             .id("changes-scope-trigger")
             .h(px(crate::surface_chrome::CONTROL_SIZE))
             .px(px(8.0))
-            .flex_none()
+            .max_w(px(250.0))
+            .min_w_0()
+            .flex_shrink(1.0)
             .flex()
             .flex_row()
             .items_center()
@@ -3825,6 +4886,8 @@ impl Changes {
             }))
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_size(px(12.0))
                     .line_height(px(14.0))
                     .text_color(theme.text)
@@ -3939,7 +5002,7 @@ impl Changes {
         let theme = &theme.for_popup();
         let current = self.scope;
         popover::popover_card(theme)
-            .w(px(180.0))
+            .w(px(310.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
             .child(
                 // The 2px row gap every other menu carries — rows straight on
@@ -3970,12 +5033,7 @@ impl Changes {
         if self.scope != DiffScope::Branch {
             return None;
         }
-        let branch = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|chat| chat.branch.clone())
-            .unwrap_or_else(|| "HEAD".to_string());
+        let branch = self.owner_branch().unwrap_or_else(|| "HEAD".to_string());
         let base = self.base_ref.clone().unwrap_or_else(|| "…".to_string());
         // Even truncation: taffy shrinks flex items ∝ factor × basis, and the
         // default factor of 1 splits the deficit proportionally to content —
@@ -4219,6 +5277,91 @@ impl Changes {
                             .child(SharedString::from("Partial snapshot")),
                     )
                 })
+                .into_any_element(),
+        )
+    }
+
+    fn context_details(&self, cx: &App) -> Option<(String, String, String, String)> {
+        let (repo, worktree, branch, path) = if let Some(owner) = &self.owner {
+            let (repo, worktree) = owner.repo_and_worktree();
+            (
+                repo,
+                worktree,
+                owner.branch.clone().unwrap_or_else(|| "HEAD".to_string()),
+                owner
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| "Path unavailable".to_string()),
+            )
+        } else if let Some(cwd) = &self.pinned_cwd {
+            let target = ChangesTarget {
+                chat_id: String::new(),
+                device_id: String::new(),
+                cwd: Some(cwd.clone()),
+                checkout_id: None,
+                branch: None,
+            };
+            let (repo, worktree) = target.repo_and_worktree();
+            (repo, worktree, "HEAD".to_string(), cwd.clone())
+        } else {
+            return None;
+        };
+        let freshness = self
+            .active_diff(cx)
+            .map(|diff| {
+                format!(
+                    "Snapshot age {}",
+                    crate::state::format_time_ago(diff.updated_at, chrono::Utc::now())
+                )
+            })
+            .unwrap_or_else(|| "Snapshot pending".to_string());
+        Some((repo, worktree, branch, format!("{path}\n{freshness}")))
+    }
+
+    fn render_context_chrome(&self, theme: &Theme, cx: &App) -> Option<AnyElement> {
+        let (repo, worktree, branch, tooltip) = self.context_details(cx)?;
+        let freshness = tooltip
+            .rsplit_once('\n')
+            .map(|(_, freshness)| freshness)
+            .unwrap_or("Snapshot pending")
+            .to_string();
+        Some(
+            div()
+                .id("changes-context-chrome")
+                .flex_none()
+                .h(px(30.0))
+                .px(px(Theme::SPACE_LG))
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.06))
+                .bg(crate::theme::wash(0.025))
+                .tooltip(move |_, cx| cx.new(|_| DiffHeaderTooltip(tooltip.clone().into())).into())
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(format!("{repo} / {worktree}"))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(10.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(branch)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(freshness)),
+                )
                 .into_any_element(),
         )
     }
@@ -4856,7 +5999,14 @@ impl Render for Changes {
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
-            return div().size_full().child(history).into_any_element();
+            let theme = Theme::of(cx).clone();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .children(self.render_context_chrome(&theme, cx))
+                .child(history)
+                .into_any_element();
         }
         let theme = Theme::of(cx).clone();
         let active = self.active_diff(cx);
@@ -4864,21 +6014,25 @@ impl Render for Changes {
         let base = self.base_ref.clone();
         // With no session selected (new-chat canvas) there is nothing to
         // prepare — show the quiet empty state, not an endless spinner.
-        let no_chat = self.state.read(cx).selected_chat_row().is_none();
-        let phase = if no_chat {
-            DiffPhase::Clean
-        } else {
-            diff_phase(active.as_ref())
-        };
-        let error = self.error.clone();
+        let no_chat = self.owner.is_none() && self.pinned_cwd.is_none();
+        let pinned = self.pinned_cwd.is_some();
+        let phase = pane_diff_phase(no_chat, pinned, active.as_ref());
+        let error = self.error.clone().map(|message| {
+            if active.is_some() {
+                SharedString::from(format!(
+                    "{message} — showing the last snapshot for this worktree"
+                ))
+            } else {
+                message
+            }
+        });
         // Scoped fetch failures replace the content area. "no turn recorded"
         // is the expected pre-first-turn state, not an error; "unknown
         // method" is version skew — the chat's host engine predates
         // GetCheckoutDiff (a still-running daemon after an app update, or a
         // remote device behind on releases) — say that instead of leaking
         // the raw RPC error (user report).
-        let scoped_notice: Option<(SharedString, bool)> = (!no_chat
-            && scope != DiffScope::WorkingTree)
+        let scoped_notice: Option<(SharedString, bool)> = shows_scoped_error(no_chat, pinned, scope)
             .then(|| self.scoped_error.clone())
             .flatten()
             .map(|message| {
@@ -4996,6 +6150,7 @@ impl Render for Changes {
             // Changes is a code-adjacent surface: chrome stays Geist while
             // paths, hunks, gutters, and source runs keep their mono overrides.
             .font_family(theme.font_sans_fixed.clone())
+            .children(self.render_context_chrome(&theme, cx))
             .when_some(error, |el, message| {
                 el.child(
                     div()
@@ -5218,6 +6373,152 @@ rename to new_name.rs
         assert_eq!(parse_hunk_header("@@ garbage"), None);
     }
 
+    fn submodule(expanded: bool, patch: &str) -> SubmoduleDiffSummary {
+        SubmoduleDiffSummary {
+            repository_path: "vendor/lib".into(),
+            parent_repository_path: None,
+            old_revision: Some("111111111111".into()),
+            new_revision: Some("222222222222".into()),
+            expanded,
+            patch: patch.into(),
+            files: vec![
+                zeron_proto::DiffFileSummary {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    additions: 1,
+                    deletions: 1,
+                    binary: false,
+                },
+                zeron_proto::DiffFileSummary {
+                    path: "README.md".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    additions: 1,
+                    deletions: 0,
+                    binary: false,
+                },
+            ],
+            additions: 2,
+            deletions: 1,
+            truncated: false,
+        }
+    }
+
+    const ROOT_WITH_GITLINK: &str = "\
+diff --git a/vendor/lib b/vendor/lib
+index 1111111..2222222 160000
+--- a/vendor/lib
++++ b/vendor/lib
+@@ -1 +1 @@
+-Subproject commit 111111111111
++Subproject commit 222222222222
+diff --git a/root.txt b/root.txt
+@@ -1 +1 @@
+-old
++new
+";
+
+    const NESTED_PATCH: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/README.md b/README.md
+@@ -0,0 +1 @@
++nested
+";
+
+    const ROOT_WITH_DIRTY_GITLINK: &str = "\
+diff --git a/vendor/lib b/vendor/lib
+index 1111111..2222222 160000
+--- a/vendor/lib
++++ b/vendor/lib
+@@ -1 +1 @@
+-Subproject commit 111111111111
++Subproject commit 222222222222-dirty
+";
+
+    #[test]
+    fn expanded_submodule_replaces_gitlink_with_group_and_nested_files() {
+        let (files, origins, groups, layout) =
+            parse_diff_tree(ROOT_WITH_GITLINK, &[submodule(true, NESTED_PATCH)]);
+        assert_eq!(groups.len(), 1);
+        assert!(!groups[0].dirty);
+        assert_eq!(logical_file_count(&layout), 3);
+        assert!(matches!(
+            layout[0],
+            DiffTreeNode::Submodule { group: 0, .. }
+        ));
+        assert_eq!(files[1].path, "root.txt");
+        assert_eq!(files[2].path, "vendor/lib/src/lib.rs");
+        assert_eq!(origins[2].repository_path.as_deref(), Some("vendor/lib"));
+        assert_eq!(origins[2].repository_relative_path, "src/lib.rs");
+
+        let (rows, ranges, headers) = flatten_diff_tree(
+            &files,
+            &groups,
+            &layout,
+            &[],
+            None,
+            DiffMode::Unified,
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(rows[0], DiffRow::SubmoduleHeader { group: 0 });
+        assert!(ranges[0].is_none(), "root gitlink must be hidden");
+        assert!(ranges[2].is_some());
+        assert!(ranges[3].is_some());
+        assert_eq!(headers[0], 0);
+
+        let (collapsed_rows, collapsed_ranges, _) = flatten_diff_tree(
+            &files,
+            &groups,
+            &layout,
+            &[],
+            None,
+            DiffMode::Unified,
+            |_| false,
+            |_| true,
+        );
+        assert_eq!(collapsed_rows[0], DiffRow::SubmoduleHeader { group: 0 });
+        assert!(collapsed_ranges[2].is_none());
+        assert!(collapsed_ranges[3].is_none());
+        assert!(collapsed_ranges[1].is_some(), "ordinary root file remains");
+    }
+
+    #[test]
+    fn expanded_submodule_preserves_dirty_parent_gitlink_marker() {
+        let (_, _, clean_groups, _) =
+            parse_diff_tree(ROOT_WITH_GITLINK, &[submodule(true, NESTED_PATCH)]);
+        let (_, _, dirty_groups, dirty_layout) =
+            parse_diff_tree(ROOT_WITH_DIRTY_GITLINK, &[submodule(true, NESTED_PATCH)]);
+
+        assert!(!clean_groups[0].dirty);
+        assert!(dirty_groups[0].dirty);
+        assert!(matches!(
+            dirty_layout.first(),
+            Some(DiffTreeNode::Submodule { group: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn unavailable_or_empty_submodule_keeps_sha_only_gitlink_fallback() {
+        for section in [submodule(false, NESTED_PATCH), submodule(true, "")] {
+            let (files, _, groups, layout) = parse_diff_tree(ROOT_WITH_GITLINK, &[section]);
+            assert!(groups.is_empty());
+            assert_eq!(layout.first(), Some(&DiffTreeNode::File(0)));
+            assert_eq!(files[0].path, "vendor/lib");
+            assert!(
+                files[0]
+                    .hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.lines)
+                    .any(|line| line.text.contains("Subproject commit"))
+            );
+        }
+    }
+
     #[test]
     fn rows_flatten_to_line_granularity() {
         let files = parse_patch(PATCH);
@@ -5259,12 +6560,13 @@ rename to new_name.rs
 
     #[test]
     fn sticky_header_tracks_the_logical_top_row() {
-        let ranges = vec![0..4, 4..5, 5..10];
+        let ranges = vec![Some(0..4), Some(4..5), Some(5..10)];
+        let headers = vec![0, 4, 5];
 
-        assert_eq!(sticky_file_header(&[], 0, 0.0), None);
-        assert_eq!(sticky_file_header(&ranges, 0, 0.0), None);
+        assert_eq!(sticky_file_header(&[], &[], 0, 0.0), None);
+        assert_eq!(sticky_file_header(&ranges, &headers, 0, 0.0), None);
         assert_eq!(
-            sticky_file_header(&ranges, 0, 0.5),
+            sticky_file_header(&ranges, &headers, 0, 0.5),
             Some(StickyFileHeader {
                 file_ix: 0,
                 header_row: 0,
@@ -5272,7 +6574,7 @@ rename to new_name.rs
             })
         );
         assert_eq!(
-            sticky_file_header(&ranges, 2, 0.0),
+            sticky_file_header(&ranges, &headers, 2, 0.0),
             Some(StickyFileHeader {
                 file_ix: 0,
                 header_row: 0,
@@ -5282,25 +6584,41 @@ rename to new_name.rs
 
         // Landing exactly on a new header hands ownership to that file; its
         // real row remains visible until it starts crossing the viewport.
-        assert_eq!(sticky_file_header(&ranges, 4, 0.0), None);
+        assert_eq!(sticky_file_header(&ranges, &headers, 4, 0.0), None);
         assert_eq!(
-            sticky_file_header(&ranges, 4, 1.0),
+            sticky_file_header(&ranges, &headers, 4, 1.0),
             Some(StickyFileHeader {
                 file_ix: 1,
                 header_row: 4,
                 next_header_row: Some(5),
             })
         );
-        assert_eq!(sticky_file_header(&ranges, 5, 0.0), None);
+        assert_eq!(sticky_file_header(&ranges, &headers, 5, 0.0), None);
         assert_eq!(
-            sticky_file_header(&ranges, 8, 0.0),
+            sticky_file_header(&ranges, &headers, 8, 0.0),
             Some(StickyFileHeader {
                 file_ix: 2,
                 header_row: 5,
                 next_header_row: None,
             })
         );
-        assert_eq!(sticky_file_header(&ranges, 10, 0.0), None);
+        assert_eq!(sticky_file_header(&ranges, &headers, 10, 0.0), None);
+
+        // A submodule header between file sections pushes the previous sticky
+        // file even though it has no file range of its own.
+        let grouped_ranges = vec![Some(0..4), Some(5..9)];
+        assert_eq!(
+            sticky_file_header(&grouped_ranges, &[0, 4, 5], 2, 0.0),
+            Some(StickyFileHeader {
+                file_ix: 0,
+                header_row: 0,
+                next_header_row: Some(4),
+            })
+        );
+        assert_eq!(
+            sticky_file_header(&grouped_ranges, &[0, 4, 5], 4, 0.0),
+            None
+        );
     }
 
     #[test]
@@ -5837,18 +7155,18 @@ rename to new_name.rs
             right: Some(1),
         };
         let first = DiffCodeScrollContext {
-            handle: states[row.file()].scroll.clone(),
+            handle: states[row.file().unwrap()].scroll.clone(),
             prefix: "first".into(),
         };
         let second = DiffCodeScrollContext {
-            handle: states[split.file()].scroll.clone(),
+            handle: states[split.file().unwrap()].scroll.clone(),
             prefix: "second".into(),
         };
         first
             .slot("unified")
             .handle
             .set_offset(gpui::Point::new(px(-96.0), px(0.0)));
-        assert_eq!(states[folding.file()].scroll.offset().x, px(-96.0));
+        assert_eq!(states[folding.file().unwrap()].scroll.offset().x, px(-96.0));
         assert_eq!(second.slot("old").handle.offset(), gpui::Point::default());
 
         second
@@ -5908,6 +7226,7 @@ rename to new_name.rs
             cwd: cwd.into(),
             patch: patch.into(),
             files: Vec::new(),
+            submodules: Vec::new(),
             additions: 0,
             deletions: 0,
             truncated: false,
@@ -5944,6 +7263,27 @@ rename to new_name.rs
     }
 
     #[test]
+    fn nested_highlight_request_uses_repository_and_local_path() {
+        let diff = diff("co", "dev", "/workspace", ROOT_WITH_GITLINK);
+        let origin = FileOrigin {
+            repository_relative_path: "src/lib.rs".into(),
+            repository_path: Some("vendor/lib".into()),
+            nesting_depth: 1,
+        };
+        let request = file_diff_text_request(
+            &diff,
+            &origin,
+            "branch".into(),
+            Some("main".into()),
+            Some("chat".into()),
+            None,
+        );
+        assert_eq!(request.path, "src/lib.rs");
+        assert_eq!(request.repository_path.as_deref(), Some("vendor/lib"));
+        assert_eq!(request.diff_checksum, diff.checksum);
+    }
+
+    #[test]
     fn diff_resolution_prefers_checkout_id_then_cwd() {
         let diffs = vec![
             diff("co-1", "dev-a", "/repo/one", "x"),
@@ -5955,14 +7295,125 @@ rename to new_name.rs
         // Unknown checkout falls back to device+cwd.
         let c = chat(Some("co-9"), "dev-a", Some("/repo/one"));
         assert_eq!(resolve_diff(&diffs, &c).unwrap().checkout_id, "co-1");
-        // Wrong device still matches by cwd alone.
+        // A matching path on another device is never accepted.
         let c = chat(None, "dev-z", Some("/repo/two"));
-        assert_eq!(resolve_diff(&diffs, &c).unwrap().checkout_id, "co-2");
+        assert!(resolve_diff(&diffs, &c).is_none());
         // Nothing to go on.
         let c = chat(None, "dev-a", None);
         assert!(resolve_diff(&diffs, &c).is_none());
         let c = chat(None, "dev-a", Some("/elsewhere"));
         assert!(resolve_diff(&diffs, &c).is_none());
+    }
+
+    #[test]
+    fn owned_target_never_falls_across_devices_or_worktrees() {
+        let diffs = vec![
+            diff("co-a", "device-a", "/repo/shared", "a"),
+            diff("co-b", "device-b", "/repo/shared", "b"),
+        ];
+        let target = ChangesTarget {
+            chat_id: "chat-a".into(),
+            device_id: "device-a".into(),
+            cwd: Some("/repo/shared".into()),
+            checkout_id: None,
+            branch: Some("feature/a".into()),
+        };
+        assert_eq!(target.resolve(&diffs).unwrap().checkout_id, "co-a");
+
+        let target = ChangesTarget {
+            chat_id: "chat-b".into(),
+            device_id: "device-b".into(),
+            cwd: Some("/repo/shared".into()),
+            checkout_id: Some("co-b".into()),
+            branch: Some("feature/b".into()),
+        };
+        assert_eq!(target.resolve(&diffs).unwrap().patch, "b");
+    }
+
+    #[test]
+    fn watch_request_scopes_to_expected_checkout_and_cwd() {
+        let params =
+            watch_checkout_params(Some("remote-device"), Some("checkout-a"), Some("/repo/a"));
+        assert_eq!(params["targetDeviceId"], "remote-device");
+        assert_eq!(params["checkoutId"], "checkout-a");
+        assert_eq!(params["cwd"], "/repo/a");
+    }
+
+    #[test]
+    fn scope_labels_describe_actual_worktree_and_turn_boundaries() {
+        assert_eq!(
+            DiffScope::WorkingTree.label(),
+            "All changes in this worktree"
+        );
+        assert_eq!(
+            DiffScope::LatestTurn.label(),
+            "Checkout changes since this chat’s latest turn"
+        );
+    }
+
+    #[test]
+    fn context_names_are_derived_from_the_owned_path() {
+        let target = ChangesTarget {
+            chat_id: "chat".into(),
+            device_id: "device".into(),
+            cwd: Some("/projects/zeron/.worktrees/feature-123".into()),
+            checkout_id: Some("checkout".into()),
+            branch: Some("feature/123".into()),
+        };
+        assert_eq!(
+            target.repo_and_worktree(),
+            ("zeron".into(), "feature-123".into())
+        );
+    }
+
+    #[gpui::test]
+    fn changes_surface_follows_only_its_owning_chat(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                let mut first = chat(Some("checkout-a"), "device", Some("/repo/a"));
+                first.id = "chat-a".into();
+                first.branch = Some("branch-a".into());
+                let mut second = chat(Some("checkout-b"), "device", Some("/repo/b"));
+                second.id = "chat-b".into();
+                state.chats = vec![first, second];
+                state.selected_chat = Some("chat-a".into());
+                state
+            });
+            Changes::for_chat(state, "chat-a".into(), cx)
+        });
+        window
+            .update(cx, |changes, _, cx| {
+                changes.state.update(cx, |state, cx| {
+                    state.selected_chat = Some("chat-b".into());
+                    cx.notify();
+                });
+                changes.sync(cx);
+                assert_eq!(changes.owner_chat_id(), Some("chat-a"));
+                assert_eq!(changes.scoped_cwd(cx).as_deref(), Some("/repo/a"));
+
+                changes.state.update(cx, |state, cx| {
+                    let chat = state
+                        .chats
+                        .iter_mut()
+                        .find(|chat| chat.id == "chat-a")
+                        .unwrap();
+                    chat.cwd = Some("/repo/a-updated".into());
+                    chat.checkout_id = Some("checkout-a-updated".into());
+                    cx.notify();
+                });
+                changes.sync(cx);
+                assert_eq!(changes.scoped_cwd(cx).as_deref(), Some("/repo/a-updated"));
+                assert_eq!(
+                    changes.owner.as_ref().unwrap().checkout_id.as_deref(),
+                    Some("checkout-a-updated")
+                );
+            })
+            .unwrap();
     }
 
     #[test]
@@ -5983,6 +7434,14 @@ rename to new_name.rs
             binary: false,
         });
         assert_eq!(diff_phase(Some(&summarized)), DiffPhase::List);
+
+        // A route-independent close-out inspector still waits for its scoped
+        // RPC when there is no selected chat; an ordinary empty canvas does
+        // not spin forever.
+        assert_eq!(pane_diff_phase(true, true, None), DiffPhase::Preparing);
+        assert_eq!(pane_diff_phase(true, false, None), DiffPhase::Clean);
+        assert!(shows_scoped_error(true, true, DiffScope::WorkingTree));
+        assert!(!shows_scoped_error(true, false, DiffScope::WorkingTree));
     }
 
     #[test]

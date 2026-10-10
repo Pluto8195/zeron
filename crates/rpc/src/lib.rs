@@ -229,6 +229,12 @@ pub mod methods {
     /// time — never re-parses the transcript. IPC-only, same reason as its
     /// sibling external-import methods.
     pub const CHAT_CLASSIFICATION: &str = "ChatClassification";
+    /// Persist or clear a user override for one chat's task category.
+    /// `{chatId, category}` where `category` is one of the seven known
+    /// categories, or `null` to return to automatic classification. Returns
+    /// the same payload as [`CHAT_CLASSIFICATION`]. Device-local because the
+    /// classification sidecars/cursors are device-local.
+    pub const SET_CHAT_CLASSIFICATION: &str = "SetChatClassification";
     /// User-triggered re-run of the Jev-first classification on every
     /// imported chat currently labeled `other` (ignores version/source stamps
     /// and the boot pass's inconclusive park; capped at 50 Jev calls). No
@@ -301,8 +307,9 @@ pub mod methods {
     /// `{chatId, repoPath, name}` → `{worktreePath, branch}`, or a structured
     /// error (nested-under-a-submodule, path-already-exists, not-a-git-repo,
     /// etc). Also stamps the chat row's `cwd` to the new worktree path
-    /// (`WorkspaceHost::set_chat_cwd`, the same durable field `SetChatCwd`/
-    /// `Mutate` writes) so the chat's next dispatch runs there automatically.
+    /// (an atomic cwd + checkout-id target write, the same durable fields
+    /// `SetChatCwd`/`Mutate` reconciles) so the chat's next dispatch runs there
+    /// automatically.
     /// IPC-only: device-local filesystem + git state.
     pub const CREATE_CHAT_WORKTREE: &str = "CreateChatWorktree";
     /// Read-only close-out inspection of a chat's agent worktree: `{chatId,
@@ -335,6 +342,10 @@ pub mod methods {
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
+    /// Optional `{checkoutId?, cwd?}` scopes the stream to one canonical
+    /// checkout; when both are supplied the host rejects a mismatch. The
+    /// payload remains an array for compatibility. Null/empty params retain
+    /// the legacy all-checkouts stream.
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     pub const WATCH_WORKSPACE_GIT_STATUS: &str = "WatchWorkspaceGitStatus";
     /// Current pull request for one checkout, resolved on the checkout's host device.
@@ -453,6 +464,7 @@ mod tests {
     #[test]
     fn reclassify_other_chats_wire_name_is_pinned() {
         assert_eq!(methods::RECLASSIFY_OTHER_CHATS, "ReclassifyOtherChats");
+        assert_eq!(methods::SET_CHAT_CLASSIFICATION, "SetChatClassification");
     }
 
     struct TestService;

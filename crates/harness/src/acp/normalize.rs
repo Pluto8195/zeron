@@ -88,6 +88,7 @@ fn tool_diff(update: &Value) -> Option<ToolDiff> {
             diff.get("newText").and_then(Value::as_str).unwrap_or(""),
             DIFF_TEXT_CAP,
         ),
+        unified_diff: None,
     })
 }
 
@@ -600,6 +601,7 @@ mod tests {
                     path: "/w/src/main.rs".into(),
                     old_text: Some("fn old() {}".into()),
                     new_text: "fn new() {}".into(),
+                    unified_diff: None,
                 }),
             }
         );

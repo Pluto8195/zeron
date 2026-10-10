@@ -799,6 +799,34 @@ pub struct DiffFileSummary {
     pub binary: bool,
 }
 
+/// A committed gitlink movement expanded inside one initialized submodule.
+///
+/// `patch` and `files` are relative to this nested repository. Recursive
+/// submodules are emitted as additional flat sections linked by
+/// `parent_repository_path`, keeping file identities unambiguous without
+/// teaching older clients about nested paths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmoduleDiffSummary {
+    /// Checkout-root-relative path of the initialized nested repository.
+    pub repository_path: String,
+    /// Checkout-root-relative containing repository, absent for direct children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_repository_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_revision: Option<String>,
+    /// False preserves the parent gitlink's SHA-only fallback when expansion is
+    /// unavailable or unsafe.
+    pub expanded: bool,
+    pub patch: String,
+    pub files: Vec<DiffFileSummary>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub truncated: bool,
+}
+
 /// Git porcelain states, independent of patch size and line counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -852,6 +880,8 @@ pub struct CheckoutDiff {
     pub cwd: String,
     pub patch: String,
     pub files: Vec<DiffFileSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submodules: Vec<SubmoduleDiffSummary>,
     pub additions: u32,
     pub deletions: u32,
     /// True when the patch was truncated at the byte cap ("Partial snapshot").
@@ -903,6 +933,10 @@ pub struct GetCheckoutFileDiffTextRequest {
     pub checkout_id: String,
     pub cwd: String,
     pub path: String,
+    /// Checkout-root-relative nested repository. Absent selects the parent
+    /// checkout and preserves the original RPC contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_path: Option<String>,
     #[serde(default)]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1326,6 +1360,7 @@ mod tests {
             checkout_id: "checkout".into(),
             cwd: "/repo".into(),
             path: "src/lib.rs".into(),
+            repository_path: Some("deps/nested".into()),
             mode: "branch".into(),
             base_ref: Some("main".into()),
             chat_id: None,
@@ -1336,9 +1371,23 @@ mod tests {
         assert_eq!(value["checkoutId"], "checkout");
         assert_eq!(value["diffChecksum"], "abc");
         assert_eq!(value["commitSha"], "deadbeef");
+        assert_eq!(value["repositoryPath"], "deps/nested");
         assert_eq!(
             serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
             request
+        );
+
+        let legacy = serde_json::json!({
+            "checkoutId": "checkout",
+            "cwd": "/repo",
+            "path": "src/lib.rs",
+            "diffChecksum": "abc"
+        });
+        assert_eq!(
+            serde_json::from_value::<GetCheckoutFileDiffTextRequest>(legacy)
+                .unwrap()
+                .repository_path,
+            None
         );
     }
 

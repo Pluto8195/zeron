@@ -256,6 +256,8 @@ async fn plan_chat_closeout_reply_has_exactly_the_pinned_wire_fields() {
             "dirtyInspectionError",
             "isWorktree",
             "mergeInspectionError",
+            "sharedChats",
+            "unmergedCommitDetails",
             "unmergedCommits",
             "worktreePath"
         ]
@@ -268,8 +270,10 @@ async fn plan_chat_closeout_reply_has_exactly_the_pinned_wire_fields() {
     assert_eq!(reply["dirtyFiles"], serde_json::json!(["scratch.txt"]));
     assert_eq!(reply["dirtyInspectionError"], serde_json::Value::Null);
     assert_eq!(reply["unmergedCommits"], serde_json::json!(0));
+    assert_eq!(reply["unmergedCommitDetails"], serde_json::json!([]));
     assert_eq!(reply["mergeInspectionError"], serde_json::Value::Null);
     assert_eq!(reply["defaultBranch"], serde_json::json!("main"));
+    assert_eq!(reply["sharedChats"], serde_json::json!([]));
 
     // The RPC is chat-bound: it must not inspect an arbitrary path supplied
     // for a chat whose stored cwd points at a different worktree.
@@ -395,13 +399,32 @@ async fn repo_map_can_close_an_unmatched_registered_worktree_without_a_marker() 
         )
         .await
         .expect("create owner chat");
-    let error = client
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({"op": "renameChat", "chatId": CHAT, "title": "Owner chat"}),
+        )
+        .await
+        .expect("rename owner chat");
+    let plan = client
         .call(
             zeron_rpc::methods::PLAN_CHAT_CLOSEOUT,
             serde_json::json!({"cwd": wt.to_string_lossy()}),
         )
         .await
-        .expect_err("open chat ownership blocks unmatched close-out");
+        .expect("planning exposes open chat ownership");
+    assert_eq!(
+        plan["sharedChats"],
+        serde_json::json!([{"id": CHAT, "title": "Owner chat"}])
+    );
+
+    let error = client
+        .call(
+            zeron_rpc::methods::CLOSE_CHAT_WORKTREE,
+            serde_json::json!({"cwd": wt.to_string_lossy(), "force": true}),
+        )
+        .await
+        .expect_err("open chat ownership blocks close-out");
     assert!(error.to_string().contains("used by 1 open chat"), "{error}");
 
     client
@@ -411,6 +434,14 @@ async fn repo_map_can_close_an_unmatched_registered_worktree_without_a_marker() 
         )
         .await
         .expect("archive owner chat");
+    let plan = client
+        .call(
+            zeron_rpc::methods::PLAN_CHAT_CLOSEOUT,
+            serde_json::json!({"cwd": wt.to_string_lossy()}),
+        )
+        .await
+        .expect("archived chat no longer blocks planning");
+    assert_eq!(plan["sharedChats"], serde_json::json!([]));
     let reply = client
         .call(
             zeron_rpc::methods::CLOSE_CHAT_WORKTREE,

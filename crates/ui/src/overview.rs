@@ -27,9 +27,9 @@
 //! Tile size follows context-window occupancy, like `session_canvas.html`'s
 //! `tileSize`: each chat's `CHAT_CONTEXT_USAGE` fraction (fetched lazily per
 //! visible row by `ensure_context_usage`) maps to a main-tile width of
-//! 160..=260px (null → 160) and a MINIMUM height of 0.62 × width (see
-//! [`tile_size_for_pct`]) — matching the reference, which treats 0.62×width
-//! as a floor and lets the real card grow to fit its content. gpui tiles
+//! 200..=300px (null → 200) and a MINIMUM height of 0.44 × width (see
+//! [`tile_size_for_pct`]); the aspect is a floor and the card still grows to
+//! fit its content. gpui tiles
 //! need a size known up front (no "measure the real rendered card" pass like
 //! the reference's own packer), so `OverviewRow::tile_size` takes the `max`
 //! of that aspect floor and a deterministic content-height ESTIMATE
@@ -399,15 +399,21 @@ impl OverviewRow {
         (w, aspect_h.max(content_h))
     }
 
-    /// Temporary visual size while the pointer is over a collapsed
-    /// subagent preview. Board packing deliberately continues to use
-    /// `tile_size`; this card floats above neighbors until the pointer
-    /// leaves, rather than making the entire canvas jump on hover.
+    /// Temporary visual size while the pointer is over a canvas tile. Board
+    /// packing deliberately continues to use `tile_size`; the two-line title,
+    /// optional branch/message rows, and complete subagent stack float above
+    /// neighbors until the pointer leaves instead of making the board jump.
     fn hovered_tile_size(&self) -> (f32, f32) {
         let (w, aspect_h) = tile_size_for_pct(self.context_pct);
-        let mut content_h = TILE_CONTENT_MIN_H;
+        let mut content_h = TILE_CONTENT_MIN_H + HOVER_TITLE_EXTRA_H;
         if self.has_badge_row {
             content_h += BADGE_ROW_ADDED_H;
+        }
+        if self.chat.branch.is_some() {
+            content_h += HOVER_BRANCH_ADDED_H;
+        }
+        if self.chat.last_message_preview.is_some() {
+            content_h += HOVER_LAST_MESSAGE_ADDED_H;
         }
         content_h += subagent_stack_height(self.subagent_count);
         (w, aspect_h.max(content_h))
@@ -503,6 +509,9 @@ fn last_segment(path: &str) -> Option<String> {
 /// First line (trimmed) of `<cwd>/.workspace-root`, if present and non-empty.
 fn workspace_root_of(cwd: &str) -> Option<String> {
     if cwd.is_empty() {
+        return None;
+    }
+    if zeron_engine::repos::is_automatic_access_blocked(std::path::Path::new(cwd)) {
         return None;
     }
     let contents =
@@ -693,6 +702,18 @@ fn pr_matches_search(query_lower: &str, item: &MyPrItem) -> bool {
             item.summary.author.as_deref(),
         ],
     )
+}
+
+fn pr_sidebar_empty_message(total: usize, query: &str, pending: bool) -> String {
+    if total == 0 {
+        if pending {
+            "Loading…".to_string()
+        } else {
+            "No open PRs found (or `gh` isn't installed/authenticated).".to_string()
+        }
+    } else {
+        format!("No PRs match “{query}”.")
+    }
 }
 
 /// Restore the sidebar's open state from the persisted UI-flag set. Unknown
@@ -970,6 +991,20 @@ fn fit_view_to_rects(
 /// without a live `Overview`/`Context`.
 fn no_tiles_visible(tile_count: usize, any_tile_visible: bool) -> bool {
     tile_count > 0 && !any_tile_visible
+}
+
+/// Drop hover state when its element is no longer mounted. Hover-leave is
+/// not guaranteed when filtering, changing view modes, or viewport culling
+/// removes the element under the pointer, so renderers reconcile against the
+/// ids they actually built this frame.
+fn reconcile_hovered_tile(hovered: &mut Option<String>, mounted_ids: &[String]) -> bool {
+    let stale = hovered
+        .as_ref()
+        .is_some_and(|id| !mounted_ids.iter().any(|mounted| mounted == id));
+    if stale {
+        *hovered = None;
+    }
+    stale
 }
 
 /// Repo-filter button label (`updateRepoFilterBtnState`,
@@ -1260,12 +1295,11 @@ struct LaidOutPartition {
     height: f32,
 }
 
-/// Recursively lays out a `Partition` tree, matching `partitionAndPlace`'s
-/// structure (session_canvas.html:1499-1541): depth 0's groups (and every
-/// EVEN depth below it) lay out side by side as columns; odd depths stack
-/// top-to-bottom as rows nested inside their parent column — alternating by
-/// depth is the direct equivalent of the reference always alternating
-/// columns/rows per nesting level. `Leaves` get packed via
+/// Recursively lays out a `Partition` tree. Every group level is packed as a
+/// compact two-dimensional cluster instead of choosing one axis for the whole
+/// level. That keeps repo -> ticket -> chat hierarchies visually nested while
+/// avoiding the long horizontal/vertical strings produced by lane layouts.
+/// `Leaves` get packed via
 /// `overview_layout::pack_rects` (free-rectangle packing, not a fixed grid)
 /// — this is the LOCAL per-group pack; a caller runs a second, GLOBAL
 /// `overview_layout::repair_overlaps` pass across every leaf's combined
@@ -1302,24 +1336,42 @@ fn layout_partition(partition: &Partition<&OverviewRow>, depth: usize) -> LaidOu
             }
         }
         Partition::Groups { dimension, groups } => {
-            let horizontal = depth % 2 == 0;
+            let label_h = if depth == 0 {
+                GROUP_TOP_LABEL_H
+            } else {
+                GROUP_NESTED_LABEL_H
+            };
+            let group_gap = if depth == 0 {
+                GROUP_TOP_GAP
+            } else {
+                GROUP_NESTED_GAP
+            };
+            // Lay each child out first so its complete measured rectangle can
+            // participate in the parent pack. `pack_rects` targets a roughly
+            // square footprint from total area, creating a dense center of
+            // mass at every hierarchy level rather than a single long lane.
+            let children: Vec<LaidOutPartition> = groups
+                .iter()
+                .map(|group| layout_partition(&group.items, depth + 1))
+                .collect();
+            let pack_items: Vec<PackItem> = children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| PackItem {
+                    id: index.to_string(),
+                    width: child.width.max(TILE_MIN_W),
+                    height: child.height + label_h,
+                })
+                .collect();
+            let packed_groups = overview_layout::pack_group_rects(&pack_items, group_gap);
+
             let mut positions: HashMap<String, (f32, f32)> = HashMap::new();
             let mut labels: Vec<(String, gpui::Hsla, f32, f32, usize)> = Vec::new();
             let mut group_boxes: Vec<(f32, f32, f32, f32, usize)> = Vec::new();
-            let mut cursor = 0.0f32;
-            let mut cross = 0.0f32;
-            for g in groups {
-                let child = layout_partition(&g.items, depth + 1);
-                let (label_x, label_y) = if horizontal {
-                    (cursor, 0.0)
-                } else {
-                    (0.0, cursor)
-                };
-                let (content_x, content_y) = if horizontal {
-                    (cursor, GROUP_LABEL_H)
-                } else {
-                    (0.0, cursor + GROUP_LABEL_H)
-                };
+            for (group_index, (g, child)) in groups.iter().zip(children.into_iter()).enumerate() {
+                let packed = packed_groups.positions[&group_index.to_string()];
+                let (label_x, label_y) = (packed.x, packed.y);
+                let (content_x, content_y) = (packed.x, packed.y + label_h);
                 // `makeLaneHeader`'s `${meta.label} (${count})`.
                 labels.push((
                     format!(
@@ -1341,30 +1393,18 @@ fn layout_partition(partition: &Partition<&OverviewRow>, depth: usize) -> LaidOu
                 // Floor for a degenerate (empty) child; a real leaf group's
                 // packed width already spans its widest tile.
                 let child_w = child.width.max(TILE_MIN_W);
-                let child_h = child.height + GROUP_LABEL_H;
+                let child_h = child.height + label_h;
                 group_boxes.push((label_x, label_y, child_w, child_h, depth));
                 for (bx, by, bw, bh, bdepth) in child.group_boxes {
                     group_boxes.push((bx + content_x, by + content_y, bw, bh, bdepth));
                 }
-                if horizontal {
-                    cursor += child_w + GROUP_GAP;
-                    cross = cross.max(child_h);
-                } else {
-                    cursor += child_h + GROUP_GAP;
-                    cross = cross.max(child_w);
-                }
             }
-            let (width, height) = if horizontal {
-                (cursor, cross)
-            } else {
-                (cross, cursor)
-            };
             LaidOutPartition {
                 positions,
                 labels,
                 group_boxes,
-                width,
-                height,
+                width: packed_groups.width,
+                height: packed_groups.height,
             }
         }
     }
@@ -2023,53 +2063,63 @@ struct TileDrag {
 /// feels 1:1 regardless of zoom level), is a click; at or above it, a drag.
 const DRAG_THRESHOLD_PX: f32 = 4.0;
 
-/// `renderTile(..., 160, 260)`'s `minPx`/`maxPx` (`session_canvas.html:
-/// ~1851`): main-tile width at 0% and 100% context.
-const TILE_MIN_W: f32 = 160.0;
-const TILE_MAX_W: f32 = 260.0;
-/// `div.style.minHeight = Math.round(size * 0.62)` (`~1128`).
-const TILE_ASPECT: f32 = 0.62;
+/// Wide/compact main-tile width at 0% and 100% context. The wider face
+/// exposes substantially more of the title while the shallower aspect keeps
+/// the wall of cards dense vertically.
+const TILE_MIN_W: f32 = 200.0;
+const TILE_MAX_W: f32 = 300.0;
+/// Expanded metadata gets its own wider surface. The collapsed face remains
+/// at its context-driven width so the context meter and face chrome do not
+/// stretch to match a long PR title in the detail below it.
+const TILE_EXPANDED_W: f32 = 480.0;
+const TILE_ASPECT: f32 = 0.44;
 /// Height floor for the tile face's ALWAYS-present rows (title, cwd,
 /// context bar + label, status row, open button/expand-hint footer). The
 /// web's tile grows to fit its content and gets measured for packing; gpui
 /// tiles here need a size known up front, so this is the content-fit floor
-/// that both 0.62 × width ([`tile_size_for_pct`]) and the row's OWN variable
-/// content ([`tile_content_height_estimate`]) sit on top of. At 160px
-/// (0.62 × 160 = 99) the floor wins; at 260px (161) the aspect ratio wins.
+/// that both 0.44 × width ([`tile_size_for_pct`]) and the row's OWN variable
+/// content ([`tile_content_height_estimate`]) sit on top of. At 200px
+/// (0.44 × 200 = 88) the floor wins; at 300px (132) the aspect ratio wins.
 /// Does NOT bake in badges/subagent tiles any more — those are only present
 /// on some rows, so [`tile_content_height_estimate`] adds them on top of
 /// this floor exactly when a row actually has them, instead of every tile
 /// paying for space it may not use (or, the bug this replaces, every tile
 /// NOT paying for space it needs).
-const TILE_CONTENT_MIN_H: f32 = 140.0;
-const TILE_GAP: f32 = 16.0;
-/// `tile_body`'s own flex-column `gap(3)` between each direct child row —
+const TILE_CONTENT_MIN_H: f32 = 120.0;
+const TILE_GAP: f32 = 14.0;
+/// `tile_body`'s own flex-column gap between each direct child row —
 /// shared here so [`tile_content_height_estimate`]'s per-optional-row
 /// addition matches the real spacing instead of a duplicated magic number.
-const TILE_ROW_GAP: f32 = 3.0;
+const TILE_ROW_GAP: f32 = 2.0;
 /// Height `badges_for`'s PR/ticket badge row adds when present: an ~18px
 /// badge-chip row (`py(1)` × 2 + ~9.5px text, rounded up) plus the
 /// flex-column gap separating it from its neighbors in `tile_body`.
-const BADGE_ROW_ADDED_H: f32 = 18.0 + TILE_ROW_GAP;
-/// One compact nested subagent tile (`.tile.compact`,
-/// `session_canvas.html:441-517`): `padding: 5px 7px` around a single
-/// 10px/1.4 name line (14px) plus a 1px border top and bottom — 26px. Set as
+const BADGE_ROW_H: f32 = 18.0;
+const BADGE_ROW_ADDED_H: f32 = BADGE_ROW_H + TILE_ROW_GAP;
+/// One compact nested subagent tile (`.tile.compact`), set as
 /// an explicit height on the rendered tile (`subagent_tile`) so this
 /// estimate and the real layout can never drift apart.
-const SUBAGENT_TILE_H: f32 = 26.0;
-/// `.subagents { gap: 6px }` — between adjacent compact subagent tiles.
-const SUBAGENT_TILE_GAP: f32 = 6.0;
+const SUBAGENT_TILE_H: f32 = 24.0;
+/// Gap between adjacent compact subagent tiles.
+const SUBAGENT_TILE_GAP: f32 = 4.0;
 /// Keep cards scannable at rest. A fourth compact row communicates the
 /// remainder; hovering the card swaps the preview for the complete stack.
 const SUBAGENT_PREVIEW_LIMIT: usize = 3;
-/// `.connector { margin-top: 10px }` — the space between the parent card's
+/// Space between the parent card's own face and its subagent stack.
 /// own face and its subagent stack. `tile_body`'s flex-column gap already
 /// supplies [`TILE_ROW_GAP`] of it; the stack adds the rest as a top margin.
-const SUBAGENT_STACK_TOP: f32 = 10.0;
+const SUBAGENT_STACK_TOP: f32 = 8.0;
+/// Hover expands the title from one line to a fixed two-line slot, then
+/// optionally adds compact branch and last-message synopsis rows. These
+/// constants include the direct-child gap where appropriate so the hover
+/// size estimate stays in lockstep with `tile_body`.
+const HOVER_TITLE_EXTRA_H: f32 = 16.0;
+const HOVER_BRANCH_ADDED_H: f32 = 16.0;
+const HOVER_LAST_MESSAGE_ADDED_H: f32 = 34.0;
 /// Three previews plus the "+N more" row is the largest resting stack.
 const FLAT_STRIDE_SUBAGENT_TILES: usize = SUBAGENT_PREVIEW_LIMIT + 1;
 
-/// Port of `tileSize(pct, 160, 260)` (`session_canvas.html:1040-1043`):
+/// Wide/compact `tileSize(pct, 200, 300)`:
 /// `round(min + pct * (max - min))`, null → 0. Clamped to `0.0..=1.0` (and a
 /// non-finite value treated as null) so a bad engine value can't produce a
 /// negative or huge tile. The web doesn't clamp, but the engine promises
@@ -2081,13 +2131,20 @@ fn tile_width_for_pct(pct: Option<f32>) -> f32 {
 
 /// `(width, height)` for a main tile at `pct`, from the context-%-driven
 /// aspect ratio ALONE: width per [`tile_width_for_pct`], height
-/// `round(width * 0.62)` floored at [`TILE_CONTENT_MIN_H`]. Doesn't know
+/// `round(width * 0.44)` floored at [`TILE_CONTENT_MIN_H`]. Doesn't know
 /// about a row's own content (subagent tiles, a badge row) — see
 /// `OverviewRow::tile_size`, the actual per-row size every layout consumer
 /// uses, which takes the `max` of this and [`tile_content_height_estimate`].
 fn tile_size_for_pct(pct: Option<f32>) -> (f32, f32) {
     let w = tile_width_for_pct(pct);
     (w, (w * TILE_ASPECT).round().max(TILE_CONTENT_MIN_H))
+}
+
+/// Width of the expanded card surface in board-space pixels. Kept separate
+/// from [`tile_width_for_pct`] because expanding should reveal more metadata,
+/// not mutate the collapsed face (especially its full-width context meter).
+fn expanded_tile_width(collapsed_width: f32) -> f32 {
+    collapsed_width.max(TILE_EXPANDED_W)
 }
 
 /// Deterministic tile CONTENT-height estimate — the packing-time stand-in
@@ -2217,8 +2274,10 @@ const GRID_COLS: usize = 4;
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 2.0;
 /// Grouped-canvas layout only (see `render_canvas_body`'s grouped branch).
-const GROUP_LABEL_H: f32 = 30.0;
-const GROUP_GAP: f32 = 36.0;
+const GROUP_TOP_LABEL_H: f32 = 40.0;
+const GROUP_NESTED_LABEL_H: f32 = 22.0;
+const GROUP_TOP_GAP: f32 = 56.0;
+const GROUP_NESTED_GAP: f32 = 28.0;
 /// `GROUP_BOX_PADDING` (`session_canvas.html:1308-1319`): how far a group's
 /// tinted box extends past its header + content.
 const GROUP_BOX_PADDING: f32 = 10.0;
@@ -2318,10 +2377,10 @@ pub struct Overview {
     /// `SCAN_CHAT_SUBAGENTS`'s contract).
     subagents: HashMap<String, Vec<SubagentItem>>,
     subagent_pending: HashSet<String>,
-    /// Card whose compact subagent preview is temporarily showing the full
-    /// stack. Kept separate from `expanded`: hover must not acknowledge a
-    /// completed chat or open its detail panel.
-    hovered_subagents: Option<String>,
+    /// Canvas tile (or list row with subagent overflow) currently hovered.
+    /// Kept separate from `expanded`: hover must not acknowledge a completed
+    /// chat or open its detail panel.
+    hovered_tile: Option<String>,
     /// Last attempt time per chat (success OR failure), so a chat with
     /// nothing to scan retries on `SUBAGENTS_REFRESH` instead of on every
     /// row rebuild.
@@ -2621,7 +2680,7 @@ impl Overview {
             link_status_pending: HashSet::new(),
             subagents: HashMap::new(),
             subagent_pending: HashSet::new(),
-            hovered_subagents: None,
+            hovered_tile: None,
             subagents_fetched_at: HashMap::new(),
             classification: HashMap::new(),
             classification_pending: HashSet::new(),
@@ -2683,6 +2742,27 @@ impl Overview {
             _pr_search_events: pr_search_events,
             _link_input_events: link_input_events,
         }
+    }
+
+    pub(crate) fn is_canvas(&self) -> bool {
+        self.view_mode == ViewMode::Canvas
+    }
+
+    /// Cmd/Ctrl+F follows the platform Find convention while Canvas is the
+    /// active overview mode. Selecting the existing query makes a repeated
+    /// search immediately replaceable.
+    pub(crate) fn focus_canvas_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_canvas() {
+            return false;
+        }
+        let focus = gpui::Focusable::focus_handle(self.search.read(cx), cx);
+        window.focus(&focus, cx);
+        window.dispatch_action(Box::new(crate::composer::SelectAll), cx);
+        true
     }
 
     /// Click-to-expand (tile or list row). Expanding also acknowledges an
@@ -2802,6 +2882,12 @@ impl Overview {
     fn set_pr_sidebar_open(&mut self, open: bool, persist: bool, cx: &mut Context<Self>) {
         self.pr_sidebar_open = open;
         if open {
+            // A render during engine startup can read the still-empty PR cache
+            // and mark that response fresh. Opening the sidebar is an explicit
+            // request to see current data, so do not let that earlier empty
+            // read suppress the user-triggered refresh.
+            self.my_prs_fetched_at = None;
+            self.review_prs_fetched_at = None;
             self.ensure_my_prs(cx);
         }
         if persist {
@@ -3630,6 +3716,45 @@ impl Overview {
         .detach();
     }
 
+    /// Apply the authoritative result of the shared manual-classification
+    /// mutation immediately instead of waiting for this view's classification
+    /// TTL. This keeps Canvas/List grouping and the open chat surfaces in sync.
+    pub(crate) fn classification_changed(
+        &mut self,
+        chat_id: &str,
+        value: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(category) = value.get("category").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(origin) = value.get("origin").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let tool_counts = value
+            .get("toolCounts")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        let skills_loaded = value
+            .get("skillsLoaded")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        self.classification.insert(
+            chat_id.to_string(),
+            ClassificationInfo {
+                category: category.to_string(),
+                origin: origin.to_string(),
+                tool_counts,
+                skills_loaded,
+            },
+        );
+        self.classification_fetched_at
+            .insert(chat_id.to_string(), Instant::now());
+        self.rows_dirty = true;
+        self.grouped_layout_cache = None;
+        cx.notify();
+    }
+
     /// "Reclassify 'other'": ask the engine to re-run Jev on every `other`
     /// chat (up to its manual budget), then show the tally in the button for
     /// [`RECLASSIFY_NOTICE`] and refetch classifications so moved chats regroup.
@@ -3889,7 +4014,22 @@ impl Overview {
             return None;
         }
         let ticket_source = link.and_then(|s| s.ticket_source);
-        let mut row = div().flex().items_center().gap(px(6.0 * zoom)).flex_wrap();
+        // The tile-height estimate reserves exactly one badge line. Keep the
+        // complete badge set in that horizontal line and clip at the card
+        // edge instead of wrapping into unreserved rows. The aggregate
+        // tooltip exposes the full clipped sequence; each reachable badge
+        // retains its provenance tooltip too.
+        let mut summary = Vec::new();
+        let mut row = div()
+            .debug_selector(|| "overview-tile-badges".into())
+            .flex_none()
+            .w_full()
+            .h(px(BADGE_ROW_H * zoom))
+            .flex()
+            .items_center()
+            .gap(px(6.0 * zoom))
+            .overflow_hidden()
+            .whitespace_nowrap();
         for (index, pr_link) in link.into_iter().flat_map(effective_pr_links).enumerate() {
             let pr = pr_link
                 .detail
@@ -3904,13 +4044,16 @@ impl Overview {
                 .map(|(label, color)| (label.to_string(), color))
                 .unwrap_or_else(|| (pr.state.clone(), theme.text_muted));
             let label = format!("#{} {action}", pr.number);
+            summary.push(label.clone());
             let pr_source = pr_link.source;
+            let debug_id = format!("overview-badge-pr-{chat_id}-{index}");
+            let badge_id = SharedString::from(debug_id.clone());
             row = row.child(
                 link_source_hover(
                     div()
-                        .id(SharedString::from(format!(
-                            "overview-badge-pr-{chat_id}-{index}"
-                        )))
+                        .id(badge_id)
+                        .debug_selector(move || debug_id.clone())
+                        .flex_none()
                         .flex()
                         .items_center()
                         .gap(px(3.0 * zoom))
@@ -3930,12 +4073,15 @@ impl Overview {
             );
         }
         if let Some(identifier) = ticket_label {
+            summary.push(identifier.clone());
+            let debug_id = format!("overview-badge-ticket-{chat_id}");
+            let badge_id = SharedString::from(debug_id.clone());
             row = row.child(
                 link_source_hover(
                     div()
-                        .id(SharedString::from(format!(
-                            "overview-badge-ticket-{chat_id}"
-                        )))
+                        .id(badge_id)
+                        .debug_selector(move || debug_id.clone())
+                        .flex_none()
                         .flex()
                         .items_center()
                         .gap(px(3.0 * zoom))
@@ -3954,7 +4100,12 @@ impl Overview {
                 .child(SharedString::from(identifier)),
             );
         }
-        Some(row.into_any_element())
+        let tooltip: SharedString = summary.join(" · ").into();
+        Some(
+            row.id(SharedString::from(format!("overview-badges-{chat_id}")))
+                .tooltip(move |_, cx| cx.new(|_| LinkSourceTooltip(tooltip.clone())).into())
+                .into_any_element(),
+        )
     }
 
     /// Compact nested tiles for a chat's subagents — `session_canvas.html`'s
@@ -4231,6 +4382,8 @@ impl Overview {
             category.as_deref(),
             origin.as_deref(),
         );
+        let classification_shell = self.shell.clone();
+        let classification_chat_id = chat_id.clone();
         // The chat route drives these per frame (`render_main`); it doesn't
         // run on this route, so the panel does. Without the settled-docked
         // frame, arriving from the blank new-session screen would leave the
@@ -4390,6 +4543,17 @@ impl Overview {
                             "overview-chat-panel",
                             metadata,
                             theme,
+                            Some(std::rc::Rc::new(move |event, _, app| {
+                                if let Some(shell) = classification_shell.upgrade() {
+                                    shell.update(app, |shell, cx| {
+                                        shell.open_chat_classification_at(
+                                            classification_chat_id.clone(),
+                                            event.position(),
+                                            cx,
+                                        );
+                                    });
+                                }
+                            })),
                         )),
                 )
                 .child(
@@ -4739,6 +4903,7 @@ impl Overview {
         theme: &Theme,
         chat_id: String,
         zoom: f32,
+        canvas_width: Option<f32>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let entry = self.link_status.get(&row.chat.id);
@@ -4880,6 +5045,8 @@ impl Overview {
                     let open_url = url.clone();
                     let pr_source = pr_link.source;
                     div()
+                        .min_w_0()
+                        .max_w_full()
                         .flex()
                         .flex_col()
                         .gap(px(4.0 * zoom))
@@ -4900,18 +5067,31 @@ impl Overview {
                                             .flex_1()
                                             .min_w_0()
                                             .flex()
-                                            .flex_wrap()
                                             .gap(px(4.0 * zoom)),
                                         LinkKind::Pr,
                                         pr_source,
                                     )
+                                    .overflow_hidden()
                                     .cursor_pointer()
                                     .text_color(theme.accent)
                                     .hover(|el| el.underline())
-                                    .child(SharedString::from(summary))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .max_w_full()
+                                            .max_h(px(32.0 * zoom))
+                                            .line_height(px(16.0 * zoom))
+                                            .whitespace_normal()
+                                            .overflow_hidden()
+                                            .child(SharedString::from(summary)),
+                                    )
                                     .when_some(checks, |el, (color, icon, _)| {
                                         el.child(
-                                            div().text_color(color).child(SharedString::from(icon)),
+                                            div()
+                                                .flex_none()
+                                                .text_color(color)
+                                                .child(SharedString::from(icon)),
                                         )
                                     })
                                     .on_click(move |_, _, cx| cx.open_url(&open_url)),
@@ -4938,6 +5118,8 @@ impl Overview {
                         "pull request"
                     },
                     div()
+                        .min_w_0()
+                        .max_w_full()
                         .flex()
                         .flex_col()
                         .gap(px(8.0 * zoom))
@@ -5154,8 +5336,16 @@ impl Overview {
 
         div()
             .w_full()
+            // Canvas detail is deliberately wider than the compact face.
+            // Its explicit width also contains pathological PR/ticket titles,
+            // instead of allowing their min-content width to stretch this
+            // card (and the face's context meter) indefinitely. List detail
+            // keeps filling its ordinary row.
+            .when_some(canvas_width, |el, width| el.w(px(width * zoom)))
+            .max_w_full()
             .flex()
             .flex_col()
+            .overflow_hidden()
             .gap(px(4.0 * zoom))
             .p(px(8.0 * zoom))
             .mt(px(4.0 * zoom))
@@ -5170,6 +5360,7 @@ impl Overview {
                 div()
                     .pt(px(4.0 * zoom))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(6.0 * zoom))
                     .child(self.open_chat_button(chat_id, theme, cx, zoom))
@@ -5658,6 +5849,17 @@ impl Render for Overview {
             .map(|shell| shell.read(cx).my_prs_shortcut_label());
         let critical: gpui::Hsla = gpui::rgb(0xd03b3b).into();
         let new_chat_button = self.render_new_chat_button(&theme, cx);
+        let repository_map_shortcut = self
+            .shell
+            .upgrade()
+            .map(|shell| shell.read(cx).repository_topology_shortcut_label());
+        let repository_map_tooltip: SharedString = repository_map_shortcut
+            .as_ref()
+            .map_or_else(
+                || "Open repository map".to_string(),
+                |shortcut| format!("Open repository map ({shortcut})"),
+            )
+            .into();
         let repository_map_button = div()
             .id("overview-repository-map")
             .h(px(28.0))
@@ -5674,11 +5876,18 @@ impl Render for Overview {
             .hover(|element| element.bg(theme.element_hover).text_color(theme.text))
             .child(crate::icons::icon(crate::icons::FILE_TREE).size(px(12.0)))
             .child("Repository map")
+            .when_some(repository_map_shortcut, |button, shortcut| {
+                button.child(popover::kbd_hint(&theme, &shortcut))
+            })
             .on_click(cx.listener(|this, _, _, cx| {
                 if let Some(shell) = this.shell.upgrade() {
                     shell.update(cx, |shell, cx| shell.open_repository_topology(cx));
                 }
-            }));
+            }))
+            .tooltip(move |_, cx| {
+                cx.new(|_| LinkSourceTooltip(repository_map_tooltip.clone()))
+                    .into()
+            });
 
         let title_row = div()
             .flex()
@@ -5729,6 +5938,7 @@ impl Render for Overview {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         this.view_mode = ViewMode::List;
+                                        this.hovered_tile = None;
                                         this.view_prefs_changed(cx);
                                         cx.notify();
                                     }),
@@ -5740,6 +5950,7 @@ impl Render for Overview {
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             this.view_mode = ViewMode::Canvas;
+                                            this.hovered_tile = None;
                                             this.view_prefs_changed(cx);
                                             cx.notify();
                                         }),
@@ -6529,6 +6740,8 @@ impl Overview {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let mounted_ids: Vec<String> = rows.iter().map(|row| row.chat.id.clone()).collect();
+        reconcile_hovered_tile(&mut self.hovered_tile, &mounted_ids);
         if rows.is_empty() {
             return self.render_empty_state(theme, cx);
         }
@@ -6656,10 +6869,10 @@ impl Overview {
         let open_button = self.open_chat_button(chat_id.clone(), theme, cx, 1.0);
         let has_subagent_overflow = row.subagent_count > SUBAGENT_PREVIEW_LIMIT;
         let show_all_subagents =
-            has_subagent_overflow && self.hovered_subagents.as_deref() == Some(chat_id.as_str());
+            has_subagent_overflow && self.hovered_tile.as_deref() == Some(chat_id.as_str());
         let subagent_tiles = self.subagent_tiles_for(&chat_id, theme, 1.0, show_all_subagents, cx);
-        let detail =
-            is_expanded.then(|| self.expanded_detail_for(row, theme, chat_id.clone(), 1.0, cx));
+        let detail = is_expanded
+            .then(|| self.expanded_detail_for(row, theme, chat_id.clone(), 1.0, None, cx));
         let toggle_id = chat_id.clone();
         let hover_id = chat_id.clone();
         div()
@@ -6695,12 +6908,12 @@ impl Overview {
             .when(has_subagent_overflow, |el| {
                 el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
-                        if this.hovered_subagents.as_deref() != Some(hover_id.as_str()) {
-                            this.hovered_subagents = Some(hover_id.clone());
+                        if this.hovered_tile.as_deref() != Some(hover_id.as_str()) {
+                            this.hovered_tile = Some(hover_id.clone());
                             cx.notify();
                         }
-                    } else if this.hovered_subagents.as_deref() == Some(hover_id.as_str()) {
-                        this.hovered_subagents = None;
+                    } else if this.hovered_tile.as_deref() == Some(hover_id.as_str()) {
+                        this.hovered_tile = None;
                         cx.notify();
                     }
                 }))
@@ -6860,13 +7073,18 @@ impl Overview {
         let category_badge = category_badge(row, zoom);
         let model = model_badge(&row.chat, theme, zoom);
         let is_expanded = self.expanded.contains(&row.chat.id);
+        let is_hovered = self.hovered_tile.as_deref() == Some(row.chat.id.as_str());
+        let hover_branch = is_hovered.then(|| row.chat.branch.clone()).flatten();
+        let hover_preview = is_hovered
+            .then(|| row.chat.last_message_preview.clone())
+            .flatten();
         div()
             .debug_selector(|| "overview-tile-body".into())
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(3.0 * zoom))
-            .p(px(10.0 * zoom))
+            .gap(px(TILE_ROW_GAP * zoom))
+            .p(px(8.0 * zoom))
             .rounded(px(8.0 * zoom))
             // Belt-and-suspenders on top of `tile_size`'s content-height
             // estimate: any residual mis-estimate (an unusually long title
@@ -6884,6 +7102,7 @@ impl Overview {
             )
             .bg(tinted_bg)
             .shadow_sm()
+            .when(is_hovered, |el| el.shadow_lg())
             .hover(|el| el.border_color(dot.opacity(0.6)))
             // Reference's exact `.card.archived { opacity: 0.4 }` /
             // `.card.stale { opacity: 0.55 }` — except an unread-done card,
@@ -6907,12 +7126,18 @@ impl Overview {
                     )
                     .child(
                         div()
+                            .debug_selector(|| "overview-tile-title".into())
                             .flex_1()
                             .min_w_0()
-                            .truncate()
                             .text_color(theme.text)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_size(crate::typography::ui_rems(13.0 * zoom))
+                            .when(!is_hovered, |el| el.truncate())
+                            .when(is_hovered, |el| {
+                                el.h(px(32.0 * zoom))
+                                    .line_height(px(16.0 * zoom))
+                                    .overflow_hidden()
+                            })
                             .child(title),
                     ),
             )
@@ -6932,6 +7157,20 @@ impl Overview {
                     )
                     .child(model),
             )
+            .when_some(hover_branch, |el, branch| {
+                el.child(
+                    div()
+                        .debug_selector(|| "overview-tile-hover-branch".into())
+                        .flex_none()
+                        .h(px(14.0 * zoom))
+                        .flex()
+                        .items_center()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(9.5 * zoom))
+                        .text_color(theme.text_muted.opacity(0.75))
+                        .child(SharedString::from(format!("⎇ {branch}"))),
+                )
+            })
             // `.fill-bar` + `.pct-label`, right under the title block like
             // the web's tile face.
             .child(context_meter(row.context_pct, theme, zoom).mt(px(2.0 * zoom)))
@@ -6959,6 +7198,19 @@ impl Overview {
                     .when_some(category_badge, |el, badge| el.child(badge)),
             )
             .when_some(badges, |el, badges| el.child(badges))
+            .when_some(hover_preview, |el, preview| {
+                el.child(
+                    div()
+                        .debug_selector(|| "overview-tile-hover-last-message".into())
+                        .flex_none()
+                        .h(px(32.0 * zoom))
+                        .line_height(px(16.0 * zoom))
+                        .overflow_hidden()
+                        .text_size(crate::typography::ui_rems(9.5 * zoom))
+                        .text_color(theme.text_muted.opacity(0.8))
+                        .child(SharedString::from(format!("Last message · {preview}"))),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -7020,6 +7272,7 @@ impl Overview {
         if rows.is_empty() {
             self.pending_fit_to_matches = false;
             self.clear_tile_motion();
+            self.hovered_tile = None;
             return self.render_empty_state(theme, cx);
         }
         if self.active_groups.is_empty() {
@@ -7072,7 +7325,7 @@ impl Overview {
         // (`session_canvas.html`'s `makeCard`, `card.style.zIndex = ++zTop`)
         // — the gpui equivalent of "paint on top" is "render last", so this
         // collects `(paint_on_top, element)` and stable-sorts expanded or
-        // subagent-hovered tiles to the end of the child list before the previously-reported
+        // hovered tiles to the end of the child list before the previously-reported
         // "expanded content hidden behind the tile below it" bug.
         let anim_now = Instant::now();
         let reduced = cx.reduce_motion();
@@ -7084,6 +7337,7 @@ impl Overview {
         // organize move can't produce a false "all off-screen" reading (see
         // `render_rescue_pill`'s doc comment).
         let mut any_tile_visible = false;
+        let mut mounted_ids = Vec::new();
         let mut tiles: Vec<(bool, _)> = rows
             .into_iter()
             .enumerate()
@@ -7094,36 +7348,58 @@ impl Overview {
                 let screen_x = pos.x * zoom + pan_x;
                 let screen_y = pos.y * zoom + pan_y;
                 let has_subagent_overflow = row.subagent_count > SUBAGENT_PREVIEW_LIMIT;
-                let show_all_subagents = has_subagent_overflow
-                    && self.hovered_subagents.as_deref() == Some(chat_id.as_str());
-                let (board_w, board_h) = if show_all_subagents {
+                let is_hovered = self.hovered_tile.as_deref() == Some(chat_id.as_str());
+                let is_expanded = self.expanded.contains(&chat_id);
+                let show_all_subagents = has_subagent_overflow && is_hovered;
+                let (board_w, board_h) = if is_hovered {
                     row.hovered_tile_size()
                 } else {
                     row.tile_size()
                 };
                 let (tile_w, tile_h) = (board_w * zoom, board_h * zoom);
+                let card_w = if is_expanded {
+                    expanded_tile_width(board_w) * zoom
+                } else {
+                    tile_w
+                };
                 // Skip building this tile's element at all when off-screen —
                 // see `tile_in_viewport`'s doc comment for why this has to
                 // happen before `tile_body` runs, not just before paint. An
                 // expanded tile's real height exceeds `tile_h`; the margin
                 // comfortably covers that without tracking exact expanded
                 // height here.
-                let in_viewport = self.tile_in_viewport(screen_x, screen_y, tile_w, tile_h);
+                let in_viewport = self.tile_in_viewport(screen_x, screen_y, card_w, tile_h);
                 if in_viewport {
                     any_tile_visible = true;
                 }
                 if !in_viewport {
                     return None;
                 }
+                mounted_ids.push(chat_id.clone());
                 let open_button = self.open_chat_button(chat_id.clone(), theme, cx, zoom);
                 let subagent_tiles =
                     self.subagent_tiles_for(&chat_id, theme, zoom, show_all_subagents, cx);
                 let content = self.tile_body(&row, theme, now, zoom, open_button, subagent_tiles);
                 let archive = (!row.chat.archived)
                     .then(|| self.archive_button(chat_id.clone(), theme, cx, zoom));
-                let is_expanded = self.expanded.contains(&chat_id);
-                let detail = is_expanded
-                    .then(|| self.expanded_detail_for(&row, theme, chat_id.clone(), zoom, cx));
+                let detail = is_expanded.then(|| {
+                    self.expanded_detail_for(
+                        &row,
+                        theme,
+                        chat_id.clone(),
+                        zoom,
+                        Some(expanded_tile_width(board_w)),
+                        cx,
+                    )
+                });
+                let face = div()
+                    .relative()
+                    .w(px(tile_w))
+                    .h(px(tile_h))
+                    .child(content)
+                    .when_some(archive, |el, archive| {
+                        el.child(div().absolute().top(px(4.0)).right(px(4.0)).child(archive))
+                    });
                 let drag_id = chat_id.clone();
                 let hover_id = chat_id.clone();
                 let element = div()
@@ -7131,21 +7407,19 @@ impl Overview {
                     .absolute()
                     .left(px(screen_x))
                     .top(px(screen_y))
-                    .w(px(tile_w))
+                    .w(px(card_w))
                     .cursor_pointer()
-                    .when(has_subagent_overflow, |el| {
-                        el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                if this.hovered_subagents.as_deref() != Some(hover_id.as_str()) {
-                                    this.hovered_subagents = Some(hover_id.clone());
-                                    cx.notify();
-                                }
-                            } else if this.hovered_subagents.as_deref() == Some(hover_id.as_str()) {
-                                this.hovered_subagents = None;
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            if this.hovered_tile.as_deref() != Some(hover_id.as_str()) {
+                                this.hovered_tile = Some(hover_id.clone());
                                 cx.notify();
                             }
-                        }))
-                    })
+                        } else if this.hovered_tile.as_deref() == Some(hover_id.as_str()) {
+                            this.hovered_tile = None;
+                            cx.notify();
+                        }
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -7169,14 +7443,12 @@ impl Overview {
                             });
                         }),
                     )
-                    .child(div().h(px(tile_h)).child(content))
-                    .when_some(archive, |el, archive| {
-                        el.child(div().absolute().top(px(4.0)).right(px(4.0)).child(archive))
-                    })
+                    .child(face)
                     .when_some(detail, |el, detail| el.child(detail));
-                Some((is_expanded || show_all_subagents, element))
+                Some((is_expanded || is_hovered, element))
             })
             .collect();
+        reconcile_hovered_tile(&mut self.hovered_tile, &mounted_ids);
         self.prune_tile_motion(&present_ids.iter().map(String::as_str).collect());
         tiles.sort_by_key(|(is_expanded, _)| *is_expanded);
         let tiles: Vec<_> = tiles.into_iter().map(|(_, element)| element).collect();
@@ -7322,9 +7594,9 @@ impl Overview {
     /// Grouped canvas: tiles partitioned by `self.active_groups` (composable,
     /// same `overview_grouping::partition` List mode's grouped rendering
     /// uses), laid out via `layout_partition` — real free-rectangle packing
-    /// per leaf group (`overview_layout::pack_rects`), not a fixed grid,
-    /// nested columns/rows alternating by depth for multi-dimension
-    /// composition. A final GLOBAL `overview_layout::repair_overlaps` sweep
+    /// per leaf group (`overview_layout::pack_rects`), not a fixed grid, and
+    /// compact two-dimensional packing of group boxes at every hierarchy
+    /// depth. A final GLOBAL `overview_layout::repair_overlaps` sweep
     /// runs across every leaf's already-placed absolute position, matching
     /// the reference's two-tier repair (local packing repair, then a
     /// cross-group safety net — `overview_layout`'s own doc comment).
@@ -7499,7 +7771,7 @@ impl Overview {
             );
         }
         // Same paint-order fix as flat mode (see that function's comment):
-        // gpui has no z-index primitive, so an expanded or subagent-hovered
+        // gpui has no z-index primitive, so an expanded or hovered
         // tile's extra height is rendered last among the tiles, so it paints over
         // whichever neighbor its packed position happens to overlap. Real
         // height-aware repacking (feeding the expanded tile's actual taller
@@ -7518,6 +7790,7 @@ impl Overview {
         // (current animated position, not a separate target-position check)
         // — it's what decides the off-screen rescue pill.
         let mut any_tile_visible = false;
+        let mut mounted_ids = Vec::new();
         for (slot, (chat_id, packed)) in repaired.iter().enumerate() {
             let Some(&row) = by_id.get(chat_id) else {
                 continue; // shouldn't happen — every id in `positions` came from `rows`
@@ -7533,56 +7806,76 @@ impl Overview {
             );
             let (screen_x, screen_y) = to_screen(pos.x, pos.y);
             let has_subagent_overflow = row.subagent_count > SUBAGENT_PREVIEW_LIMIT;
-            let show_all_subagents = has_subagent_overflow
-                && self.hovered_subagents.as_deref() == Some(chat_id.as_str());
-            let (board_w, board_h) = if show_all_subagents {
+            let is_hovered = self.hovered_tile.as_deref() == Some(chat_id.as_str());
+            let is_expanded = self.expanded.contains(chat_id);
+            let show_all_subagents = has_subagent_overflow && is_hovered;
+            let (board_w, board_h) = if is_hovered {
                 row.hovered_tile_size()
             } else {
                 row.tile_size()
             };
             let (tile_w, tile_h) = (board_w * zoom, board_h * zoom);
+            let card_w = if is_expanded {
+                expanded_tile_width(board_w) * zoom
+            } else {
+                tile_w
+            };
             // Same viewport culling as flat mode — see `tile_in_viewport`'s
             // doc comment.
-            let in_viewport = self.tile_in_viewport(screen_x, screen_y, tile_w, tile_h);
+            let in_viewport = self.tile_in_viewport(screen_x, screen_y, card_w, tile_h);
             if in_viewport {
                 any_tile_visible = true;
             }
             if !in_viewport {
                 continue;
             }
+            mounted_ids.push(chat_id.clone());
             let open_button = self.open_chat_button(chat_id.clone(), theme, cx, zoom);
             let subagent_tiles =
                 self.subagent_tiles_for(chat_id, theme, zoom, show_all_subagents, cx);
             let content = self.tile_body(row, theme, now, zoom, open_button, subagent_tiles);
             let archive =
                 (!row.chat.archived).then(|| self.archive_button(chat_id.clone(), theme, cx, zoom));
-            let is_expanded = self.expanded.contains(chat_id);
-            let detail = is_expanded
-                .then(|| self.expanded_detail_for(row, theme, chat_id.clone(), zoom, cx));
+            let detail = is_expanded.then(|| {
+                self.expanded_detail_for(
+                    row,
+                    theme,
+                    chat_id.clone(),
+                    zoom,
+                    Some(expanded_tile_width(board_w)),
+                    cx,
+                )
+            });
+            let face = div()
+                .relative()
+                .w(px(tile_w))
+                .h(px(tile_h))
+                .child(content)
+                .when_some(archive, |el, archive| {
+                    el.child(div().absolute().top(px(4.0)).right(px(4.0)).child(archive))
+                });
             let toggle_id = chat_id.clone();
             let hover_id = chat_id.clone();
             tiles.push((
-                is_expanded || show_all_subagents,
+                is_expanded || is_hovered,
                 div()
                     .id(("overview-grouped-tile", slot))
                     .absolute()
                     .left(px(screen_x))
                     .top(px(screen_y))
-                    .w(px(tile_w))
+                    .w(px(card_w))
                     .cursor_pointer()
-                    .when(has_subagent_overflow, |el| {
-                        el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                if this.hovered_subagents.as_deref() != Some(hover_id.as_str()) {
-                                    this.hovered_subagents = Some(hover_id.clone());
-                                    cx.notify();
-                                }
-                            } else if this.hovered_subagents.as_deref() == Some(hover_id.as_str()) {
-                                this.hovered_subagents = None;
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            if this.hovered_tile.as_deref() != Some(hover_id.as_str()) {
+                                this.hovered_tile = Some(hover_id.clone());
                                 cx.notify();
                             }
-                        }))
-                    })
+                        } else if this.hovered_tile.as_deref() == Some(hover_id.as_str()) {
+                            this.hovered_tile = None;
+                            cx.notify();
+                        }
+                    }))
                     // No drag here (positions are algorithm-computed, not
                     // user-placed — see this fn's own doc comment), so a
                     // plain click always toggles expand; no threshold needed.
@@ -7590,14 +7883,12 @@ impl Overview {
                         this.toggle_expanded(&toggle_id, cx);
                         cx.notify();
                     }))
-                    .child(div().h(px(tile_h)).child(content))
-                    .when_some(archive, |el, archive| {
-                        el.child(div().absolute().top(px(4.0)).right(px(4.0)).child(archive))
-                    })
+                    .child(face)
                     .when_some(detail, |el, detail| el.child(detail))
                     .into_any_element(),
             ));
         }
+        reconcile_hovered_tile(&mut self.hovered_tile, &mounted_ids);
         self.prune_tile_motion(&repaired.keys().map(String::as_str).collect());
         tiles.sort_by_key(|(is_expanded, _)| *is_expanded);
         elements.extend(tiles.into_iter().map(|(_, element)| element));
@@ -7770,17 +8061,11 @@ impl Overview {
                 ));
 
         let body: gpui::AnyElement = if shown == 0 {
-            let message = if total == 0 {
-                if (self.my_prs_pending && self.my_prs_fetched_at.is_none())
-                    || (self.review_prs_pending && self.review_prs_fetched_at.is_none())
-                {
-                    "Loading…".to_string()
-                } else {
-                    "No open PRs found (or `gh` isn't installed/authenticated).".to_string()
-                }
-            } else {
-                format!("No PRs match \u{201c}{query}\u{201d}.")
-            };
+            let message = pr_sidebar_empty_message(
+                total,
+                &query,
+                self.my_prs_pending || self.review_prs_pending,
+            );
             div()
                 .p(px(12.0))
                 .text_size(crate::typography::ui_rems(11.5))
@@ -8534,6 +8819,21 @@ mod logic_tests {
     }
 
     #[test]
+    fn repo_key_does_not_probe_privacy_managed_history() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("test requires HOME");
+        for child in ["Music", "Pictures", "Documents"] {
+            let cwd = home.join(child).join("historical-chat");
+            assert!(workspace_root_of(cwd.to_str().unwrap()).is_none());
+            assert_eq!(repo_key(cwd.to_str()), "historical-chat");
+        }
+        assert!(!zeron_engine::repos::is_automatic_access_blocked(
+            &home.join("Projects").join("zeron")
+        ));
+    }
+
+    #[test]
     fn repo_key_resolves_worktree_via_workspace_root() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -8768,6 +9068,19 @@ mod logic_tests {
         assert!(!no_tiles_visible(0, true));
     }
 
+    #[test]
+    fn hovered_tile_reconciliation_drops_only_unmounted_ids() {
+        let mounted = vec!["a".to_string(), "b".to_string()];
+        let mut hovered = Some("b".to_string());
+        assert!(!reconcile_hovered_tile(&mut hovered, &mounted));
+        assert_eq!(hovered.as_deref(), Some("b"));
+
+        let mounted = vec!["a".to_string()];
+        assert!(reconcile_hovered_tile(&mut hovered, &mounted));
+        assert!(hovered.is_none());
+        assert!(!reconcile_hovered_tile(&mut hovered, &[]));
+    }
+
     fn pr_item(number: u64, repo: &str, title: &str, branch: Option<&str>) -> MyPrItem {
         let detail = branch.map(|b| {
             serde_json::json!({
@@ -8888,6 +9201,19 @@ mod logic_tests {
     }
 
     #[test]
+    fn pr_sidebar_empty_message_prefers_loading_while_a_request_is_pending() {
+        assert_eq!(pr_sidebar_empty_message(0, "", true), "Loading…");
+        assert_eq!(
+            pr_sidebar_empty_message(0, "", false),
+            "No open PRs found (or `gh` isn't installed/authenticated)."
+        );
+        assert_eq!(
+            pr_sidebar_empty_message(2, "widgets", true),
+            "No PRs match “widgets”."
+        );
+    }
+
+    #[test]
     fn pr_sidebar_flag_round_trips_through_the_string_set_file() {
         let dir = std::env::temp_dir().join(format!("zeron-overview-flags-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -8925,12 +9251,20 @@ mod logic_tests {
         });
 
         overview.update(cx, |overview, cx| {
+            overview.my_prs_fetched_at = Some(Instant::now());
+            overview.review_prs_fetched_at = Some(Instant::now());
             overview.open_pr_sidebar(cx);
             assert!(overview.pr_sidebar_open);
+            assert!(overview.my_prs_fetched_at.is_none());
+            assert!(overview.review_prs_fetched_at.is_none());
             overview.toggle_pr_sidebar(cx);
             assert!(!overview.pr_sidebar_open);
+            overview.my_prs_fetched_at = Some(Instant::now());
+            overview.review_prs_fetched_at = Some(Instant::now());
             overview.toggle_pr_sidebar(cx);
             assert!(overview.pr_sidebar_open);
+            assert!(overview.my_prs_fetched_at.is_none());
+            assert!(overview.review_prs_fetched_at.is_none());
         });
     }
 
@@ -9105,6 +9439,42 @@ mod logic_tests {
         });
         vcx.run_until_parked();
         (overview, vcx)
+    }
+
+    #[gpui::test]
+    fn canvas_find_focuses_and_selects_the_chat_search(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_repos(cx, dir.path(), &["alpha"]);
+        let (overview, vcx) = overview_over(cx, &state);
+        overview.update(vcx, |overview, cx| {
+            overview.view_mode = ViewMode::Canvas;
+            overview
+                .search
+                .update(cx, |search, cx| search.set_text("old query", cx));
+            cx.notify();
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+
+        vcx.update(|window, cx| {
+            assert!(overview.update(cx, |overview, cx| {
+                overview.focus_canvas_search(window, cx)
+            }));
+            let search = overview.read(cx).search.clone();
+            assert!(gpui::Focusable::focus_handle(search.read(cx), cx).is_focused(window));
+        });
+        vcx.simulate_keystrokes("replacement");
+        overview.read_with(vcx, |overview, cx| {
+            assert_eq!(overview.search.read(cx).text(), "replacement");
+        });
+
+        overview.update(vcx, |overview, _| overview.view_mode = ViewMode::List);
+        vcx.update(|window, cx| {
+            window.blur();
+            assert!(!overview.update(cx, |overview, cx| {
+                overview.focus_canvas_search(window, cx)
+            }));
+            assert!(window.focused(cx).is_none());
+        });
     }
 
     fn state_with_repos(
@@ -9643,29 +10013,37 @@ mod logic_tests {
 
     #[test]
     fn tile_width_matches_reference_tile_size() {
-        // `tileSize(pct, 160, 260)`: null → min, 1.0 → max, linear + rounded.
-        assert_eq!(tile_width_for_pct(None), 160.0);
-        assert_eq!(tile_width_for_pct(Some(0.0)), 160.0);
-        assert_eq!(tile_width_for_pct(Some(1.0)), 260.0);
-        assert_eq!(tile_width_for_pct(Some(0.5)), 210.0);
-        assert_eq!(tile_width_for_pct(Some(0.333)), 193.0); // 193.3 → 193
-        assert_eq!(tile_width_for_pct(Some(0.337)), 194.0); // 193.7 → 194
+        // Wide/compact `tileSize(pct, 200, 300)`: null → min, 1.0 → max,
+        // linear + rounded.
+        assert_eq!(tile_width_for_pct(None), 200.0);
+        assert_eq!(tile_width_for_pct(Some(0.0)), 200.0);
+        assert_eq!(tile_width_for_pct(Some(1.0)), 300.0);
+        assert_eq!(tile_width_for_pct(Some(0.5)), 250.0);
+        assert_eq!(tile_width_for_pct(Some(0.333)), 233.0); // 233.3 → 233
+        assert_eq!(tile_width_for_pct(Some(0.337)), 234.0); // 233.7 → 234
     }
 
     #[test]
     fn tile_width_clamps_out_of_range_and_non_finite() {
-        assert_eq!(tile_width_for_pct(Some(-0.4)), 160.0);
-        assert_eq!(tile_width_for_pct(Some(3.0)), 260.0);
-        assert_eq!(tile_width_for_pct(Some(f32::NAN)), 160.0);
-        assert_eq!(tile_width_for_pct(Some(f32::INFINITY)), 160.0);
+        assert_eq!(tile_width_for_pct(Some(-0.4)), 200.0);
+        assert_eq!(tile_width_for_pct(Some(3.0)), 300.0);
+        assert_eq!(tile_width_for_pct(Some(f32::NAN)), 200.0);
+        assert_eq!(tile_width_for_pct(Some(f32::INFINITY)), 200.0);
+    }
+
+    #[test]
+    fn expanded_width_is_wider_but_never_shrinks_the_face() {
+        assert_eq!(expanded_tile_width(TILE_MIN_W), 480.0);
+        assert_eq!(expanded_tile_width(TILE_MAX_W), 480.0);
+        assert_eq!(expanded_tile_width(640.0), 640.0);
     }
 
     #[test]
     fn tile_height_is_aspect_ratio_over_content_floor() {
-        // 0.62 × 260 = 161.2 → 161, above the content floor.
-        assert_eq!(tile_size_for_pct(Some(1.0)), (260.0, 161.0));
-        // 0.62 × 160 = 99.2 → 99, below it: the floor wins.
-        assert_eq!(tile_size_for_pct(None), (160.0, TILE_CONTENT_MIN_H));
+        // 0.44 × 300 = 132, above the content floor.
+        assert_eq!(tile_size_for_pct(Some(1.0)), (300.0, 132.0));
+        // 0.44 × 200 = 88, below it: the floor wins.
+        assert_eq!(tile_size_for_pct(None), (200.0, TILE_CONTENT_MIN_H));
         // Height never shrinks as width grows.
         let mut last = 0.0;
         for i in 0..=100 {
@@ -9674,9 +10052,9 @@ mod logic_tests {
             last = h;
         }
         // `tile_max_size` also accounts for CONTENT height — a badge row +
-        // `FLAT_STRIDE_SUBAGENT_TILES` (4) subagent tiles: 140 + 21 + (10 +
-        // 4×26 + 3×6) — three agents plus the remainder indicator.
-        assert_eq!(tile_max_size(), (260.0, 293.0));
+        // `FLAT_STRIDE_SUBAGENT_TILES` (4) compact rows: 120 + 20 + (8 +
+        // 4×24 + 3×4) — three agents plus the remainder indicator.
+        assert_eq!(tile_max_size(), (300.0, 256.0));
     }
 
     #[test]
@@ -9684,17 +10062,17 @@ mod logic_tests {
         // No optional content: exactly the fixed-row floor.
         assert_eq!(tile_content_height_estimate(0, false), TILE_CONTENT_MIN_H);
         assert_eq!(subagent_stack_height(0), 0.0);
-        // 1 subagent: the connector's 10px + one 26px tile, no gap.
-        assert_eq!(tile_content_height_estimate(1, false), 176.0);
-        // 2: two tiles + one 6px gap.
+        // 1 subagent: the connector's 8px + one 24px tile, no gap.
+        assert_eq!(tile_content_height_estimate(1, false), 152.0);
+        // 2: two tiles + one 4px gap.
         assert_eq!(
             tile_content_height_estimate(2, false),
-            140.0 + 10.0 + 52.0 + 6.0
+            120.0 + 8.0 + 48.0 + 4.0
         );
         // 36: three agents plus one "+33 more" row.
-        assert_eq!(subagent_stack_height(36), 10.0 + 36.0 * 26.0 + 35.0 * 6.0);
+        assert_eq!(subagent_stack_height(36), 8.0 + 36.0 * 24.0 + 35.0 * 4.0);
         assert_eq!(subagent_preview_row_count(36), 4);
-        assert_eq!(tile_content_height_estimate(36, false), 272.0);
+        assert_eq!(tile_content_height_estimate(36, false), 236.0);
         // Once the remainder row appears, higher counts do not inflate the
         // resting canvas layout.
         assert_eq!(
@@ -9702,8 +10080,8 @@ mod logic_tests {
             tile_content_height_estimate(5, false)
         );
         // A badge row adds a flat amount on top, independent of subagents.
-        assert_eq!(tile_content_height_estimate(0, true), 161.0);
-        assert_eq!(tile_content_height_estimate(36, true), 293.0);
+        assert_eq!(tile_content_height_estimate(0, true), 140.0);
+        assert_eq!(tile_content_height_estimate(36, true), 256.0);
     }
 
     #[test]
@@ -9838,23 +10216,28 @@ mod logic_tests {
 
     #[test]
     fn row_tile_size_uses_the_content_height_estimate_when_it_exceeds_aspect() {
-        // 0% context: aspect height is the floor (140), well under what 2
-        // subagents + a badge row need (195) — `tile_size` must pick the
+        // 0% context: aspect height is the floor (120), well under what 2
+        // subagents + a badge row need (200) — `tile_size` must pick the
         // taller of the two, not the context-driven one alone.
         let tall = row_ex("c", "/r/zeron", None, 2, true);
-        assert_eq!(tall.tile_size(), (160.0, 229.0));
-        // 100% context, no optional content: aspect height (161) exceeds
-        // the bare content floor (140) — aspect wins here instead.
+        assert_eq!(tall.tile_size(), (200.0, 200.0));
+        // 100% context, no optional content: aspect height (132) exceeds
+        // the bare content floor (120) — aspect wins here instead.
         let wide = row_ex("c", "/r/zeron", Some(1.0), 0, false);
-        assert_eq!(wide.tile_size(), (260.0, 161.0));
-        // ...but even one subagent tile (176) outgrows it.
+        assert_eq!(wide.tile_size(), (300.0, 132.0));
+        // ...but even one subagent tile (152) outgrows it.
         let wide_sub = row_ex("c", "/r/zeron", Some(1.0), 1, false);
-        assert_eq!(wide_sub.tile_size(), (260.0, 176.0));
+        assert_eq!(wide_sub.tile_size(), (300.0, 152.0));
         // A 36-subagent parent rests at three rows plus the remainder row,
         // then grows to the complete stack only while hovered.
         let huge = row_ex("c", "/r/zeron", Some(1.0), 36, true);
-        assert_eq!(huge.tile_size(), (260.0, 293.0));
-        assert_eq!(huge.hovered_tile_size(), (260.0, 161.0 + 1156.0));
+        assert_eq!(huge.tile_size(), (300.0, 256.0));
+        assert_eq!(huge.hovered_tile_size(), (300.0, 1168.0));
+
+        let mut metadata = row_ex("meta", "/r/zeron", Some(1.0), 0, false);
+        metadata.chat.branch = Some("feature/wide-cards".into());
+        metadata.chat.last_message_preview = Some("Implemented the canvas revamp".into());
+        assert_eq!(metadata.hovered_tile_size(), (300.0, 186.0));
     }
 
     #[test]
@@ -9905,6 +10288,91 @@ mod logic_tests {
             });
             assert!(inside, "{} escapes every group box", r.chat.id);
         }
+    }
+
+    #[test]
+    fn grouped_layout_forms_dense_two_dimensional_clusters_at_each_depth() {
+        let mut rows = Vec::new();
+        for repo in 0..6 {
+            for ticket in 0..4 {
+                let mut item = row(
+                    &format!("repo-{repo}-ticket-{ticket}"),
+                    &format!("/r/repo-{repo}"),
+                    None,
+                );
+                item.ticket = Some(format!("task-{repo}-{ticket}"));
+                rows.push(item);
+            }
+        }
+        let refs: Vec<&OverviewRow> = rows.iter().collect();
+        let tree =
+            overview_grouping::partition(refs, &[GroupDimension::Repo, GroupDimension::Ticket]);
+        let laid_out = layout_partition(&tree, 0);
+
+        let top: Vec<_> = laid_out
+            .group_boxes
+            .iter()
+            .copied()
+            .filter(|(_, _, _, _, depth)| *depth == 0)
+            .collect();
+        assert_eq!(top.len(), 6);
+        assert!(
+            top.iter()
+                .map(|group| group.0 as i64)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1,
+            "repo groups should occupy multiple columns: {top:?}"
+        );
+        assert!(
+            top.iter()
+                .map(|group| group.1 as i64)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1,
+            "repo groups should occupy multiple rows: {top:?}"
+        );
+
+        let first_repo = top[0];
+        let nested: Vec<_> = laid_out
+            .group_boxes
+            .iter()
+            .copied()
+            .filter(|(x, y, w, h, depth)| {
+                *depth == 1
+                    && *x >= first_repo.0
+                    && *y >= first_repo.1 + GROUP_TOP_LABEL_H
+                    && *x + *w <= first_repo.0 + first_repo.2 + 0.01
+                    && *y + *h <= first_repo.1 + first_repo.3 + 0.01
+            })
+            .collect();
+        assert_eq!(nested.len(), 4);
+        assert!(
+            nested
+                .iter()
+                .map(|group| group.0 as i64)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1,
+            "ticket groups should occupy multiple columns: {nested:?}"
+        );
+        assert!(
+            nested
+                .iter()
+                .map(|group| group.1 as i64)
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1,
+            "ticket groups should occupy multiple rows: {nested:?}"
+        );
+
+        // The pack is intentionally landscape but still compact: six equal
+        // repos should never become a six-wide or six-tall string.
+        let aspect = laid_out.width / laid_out.height;
+        assert!((0.5..=2.5).contains(&aspect), "canvas aspect {aspect}");
+        let repeated = layout_partition(&tree, 0);
+        assert_eq!(repeated.positions, laid_out.positions);
+        assert_eq!(repeated.group_boxes, laid_out.group_boxes);
     }
 
     /// Extends the mixed-size case above with rows that share the exact
@@ -10106,6 +10574,141 @@ mod logic_tests {
         assert!(m5.is_none());
     }
 
+    #[gpui::test]
+    fn canvas_multi_pr_and_ticket_badges_fit_the_reserved_single_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            let mut chat = row_ex("c1", "/r", None, 0, false).chat;
+            chat.last_message_at = Some(Utc::now());
+            state.chats = vec![chat];
+        });
+        let status = OverviewLinkStatus {
+            ticket: Some(TicketStatus {
+                identifier: "ENG-1234".into(),
+                title: Some("Compact badges".into()),
+                url: None,
+                status: Some("In Progress".into()),
+            }),
+            pr_links: (1..=5)
+                .map(|number| OverviewPrLink {
+                    url: format!("https://github.com/a/b/pull/{number}"),
+                    source: Some(ChatLinkSource::Manual),
+                    detail: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let (overview, vcx) = cx.add_window_view(|_, cx| {
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
+            overview.view_mode = ViewMode::Canvas;
+            overview.link_status.insert(
+                "c1".into(),
+                LinkStatusEntry {
+                    status,
+                    diff_stat: None,
+                    is_worktree: None,
+                    fetched_at: Instant::now(),
+                },
+            );
+            overview
+        });
+        vcx.run_until_parked();
+
+        overview.update(vcx, |overview, cx| {
+            let row = &overview.rows(cx)[0];
+            assert!(row.has_badge_row);
+            assert_eq!(
+                row.tile_size(),
+                (TILE_MIN_W, TILE_CONTENT_MIN_H + BADGE_ROW_ADDED_H)
+            );
+        });
+        let tile = vcx
+            .debug_bounds("overview-tile-body")
+            .expect("tile rendered");
+        let badges = vcx
+            .debug_bounds("overview-tile-badges")
+            .expect("badge row rendered");
+        assert!(
+            (f32::from(badges.size.height) - BADGE_ROW_H).abs() < 0.5,
+            "badge row must remain the reserved single line: {badges:?}"
+        );
+        assert!(
+            badges.top() >= tile.top() && badges.bottom() <= tile.bottom() + px(0.5),
+            "single-line badges must fit the packed tile: {badges:?} in {tile:?}"
+        );
+        for selector in [
+            "overview-badge-pr-c1-0",
+            "overview-badge-pr-c1-1",
+            "overview-badge-pr-c1-2",
+            "overview-badge-pr-c1-3",
+            "overview-badge-pr-c1-4",
+        ] {
+            assert!(
+                vcx.debug_bounds(selector).is_some(),
+                "{selector} remains in the clipped row"
+            );
+        }
+        assert!(
+            vcx.debug_bounds("overview-badge-ticket-c1").is_some(),
+            "ticket badge remains in the clipped row"
+        );
+    }
+
+    #[gpui::test]
+    fn canvas_culling_clears_hover_for_the_unmounted_tile(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            let mut chat = row_ex("c1", "/r", None, 0, false).chat;
+            chat.last_message_at = Some(Utc::now());
+            state.chats = vec![chat];
+        });
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let (overview, vcx) = cx.add_window_view(|_, cx| {
+            let mut overview = Overview::new(
+                state.clone(),
+                gpui::WeakEntity::new_invalid(),
+                transcript,
+                composer,
+                cx,
+            );
+            overview.view_mode = ViewMode::Canvas;
+            overview
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("overview-tile-body").is_some());
+
+        // Model the missing hover-leave case: the pointer had entered this
+        // tile, then panning culled its element before gpui could send leave.
+        overview.update(vcx, |overview, cx| {
+            overview.hovered_tile = Some("c1".into());
+            overview.canvas_pan = (100_000.0, 100_000.0);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        overview.update(vcx, |overview, _| {
+            assert!(overview.hovered_tile.is_none());
+        });
+    }
+
     /// End to end over the real UI path the canvas uses: a chat with a
     /// harness session gets a `SCAN_CHAT_SUBAGENTS` request from `rows()`,
     /// the reply lands in `subagents`, the row's `subagent_count` (tile
@@ -10223,6 +10826,11 @@ mod logic_tests {
                 zeron_rpc::RpcClient::new(out, inbound),
             ));
             let mut chat = row_ex("c1", "/r", None, 0, false).chat;
+            chat.title =
+                Some("A deliberately long canvas title that needs the second hover line".into());
+            chat.branch = Some("feature/canvas-hover-details".into());
+            chat.last_message_preview =
+                Some("Finished the compact card layout and verified its interactions".into());
             chat.harness_session_id = Some("s1".into());
             chat.last_message_at = Some(Utc::now());
             state.chats = vec![chat];
@@ -10296,6 +10904,16 @@ mod logic_tests {
         let tile = vcx
             .debug_bounds("overview-tile-body")
             .expect("tile rendered");
+        let resting_title = vcx
+            .debug_bounds("overview-tile-title")
+            .expect("resting title rendered");
+        assert!(
+            vcx.debug_bounds("overview-tile-hover-branch").is_none()
+                && vcx
+                    .debug_bounds("overview-tile-hover-last-message")
+                    .is_none(),
+            "hover-only metadata stays out of the resting card"
+        );
         assert!(
             vcx.debug_bounds("overview-card-model").is_some(),
             "card renders model metadata"
@@ -10324,8 +10942,29 @@ mod logic_tests {
         vcx.simulate_mouse_move(tile.center(), None, gpui::Modifiers::default());
         vcx.run_until_parked();
         overview.update(vcx, |overview, _| {
-            assert_eq!(overview.hovered_subagents.as_deref(), Some("c1"));
+            assert_eq!(overview.hovered_tile.as_deref(), Some("c1"));
         });
+        let hovered_tile = vcx
+            .debug_bounds("overview-tile-body")
+            .expect("hovered tile rendered");
+        let hovered_title = vcx
+            .debug_bounds("overview-tile-title")
+            .expect("hovered title rendered");
+        assert!(
+            hovered_title.size.height > resting_title.size.height,
+            "hover expands the title from one line to two: {resting_title:?} -> {hovered_title:?}"
+        );
+        assert!(
+            vcx.debug_bounds("overview-tile-hover-branch").is_some()
+                && vcx
+                    .debug_bounds("overview-tile-hover-last-message")
+                    .is_some(),
+            "hover reveals branch and two-line last-message synopsis"
+        );
+        assert!(
+            hovered_tile.size.height > tile.size.height,
+            "hovered card floats taller without repacking: {tile:?} -> {hovered_tile:?}"
+        );
         assert!(vcx.debug_bounds("overview-subagent-more").is_none());
         let block = vcx
             .debug_bounds("overview-tile-subagents")

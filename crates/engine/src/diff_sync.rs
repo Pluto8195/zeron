@@ -38,13 +38,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary};
+use zeron_proto::{Chat, CheckoutDiff, DiffFileSummary, SubmoduleDiffSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
@@ -56,6 +57,14 @@ mod git_status;
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_DIFF_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+/// Recursive gitlink inspection is deliberately shallow and repository-bounded.
+const MAX_SUBMODULE_DEPTH: usize = 2;
+/// Each expanded repository costs up to seven short-lived Git processes. Keep
+/// watcher-driven refreshes comfortably below the previous ~250-process worst
+/// case while still covering ordinary multi-submodule workspaces.
+const MAX_EXPANDED_SUBMODULES: usize = 8;
+/// Shared across every nested name-status, numstat, and raw-tree capture.
+const MAX_SUBMODULE_METADATA_BYTES: usize = 2 * 1024 * 1024;
 /// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Slow repair pass: re-reconcile + re-sync every checkout.
@@ -83,6 +92,8 @@ pub struct DiffSidecar {
     pub head_sha: Option<String>,
     pub patch: String,
     pub files: Vec<DiffFileSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submodules: Vec<SubmoduleDiffSummary>,
     pub additions: u32,
     pub deletions: u32,
     pub truncated: bool,
@@ -98,6 +109,7 @@ pub struct DiffSnapshot {
     pub head_sha: Option<String>,
     pub patch: String,
     pub files: Vec<DiffFileSummary>,
+    pub submodules: Vec<SubmoduleDiffSummary>,
     pub additions: u32,
     pub deletions: u32,
     pub truncated: bool,
@@ -403,7 +415,10 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, fresh: bool) {
         };
         // Stamp the row's checkoutId so every device groups this chat correctly.
         if chat.checkout_id.as_deref() != Some(identity.id.as_str())
-            && let Err(err) = inner.workspace.set_chat_checkout(&chat.id, &identity.id)
+            && let Err(err) =
+                inner
+                    .workspace
+                    .set_chat_checkout_for_cwd(&chat.id, &cwd, &identity.id)
         {
             tracing::debug!(chat = %chat.id, error = %err, "diff-sync: checkoutId write failed");
         }
@@ -661,6 +676,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         cwd: entry.identity.root.to_string_lossy().to_string(),
         patch: snapshot.patch.clone(),
         files: snapshot.files.clone(),
+        submodules: snapshot.submodules.clone(),
         additions: snapshot.additions,
         deletions: snapshot.deletions,
         truncated: snapshot.truncated,
@@ -687,6 +703,7 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 head_sha: snapshot.head_sha.clone(),
                 patch: snapshot.patch.clone(),
                 files: snapshot.files.clone(),
+                submodules: snapshot.submodules.clone(),
                 additions: snapshot.additions,
                 deletions: snapshot.deletions,
                 truncated: snapshot.truncated,
@@ -795,60 +812,66 @@ struct Capture {
 
 /// Run git capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
-async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
-    let mut cmd = tokio::process::Command::new("git");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.as_std_mut().creation_flags(0x08000000);
-    }
-    cmd.arg("-C").arg(cwd).args(args);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
-    let mut out: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut truncated = false;
-    loop {
-        let n = stdout
-            .read(&mut buf)
+fn capture_git<'a>(
+    cwd: &'a Path,
+    args: &'a [&'a str],
+    max_bytes: usize,
+) -> BoxFuture<'a, Result<Capture, EngineError>> {
+    Box::pin(async move {
+        let mut cmd = tokio::process::Command::new("git");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut().creation_flags(0x08000000);
+        }
+        cmd.arg("-C").arg(cwd).args(args);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut truncated = false;
+        loop {
+            let n = stdout
+                .read(&mut buf)
+                .await
+                .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(out.len());
+            if n > remaining {
+                out.extend_from_slice(&buf[..remaining]);
+                truncated = true;
+                let _ = child.start_kill();
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        let output = child
+            .wait_with_output()
             .await
-            .map_err(|e| EngineError::Other(format!("git read failed: {e}")))?;
-        if n == 0 {
-            break;
+            .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
+        if !output.status.success() && !truncated {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = stderr.trim();
+            return Err(EngineError::Other(if message.is_empty() {
+                format!("git exited {}", output.status)
+            } else {
+                format!("git: {message}")
+            }));
         }
-        let remaining = max_bytes.saturating_sub(out.len());
-        if n > remaining {
-            out.extend_from_slice(&buf[..remaining]);
-            truncated = true;
-            let _ = child.start_kill();
-            break;
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
-    if !output.status.success() && !truncated {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr.trim();
-        return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
-        } else {
-            format!("git: {message}")
-        }));
-    }
-    Ok(Capture {
-        stdout: out,
-        truncated,
+        Ok(Capture {
+            stdout: out,
+            truncated,
+        })
     })
 }
 
@@ -932,6 +955,494 @@ fn apply_numstat(files: &mut [DiffFileSummary], value: &[u8]) {
             file.binary = adds == "-" || dels == "-";
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RawDiffEntry {
+    old_mode: u32,
+    new_mode: u32,
+    old_oid: String,
+    new_oid: String,
+    status: char,
+    old_path: Option<String>,
+    path: String,
+}
+
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn zero_object_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte == b'0')
+}
+
+/// Parse `git diff --raw -z --no-abbrev`. With `-z`, the header, old path,
+/// and (for rename/copy) new path are separate NUL records.
+fn parse_raw_diff(value: &[u8]) -> Result<Vec<RawDiffEntry>, EngineError> {
+    let records: Vec<&[u8]> = value.split(|byte| *byte == 0).collect();
+    let mut entries = Vec::new();
+    let mut i = 0usize;
+    while i < records.len() {
+        let header = records[i];
+        i += 1;
+        if header.is_empty() {
+            continue;
+        }
+        let header = std::str::from_utf8(header)
+            .map_err(|_| EngineError::Other("invalid raw diff header".into()))?;
+        let header = header
+            .strip_prefix(':')
+            .ok_or_else(|| EngineError::Other("invalid raw diff record".into()))?;
+        let mut fields = header.split_ascii_whitespace();
+        let old_mode = u32::from_str_radix(fields.next().unwrap_or_default(), 8)
+            .map_err(|_| EngineError::Other("invalid raw diff old mode".into()))?;
+        let new_mode = u32::from_str_radix(fields.next().unwrap_or_default(), 8)
+            .map_err(|_| EngineError::Other("invalid raw diff new mode".into()))?;
+        let old_oid = fields.next().unwrap_or_default().to_ascii_lowercase();
+        let new_oid = fields.next().unwrap_or_default().to_ascii_lowercase();
+        let status_field = fields.next().unwrap_or_default();
+        let status = status_field.chars().next().unwrap_or('M');
+        if !valid_object_id(&old_oid) || !valid_object_id(&new_oid) {
+            return Err(EngineError::Other("invalid raw diff object id".into()));
+        }
+        let first = records
+            .get(i)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| EngineError::Other("raw diff path missing".into()))?;
+        i += 1;
+        let first = String::from_utf8_lossy(first).into_owned();
+        let renamed = matches!(status, 'R' | 'C');
+        let second = if renamed {
+            let path = records
+                .get(i)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| EngineError::Other("raw diff destination missing".into()))?;
+            i += 1;
+            Some(String::from_utf8_lossy(path).into_owned())
+        } else {
+            None
+        };
+        entries.push(RawDiffEntry {
+            old_mode,
+            new_mode,
+            old_oid,
+            new_oid,
+            status,
+            old_path: renamed.then_some(first.clone()),
+            path: second.unwrap_or(first),
+        });
+    }
+    Ok(entries)
+}
+
+fn join_git_path(parent: Option<&str>, child: &str) -> String {
+    match parent {
+        Some(parent) if !parent.is_empty() => format!("{parent}/{child}"),
+        _ => child.to_string(),
+    }
+}
+
+async fn declared_submodule(parent_root: &Path, path: &str, target_revision: Option<&str>) -> bool {
+    let config = if let Some(target_revision) = target_revision {
+        if !valid_object_id(target_revision) {
+            return false;
+        }
+        let blob = format!("{target_revision}:.gitmodules");
+        Box::pin(capture_git(
+            parent_root,
+            &[
+                "config",
+                "--null",
+                "--blob",
+                &blob,
+                "--get-regexp",
+                "^submodule\\..*\\.path$",
+            ],
+            256 * 1024,
+        ))
+        .await
+    } else {
+        let modules = parent_root.join(".gitmodules");
+        let Ok(metadata) = tokio::fs::symlink_metadata(&modules).await else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return false;
+        }
+        let modules = modules.to_string_lossy().into_owned();
+        Box::pin(capture_git(
+            parent_root,
+            &[
+                "config",
+                "--null",
+                "--file",
+                &modules,
+                "--get-regexp",
+                "^submodule\\..*\\.path$",
+            ],
+            256 * 1024,
+        ))
+        .await
+    };
+    let Ok(config) = config else {
+        return false;
+    };
+    config.stdout.split(|byte| *byte == 0).any(|record| {
+        record
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .is_some_and(|separator| &record[separator + 1..] == path.as_bytes())
+    })
+}
+
+/// Resolve an initialized nested repository without following any symlink and
+/// without allowing an uninitialized directory to fall through to its parent.
+async fn resolve_submodule_root(
+    checkout_root: &Path,
+    repository_path: &str,
+) -> Result<PathBuf, EngineError> {
+    let relative = validate_diff_path(repository_path)?;
+    let canonical_checkout = tokio::fs::canonicalize(checkout_root)
+        .await
+        .map_err(|error| EngineError::Other(format!("canonical checkout: {error}")))?;
+    let mut candidate = checkout_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(EngineError::Other("submodule path escapes checkout".into()));
+        };
+        candidate.push(component);
+        let metadata = tokio::fs::symlink_metadata(&candidate)
+            .await
+            .map_err(|error| EngineError::Other(format!("submodule unavailable: {error}")))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(EngineError::Other(
+                "submodule path is not a real directory".into(),
+            ));
+        }
+    }
+    let canonical = tokio::fs::canonicalize(&candidate)
+        .await
+        .map_err(|error| EngineError::Other(format!("canonical submodule: {error}")))?;
+    if canonical == canonical_checkout || !canonical.starts_with(&canonical_checkout) {
+        return Err(EngineError::Other("submodule escapes checkout".into()));
+    }
+    let top = Box::pin(capture_git(
+        &canonical,
+        &["rev-parse", "--show-toplevel"],
+        16 * 1024,
+    ))
+    .await?;
+    let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim().to_string());
+    let canonical_top = tokio::fs::canonicalize(top)
+        .await
+        .map_err(|error| EngineError::Other(format!("canonical submodule root: {error}")))?;
+    if canonical_top != canonical {
+        return Err(EngineError::Other(
+            "submodule repository root does not match its path".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+async fn commit_exists(root: &Path, revision: &str) -> bool {
+    if !valid_object_id(revision) || zero_object_id(revision) {
+        return false;
+    }
+    let spec = format!("{revision}^{{commit}}");
+    Box::pin(capture_git(root, &["cat-file", "-e", &spec], 1))
+        .await
+        .is_ok()
+}
+
+struct SubmoduleBudget {
+    remaining_patch: usize,
+    remaining_metadata: usize,
+    sections: usize,
+    truncated: bool,
+}
+
+impl SubmoduleBudget {
+    fn metadata_cap(&self) -> usize {
+        self.remaining_metadata
+    }
+
+    fn consume_metadata(&mut self, capture: &Capture) {
+        self.remaining_metadata = self.remaining_metadata.saturating_sub(capture.stdout.len());
+        if capture.truncated {
+            self.remaining_metadata = 0;
+            self.truncated = true;
+        }
+    }
+}
+
+struct PendingSubmodules {
+    parent_root: PathBuf,
+    parent_repository_path: Option<String>,
+    entries: Vec<RawDiffEntry>,
+    worktree_target: bool,
+    declaration_target: Option<String>,
+    depth: usize,
+}
+
+async fn capture_submodule_sections(
+    checkout_root: &Path,
+    raw: &Capture,
+    worktree_target: bool,
+    target_revision: Option<&str>,
+    remaining_patch: usize,
+) -> Result<(Vec<SubmoduleDiffSummary>, bool), EngineError> {
+    if raw.truncated {
+        return Ok((Vec::new(), true));
+    }
+    let mut budget = SubmoduleBudget {
+        remaining_patch,
+        remaining_metadata: MAX_SUBMODULE_METADATA_BYTES,
+        sections: 0,
+        truncated: false,
+    };
+    let entries = match parse_raw_diff(&raw.stdout) {
+        Ok(entries) => entries,
+        Err(_) => return Ok((Vec::new(), true)),
+    };
+    let mut pending = std::collections::VecDeque::from([PendingSubmodules {
+        parent_root: checkout_root.to_path_buf(),
+        parent_repository_path: None,
+        entries,
+        worktree_target,
+        declaration_target: target_revision.map(str::to_string),
+        depth: 1,
+    }]);
+    let mut sections = Vec::new();
+
+    while let Some(batch) = pending.pop_front() {
+        for entry in batch.entries {
+            if entry.old_mode != 0o160000 && entry.new_mode != 0o160000 {
+                continue;
+            }
+            if budget.sections >= MAX_EXPANDED_SUBMODULES {
+                budget.truncated = true;
+                break;
+            }
+            budget.sections += 1;
+            let repository_path =
+                join_git_path(batch.parent_repository_path.as_deref(), &entry.path);
+            let old_revision = (!zero_object_id(&entry.old_oid)).then(|| entry.old_oid.clone());
+            let mut new_revision = (!zero_object_id(&entry.new_oid)).then(|| entry.new_oid.clone());
+            let mut section = SubmoduleDiffSummary {
+                repository_path: repository_path.clone(),
+                parent_repository_path: batch.parent_repository_path.clone(),
+                old_revision,
+                new_revision: new_revision.clone(),
+                expanded: false,
+                patch: String::new(),
+                files: Vec::new(),
+                additions: 0,
+                deletions: 0,
+                truncated: false,
+            };
+
+            // Added/removed/type-changed/renamed gitlinks remain SHA-only.
+            if entry.old_mode != 0o160000
+                || entry.new_mode != 0o160000
+                || entry.old_path.is_some()
+                || !matches!(entry.status, 'M' | 'T')
+                || batch.depth > MAX_SUBMODULE_DEPTH
+            {
+                if batch.depth > MAX_SUBMODULE_DEPTH {
+                    budget.truncated = true;
+                }
+                sections.push(section);
+                continue;
+            }
+            if !Box::pin(declared_submodule(
+                &batch.parent_root,
+                &entry.path,
+                batch.declaration_target.as_deref(),
+            ))
+            .await
+            {
+                sections.push(section);
+                continue;
+            }
+            let nested_root =
+                match Box::pin(resolve_submodule_root(&batch.parent_root, &entry.path)).await {
+                    Ok(root) => root,
+                    Err(_) => {
+                        sections.push(section);
+                        continue;
+                    }
+                };
+            if batch.worktree_target {
+                new_revision = Box::pin(capture_git(
+                    &nested_root,
+                    &["rev-parse", "--verify", "HEAD"],
+                    256,
+                ))
+                .await
+                .ok()
+                .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
+                .filter(|revision| valid_object_id(revision));
+                section.new_revision = new_revision.clone();
+            }
+            let (Some(old_revision), Some(new_revision)) =
+                (section.old_revision.as_deref(), new_revision.as_deref())
+            else {
+                sections.push(section);
+                continue;
+            };
+            if old_revision == new_revision {
+                sections.push(section);
+                continue;
+            }
+
+            if budget.remaining_metadata == 0 {
+                section.truncated = true;
+                budget.truncated = true;
+                sections.push(section);
+                continue;
+            }
+
+            let names = match Box::pin(capture_git(
+                &nested_root,
+                &[
+                    "diff",
+                    "--name-status",
+                    "-z",
+                    "--find-renames",
+                    old_revision,
+                    new_revision,
+                    "--",
+                ],
+                budget.metadata_cap(),
+            ))
+            .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    sections.push(section);
+                    continue;
+                }
+            };
+            budget.consume_metadata(&names);
+            let nums = if budget.remaining_metadata == 0 {
+                None
+            } else {
+                match Box::pin(capture_git(
+                    &nested_root,
+                    &[
+                        "diff",
+                        "--numstat",
+                        "-z",
+                        "--find-renames",
+                        old_revision,
+                        new_revision,
+                        "--",
+                    ],
+                    budget.metadata_cap(),
+                ))
+                .await
+                {
+                    Ok(value) => {
+                        budget.consume_metadata(&value);
+                        Some(value)
+                    }
+                    Err(_) => {
+                        sections.push(section);
+                        continue;
+                    }
+                }
+            };
+            let patch = match Box::pin(capture_git(
+                &nested_root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-color",
+                    "--find-renames",
+                    "--unified=3",
+                    old_revision,
+                    new_revision,
+                    "--",
+                ],
+                budget.remaining_patch,
+            ))
+            .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    sections.push(section);
+                    continue;
+                }
+            };
+            let nested_raw = if budget.remaining_metadata == 0 {
+                None
+            } else {
+                let capture = Box::pin(capture_git(
+                    &nested_root,
+                    &[
+                        "diff",
+                        "--raw",
+                        "-z",
+                        "--no-abbrev",
+                        "--find-renames",
+                        old_revision,
+                        new_revision,
+                        "--",
+                    ],
+                    budget.metadata_cap(),
+                ))
+                .await
+                .ok();
+                if let Some(capture) = capture.as_ref() {
+                    budget.consume_metadata(capture);
+                }
+                capture
+            };
+
+            section.files = parse_name_status(&names.stdout);
+            if let Some(nums) = nums.as_ref() {
+                apply_numstat(&mut section.files, &nums.stdout);
+            }
+            section.patch = String::from_utf8_lossy(&patch.stdout).into_owned();
+            section.truncated = names.truncated
+                || nums.is_none()
+                || nums.as_ref().is_some_and(|nums| nums.truncated)
+                || patch.truncated
+                || nested_raw.is_none()
+                || nested_raw.as_ref().is_some_and(|raw| raw.truncated);
+            if patch.truncated {
+                let boundary = section.patch.rfind('\n').unwrap_or(0);
+                section.patch.truncate(boundary);
+            }
+            budget.remaining_patch = budget.remaining_patch.saturating_sub(section.patch.len());
+            section.additions = section.files.iter().map(|file| file.additions).sum();
+            section.deletions = section.files.iter().map(|file| file.deletions).sum();
+            section.expanded = true;
+            budget.truncated |= section.truncated;
+
+            if let Some(raw) = nested_raw.filter(|raw| !raw.truncated) {
+                match parse_raw_diff(&raw.stdout) {
+                    Ok(entries) if !entries.is_empty() => {
+                        pending.push_back(PendingSubmodules {
+                            parent_root: nested_root,
+                            parent_repository_path: Some(repository_path),
+                            entries,
+                            worktree_target: false,
+                            declaration_target: Some(new_revision.to_string()),
+                            depth: batch.depth + 1,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        section.truncated = true;
+                        budget.truncated = true;
+                    }
+                }
+            }
+            sections.push(section);
+        }
+    }
+    Ok((sections, budget.truncated))
 }
 
 fn quote_patch_path(path: &str) -> String {
@@ -1096,6 +1607,40 @@ pub(crate) async fn read_diff_file_text_at(
     })
 }
 
+/// Read a file from a server-produced submodule section. The repository path
+/// and revisions are revalidated locally; callers must still perform the same
+/// before/after snapshot checksum checks as root-file reads.
+pub(crate) async fn read_submodule_diff_file_text(
+    checkout_root: &Path,
+    section: &SubmoduleDiffSummary,
+    file: &DiffFileSummary,
+) -> Result<DiffFileTextPair, EngineError> {
+    if !section.expanded {
+        return Err(EngineError::Other("submodule diff is unavailable".into()));
+    }
+    let old = section
+        .old_revision
+        .as_deref()
+        .filter(|revision| valid_object_id(revision) && !zero_object_id(revision))
+        .ok_or_else(|| EngineError::Other("submodule old revision unavailable".into()))?;
+    let new = section
+        .new_revision
+        .as_deref()
+        .filter(|revision| valid_object_id(revision) && !zero_object_id(revision))
+        .ok_or_else(|| EngineError::Other("submodule new revision unavailable".into()))?;
+    let root = Box::pin(resolve_submodule_root(
+        checkout_root,
+        &section.repository_path,
+    ))
+    .await?;
+    if !Box::pin(commit_exists(&root, old)).await || !Box::pin(commit_exists(&root, new)).await {
+        return Err(EngineError::Other(
+            "submodule diff objects are unavailable".into(),
+        ));
+    }
+    Box::pin(read_diff_file_text_at(&root, old, Some(new), file)).await
+}
+
 /// Resolve the parent used as a commit diff's old side. Root commits compare
 /// against Git's canonical empty tree.
 pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
@@ -1128,7 +1673,7 @@ pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
 /// as synthesized new-file hunks. 3MiB patch cap with a `truncated` flag; sha256
 /// checksum over branch ‖ head ‖ patch ‖ files ‖ truncated.
 pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
-    capture_diff_against(repos, root, None).await
+    Box::pin(capture_diff_against(repos, root, None)).await
 }
 
 /// [`capture_diff`] with the diff base overridable: `None` keeps the
@@ -1167,6 +1712,20 @@ pub async fn capture_diff_against(
         2 * 1024 * 1024,
     )
     .await?;
+    let raw = capture_git(
+        root,
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--find-renames",
+            base,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
     let tracked = capture_git(
         root,
         &[
@@ -1199,7 +1758,8 @@ pub async fn capture_diff_against(
     let mut files = parse_name_status(&names.stdout);
     apply_numstat(&mut files, &nums.stdout);
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
-    let mut truncated = tracked.truncated || names.truncated || nums.truncated || status.truncated;
+    let mut truncated =
+        tracked.truncated || names.truncated || nums.truncated || raw.truncated || status.truncated;
 
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
@@ -1302,6 +1862,15 @@ pub async fn capture_diff_against(
         });
     }
 
+    let (submodules, submodules_truncated) = Box::pin(capture_submodule_sections(
+        root,
+        &raw,
+        true,
+        None,
+        MAX_PATCH_BYTES.saturating_sub(patch.len()),
+    ))
+    .await?;
+    truncated |= submodules_truncated;
     let additions: u32 = files.iter().map(|f| f.additions).sum();
     let deletions: u32 = files.iter().map(|f| f.deletions).sum();
     let files_json = serde_json::to_string(&files)
@@ -1314,6 +1883,10 @@ pub async fn capture_diff_against(
     hasher.update(patch.as_bytes());
     hasher.update([0u8]);
     hasher.update(files_json.as_bytes());
+    hasher.update([0u8]);
+    let submodules_json = serde_json::to_string(&submodules)
+        .map_err(|e| EngineError::Other(format!("submodule diffs serialize: {e}")))?;
+    hasher.update(submodules_json.as_bytes());
     hasher.update(if truncated { b"1" } else { b"0" });
     let checksum = crate::repos::hex(&hasher.finalize());
 
@@ -1323,6 +1896,7 @@ pub async fn capture_diff_against(
         head_sha: (!head.is_empty()).then_some(head),
         patch,
         files,
+        submodules,
         additions,
         deletions,
         truncated,
@@ -1372,6 +1946,21 @@ pub async fn capture_commit_diff(
         2 * 1024 * 1024,
     )
     .await?;
+    let raw = capture_git(
+        root,
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--find-renames",
+            &base,
+            sha,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
     let tracked = capture_git(
         root,
         &[
@@ -1390,12 +1979,21 @@ pub async fn capture_commit_diff(
     let mut files = parse_name_status(&names.stdout);
     apply_numstat(&mut files, &nums.stdout);
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
-    let truncated = tracked.truncated || names.truncated || nums.truncated;
+    let mut truncated = tracked.truncated || names.truncated || nums.truncated || raw.truncated;
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
         patch.push_str("\n# Comet diff truncated\n");
     }
+    let (submodules, submodules_truncated) = Box::pin(capture_submodule_sections(
+        root,
+        &raw,
+        false,
+        Some(sha),
+        MAX_PATCH_BYTES.saturating_sub(patch.len()),
+    ))
+    .await?;
+    truncated |= submodules_truncated;
     let additions: u32 = files.iter().map(|f| f.additions).sum();
     let deletions: u32 = files.iter().map(|f| f.deletions).sum();
     let files_json = serde_json::to_string(&files)
@@ -1408,6 +2006,10 @@ pub async fn capture_commit_diff(
     hasher.update(patch.as_bytes());
     hasher.update([0u8]);
     hasher.update(files_json.as_bytes());
+    hasher.update([0u8]);
+    let submodules_json = serde_json::to_string(&submodules)
+        .map_err(|e| EngineError::Other(format!("submodule diffs serialize: {e}")))?;
+    hasher.update(submodules_json.as_bytes());
     hasher.update(if truncated { b"1" } else { b"0" });
     let checksum = crate::repos::hex(&hasher.finalize());
     Ok(DiffSnapshot {
@@ -1416,6 +2018,7 @@ pub async fn capture_commit_diff(
         git_status: None,
         patch,
         files,
+        submodules,
         additions,
         deletions,
         truncated,
@@ -1530,6 +2133,21 @@ pub async fn capture_turn_diff(
         2 * 1024 * 1024,
     )
     .await?;
+    let raw = capture_git(
+        root,
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--find-renames",
+            turn_tree,
+            &current,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
     let tracked = capture_git(
         root,
         &[
@@ -1549,13 +2167,22 @@ pub async fn capture_turn_diff(
     let mut files = parse_name_status(&names.stdout);
     apply_numstat(&mut files, &nums.stdout);
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
-    let truncated = tracked.truncated || names.truncated || nums.truncated;
+    let mut truncated = tracked.truncated || names.truncated || nums.truncated || raw.truncated;
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
         patch.push_str("\n# Zeron diff truncated\n");
     }
 
+    let (submodules, submodules_truncated) = Box::pin(capture_submodule_sections(
+        root,
+        &raw,
+        false,
+        Some(&current),
+        MAX_PATCH_BYTES.saturating_sub(patch.len()),
+    ))
+    .await?;
+    truncated |= submodules_truncated;
     let additions: u32 = files.iter().map(|f| f.additions).sum();
     let deletions: u32 = files.iter().map(|f| f.deletions).sum();
     let files_json = serde_json::to_string(&files)
@@ -1568,6 +2195,10 @@ pub async fn capture_turn_diff(
     hasher.update(patch.as_bytes());
     hasher.update([0u8]);
     hasher.update(files_json.as_bytes());
+    hasher.update([0u8]);
+    let submodules_json = serde_json::to_string(&submodules)
+        .map_err(|e| EngineError::Other(format!("submodule diffs serialize: {e}")))?;
+    hasher.update(submodules_json.as_bytes());
     hasher.update(if truncated { b"1" } else { b"0" });
     let checksum = crate::repos::hex(&hasher.finalize());
 
@@ -1577,6 +2208,7 @@ pub async fn capture_turn_diff(
         git_status: None,
         patch,
         files,
+        submodules,
         additions,
         deletions,
         truncated,
@@ -1586,7 +2218,59 @@ pub async fn capture_turn_diff(
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
+    use super::{
+        Capture, CheckoutIdentity, MAX_EXPANDED_SUBMODULES, MAX_SUBMODULE_METADATA_BYTES,
+        MAX_WATCH_DIRS, SubmoduleBudget, exceeds_watch_budget, parse_raw_diff, watch_targets,
+    };
+
+    #[test]
+    fn submodule_metadata_budget_is_shared_and_hard_capped() {
+        assert!(MAX_EXPANDED_SUBMODULES <= 8);
+        let mut budget = SubmoduleBudget {
+            remaining_patch: 100,
+            remaining_metadata: MAX_SUBMODULE_METADATA_BYTES,
+            sections: 0,
+            truncated: false,
+        };
+        budget.consume_metadata(&Capture {
+            stdout: vec![0; MAX_SUBMODULE_METADATA_BYTES - 4],
+            truncated: false,
+        });
+        assert_eq!(budget.metadata_cap(), 4);
+        budget.consume_metadata(&Capture {
+            stdout: vec![0; 4],
+            truncated: true,
+        });
+        assert_eq!(budget.metadata_cap(), 0);
+        assert!(budget.truncated);
+    }
+
+    #[test]
+    fn raw_gitlink_records_keep_modes_oids_and_rename_paths() {
+        let old = "1".repeat(40);
+        let new = "2".repeat(40);
+        let modified = format!(":160000 160000 {old} {new} M\0deps/lib\0");
+        let parsed = parse_raw_diff(modified.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].old_mode, 0o160000);
+        assert_eq!(parsed[0].new_mode, 0o160000);
+        assert_eq!(parsed[0].path, "deps/lib");
+        assert_eq!(parsed[0].old_path, None);
+
+        let renamed = format!(":160000 160000 {old} {new} R100\0old/lib\0new/lib\0");
+        let parsed = parse_raw_diff(renamed.as_bytes()).unwrap();
+        assert_eq!(parsed[0].old_path.as_deref(), Some("old/lib"));
+        assert_eq!(parsed[0].path, "new/lib");
+    }
+
+    #[test]
+    fn malformed_raw_diff_is_rejected() {
+        assert!(parse_raw_diff(b":160000 160000 bad bad M\0deps/lib\0").is_err());
+        let old = "1".repeat(40);
+        let new = "2".repeat(40);
+        let missing_path = format!(":160000 160000 {old} {new} M\0");
+        assert!(parse_raw_diff(missing_path.as_bytes()).is_err());
+    }
 
     #[test]
     fn small_tree_is_watchable() {

@@ -971,6 +971,19 @@ impl AppState {
         }
     }
 
+    /// Replace one chat title in the shared presentation state and return its
+    /// previous value. The shell uses this for an immediate rename preview;
+    /// the registry watch remains authoritative and will reconcile the same
+    /// persisted value (or a newer remote edit) afterward.
+    pub(crate) fn replace_chat_title(
+        &mut self,
+        chat_id: &str,
+        title: Option<String>,
+    ) -> Option<Option<String>> {
+        let chat = self.chats.iter_mut().find(|chat| chat.id == chat_id)?;
+        Some(std::mem::replace(&mut chat.title, title))
+    }
+
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
         self.apply_sessions_at(sessions, Utc::now())
     }
@@ -1316,6 +1329,31 @@ impl AppState {
         if history_pending {
             self.transcript_replayed = false;
         }
+        Ok(())
+    }
+
+    /// Commit one prepared opening frame as a single presentation boundary.
+    ///
+    /// Frame application invalidates transcript consumers, while installing
+    /// the prepared rows used to happen after that invalidation in the watch
+    /// closure.  Keeping both here (with a final notify) makes startup
+    /// hydration deterministic even when the restored window otherwise has no
+    /// input events to drive another paint.
+    fn receive_prepared_opening_transcript_update(
+        &mut self,
+        chat_id: &str,
+        update: zeron_doc::TranscriptUpdate,
+        prepared: Arc<crate::transcript::PreparedTranscript>,
+        history_pending: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        if history_pending && self.transcript_replayed {
+            return Ok(());
+        }
+        self.receive_opening_transcript_update(update, history_pending, cx)?;
+        self.prepared_transcripts
+            .insert(chat_id.to_string(), prepared);
+        cx.notify();
         Ok(())
     }
 
@@ -2582,16 +2620,15 @@ fn spawn_transcript_watch(
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        if history_pending && state.transcript_replayed {
-                            return;
-                        }
-                        if let Err(err) =
-                            state.receive_opening_transcript_update(update, history_pending, cx)
-                        {
+                        if let Err(err) = state.receive_prepared_opening_transcript_update(
+                            &chat_id,
+                            update,
+                            prepared,
+                            history_pending,
+                            cx,
+                        ) {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
-                        } else {
-                            state.prepared_transcripts.insert(chat_id.clone(), prepared);
                         }
                     }
                 });
@@ -3411,6 +3448,70 @@ mod tests {
     }
 
     #[gpui::test]
+    fn restored_chat_full_hydration_repaints_without_a_user_mutation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| crate::transcript::Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("restored".into()), cx);
+        });
+
+        let preview = zeron_doc::TranscriptUpdate {
+            frame: TranscriptFrame::reset(&[]),
+            context_usage: None,
+            replay_baseline: Some(zeron_doc::TranscriptBaseline::default()),
+        };
+        let preview_prepared = crate::transcript::TranscriptPreparation::default()
+            .prepare(&preview)
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state
+                .receive_prepared_opening_transcript_update(
+                    "restored",
+                    preview,
+                    preview_prepared,
+                    true,
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(transcript.read(cx).rows().is_empty());
+            assert!(!state.read(cx).transcript_replayed);
+        });
+
+        let entries = vec![user_entry("history")];
+        let full = zeron_doc::TranscriptUpdate {
+            frame: TranscriptFrame::reset(&entries),
+            context_usage: None,
+            replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
+        };
+        let full_prepared = crate::transcript::TranscriptPreparation::default()
+            .prepare(&full)
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state
+                .receive_prepared_opening_transcript_update(
+                    "restored",
+                    full,
+                    full_prepared,
+                    false,
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(state.read(cx).transcript_replayed);
+            assert_eq!(state.read(cx).transcript[0].id, "history");
+            assert_eq!(transcript.read(cx).rows().len(), 1);
+        });
+    }
+
+    #[gpui::test]
     fn whale_transcript_revisit_is_synchronous_and_fresh_reset_wins(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         state.update(cx, |state, cx| {
@@ -4073,6 +4174,46 @@ mod tests {
         state.selected_chat = Some("b".into());
         state.apply_chats(vec![chat("b", 1, None), chat("c", 2, None)]);
         assert_eq!(state.selected_chat.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn optimistic_chat_title_updates_every_shared_consumer_and_can_roll_back() {
+        let mut state = AppState::new();
+        let mut row = chat("a", 0, None);
+        row.title = Some("Old name".into());
+        state.apply_chats(vec![row]);
+
+        let previous = state
+            .replace_chat_title("a", Some("Specific new name".into()))
+            .expect("chat exists");
+        assert_eq!(previous.as_deref(), Some("Old name"));
+        assert_eq!(
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == "a")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Specific new name")
+        );
+
+        state.replace_chat_title("a", previous);
+        assert_eq!(
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == "a")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Old name")
+        );
+        assert!(
+            state
+                .replace_chat_title("missing", Some("No-op".into()))
+                .is_none()
+        );
     }
 
     #[test]

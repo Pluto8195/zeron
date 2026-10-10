@@ -35,6 +35,9 @@ pub(super) struct CloseoutDialog {
     phase: CloseoutPhase,
     /// A `CLOSE_CHAT_WORKTREE` is in flight (ignore repeat clicks).
     submitting: bool,
+    /// Route-independent diff viewer. Repo Map does not mount the chat's
+    /// right-pane host, so close-out inspection lives inside this modal.
+    inspection: Option<Entity<Changes>>,
     /// The user completed the first of two force-close clicks. Cleared any
     /// time the dialog is reopened or its plan is refreshed.
     force_armed: bool,
@@ -95,6 +98,7 @@ impl Shell {
             request_id,
             phase,
             submitting: false,
+            inspection: None,
             force_armed: false,
             error: None,
         });
@@ -279,11 +283,96 @@ impl Shell {
         }
     }
 
+    fn inspect_closeout_commit(
+        &mut self,
+        cwd: String,
+        commit: zeron_proto::GitHistoryCommit,
+        cx: &mut Context<Self>,
+    ) {
+        let changes =
+            cx.new(|cx| Changes::for_commit_at_cwd(self.state.clone(), commit, Some(cwd), cx));
+        if let Some(dialog) = self.closeout_dialog.as_mut() {
+            dialog.inspection = Some(changes);
+            dialog.force_armed = false;
+        }
+        cx.notify();
+    }
+
+    fn inspect_closeout_worktree(&mut self, cwd: String, cx: &mut Context<Self>) {
+        let changes = cx.new(|cx| Changes::for_checkout(self.state.clone(), cwd, cx));
+        if let Some(dialog) = self.closeout_dialog.as_mut() {
+            dialog.inspection = Some(changes);
+            dialog.force_armed = false;
+        }
+        cx.notify();
+    }
+
+    fn close_closeout_inspection(&mut self, cx: &mut Context<Self>) {
+        let connected = self.state.read(cx).engine().is_some();
+        let mut refresh = false;
+        if let Some(dialog) = self.closeout_dialog.as_mut() {
+            dialog.inspection = None;
+            dialog.force_armed = false;
+            dialog.error = None;
+            if connected {
+                dialog.phase = CloseoutPhase::Loading;
+                refresh = true;
+            } else {
+                dialog.phase = CloseoutPhase::PlanFailed("Engine not connected".into());
+            }
+        }
+        if refresh {
+            self.fetch_closeout_plan(cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_closeout_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let inspection = self.closeout_dialog.as_ref()?.inspection.clone();
+        if let Some(changes) = inspection {
+            let theme = Theme::of(cx).for_popup();
+            changes.update(cx, |changes, cx| changes.ensure_content(cx));
+            let title = changes.read(cx).tab_title();
+            let controls = changes.update(cx, |changes, cx| changes.render_header_controls(cx));
+            let width = (f32::from(viewport.width) - 64.0).clamp(520.0, 1120.0);
+            let height = (f32::from(viewport.height) - 80.0).clamp(360.0, 820.0);
+            let card = popover::dialog_card(&theme)
+                .w(px(width))
+                .h(px(height))
+                .child(popover::dialog_title(
+                    &theme,
+                    &format!("Inspecting {title}"),
+                ))
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .flex_col()
+                        .child(crate::surface_chrome::toolbar(&theme).child(controls))
+                        .child(div().flex_1().min_h_0().child(changes)),
+                )
+                .child(
+                    div().mt(px(12.0)).flex().justify_end().child(
+                        popover::btn_ghost(&theme, "Back to close out", "closeout-inspection-back")
+                            .id("closeout-inspection-back")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.close_closeout_inspection(cx)),
+                            ),
+                    ),
+                )
+                .into_any_element();
+            return Some(popover::modal("chat-closeout-inspection", viewport, card));
+        }
         let dialog = self.closeout_dialog.as_ref()?;
         let theme = Theme::of(cx).for_popup();
         let code_family = crate::typography::code_effective_family_name(cx);
@@ -306,7 +395,8 @@ impl Shell {
                 CloseoutVerdict::Live
                 | CloseoutVerdict::NotWorktree
                 | CloseoutVerdict::OnDefaultBranch
-                | CloseoutVerdict::DirtyInspectionFailed,
+                | CloseoutVerdict::DirtyInspectionFailed
+                | CloseoutVerdict::InUse,
             ) => "Can\u{2019}t close out worktree",
             Some(CloseoutVerdict::NeedsForce) => "Force close out worktree?",
             _ => "Close out worktree?",
@@ -334,7 +424,6 @@ impl Shell {
                 body.push(small(err.clone(), theme.danger).into_any_element());
             }
             CloseoutPhase::Ready(plan) => {
-                let verdict = co::verdict(plan);
                 let summary = co::summary_rows(plan);
                 if !summary.is_empty() {
                     let rows = summary.into_iter().map(|(label, value)| {
@@ -360,10 +449,61 @@ impl Shell {
                     );
                 }
                 body.push(popover::dialog_body(&theme, co::body_copy(plan)).into_any_element());
-                if matches!(
-                    verdict,
-                    CloseoutVerdict::NeedsForce | CloseoutVerdict::DirtyInspectionFailed
-                ) {
+                if !plan.shared_chats.is_empty() {
+                    let mut chats = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .p(px(10.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.surface_raised)
+                        .child(small(
+                            "Other chats using this worktree".to_string(),
+                            theme.text_muted,
+                        ));
+                    for (index, chat) in plan.shared_chats.iter().enumerate() {
+                        let chat_id = chat.id.clone();
+                        chats = chats.child(
+                            div()
+                                .id(("closeout-shared-chat", index))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .text_color(theme.text)
+                                .hover(|element| element.bg(theme.element_hover))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.closeout_dialog = None;
+                                    this.open_chat(chat_id.clone(), cx);
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .child(SharedString::from(chat.title.clone())),
+                                )
+                                .child(small("Open chat →".to_string(), theme.accent)),
+                        );
+                    }
+                    body.push(chats.into_any_element());
+                }
+                // Show every discovered risk even when a harder blocker wins
+                // the verdict (for example a live chat with dirty files, or
+                // the default branch with unique commits). Close-out should
+                // never hide work merely because another condition blocks it.
+                if plan.dirty
+                    || plan.dirty_inspection_error.is_some()
+                    || plan.unmerged_commits > 0
+                    || plan.merge_inspection_error.is_some()
+                    || plan.default_branch.is_none()
+                {
                     let mut warnings = div()
                         .flex()
                         .flex_col()
@@ -379,12 +519,91 @@ impl Shell {
                             warnings = warnings
                                 .child(div().pl(px(10.0)).child(mono(line, theme.text_muted)));
                         }
+                        let cwd = dialog.cwd.clone();
+                        warnings = warnings.child(
+                            div()
+                                .id("closeout-view-uncommitted")
+                                .mt(px(3.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.surface_raised)
+                                .cursor_pointer()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text)
+                                .hover(|element| element.bg(theme.element_hover))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.inspect_closeout_worktree(cwd.clone(), cx)
+                                }))
+                                .child("View uncommitted changes →"),
+                        );
                     }
                     if let Some(line) = co::dirty_inspection_label(plan) {
                         warnings = warnings.child(small(line, theme.danger));
                     }
                     if let Some(line) = co::unmerged_label(plan) {
                         warnings = warnings.child(small(line, theme.danger));
+                        if plan.unmerged_commit_details.is_empty() {
+                            warnings = warnings.child(
+                                div().pl(px(10.0)).child(small(
+                                    "Commit details unavailable; check again after the engine refreshes."
+                                        .to_string(),
+                                    theme.text_muted,
+                                )),
+                            );
+                        } else {
+                            for (index, commit) in
+                                plan.unmerged_commit_details.iter().cloned().enumerate()
+                            {
+                                let short = commit.sha.chars().take(8).collect::<String>();
+                                let subject = if commit.subject.trim().is_empty() {
+                                    "Untitled commit".to_string()
+                                } else {
+                                    commit.subject.clone()
+                                };
+                                let label = format!("{short}  {subject}");
+                                let cwd = dialog.cwd.clone();
+                                warnings = warnings.child(
+                                    div()
+                                        .id(("closeout-unmerged-commit", index))
+                                        .px(px(8.0))
+                                        .py(px(5.0))
+                                        .rounded(px(5.0))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.surface_raised)
+                                        .cursor_pointer()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .font_family(code_family.clone())
+                                        .text_size(crate::typography::ui_rems(10.0))
+                                        .text_color(theme.text)
+                                        .hover(|element| element.bg(theme.element_hover))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.inspect_closeout_commit(
+                                                cwd.clone(),
+                                                commit.clone(),
+                                                cx,
+                                            )
+                                        }))
+                                        .child(SharedString::from(label)),
+                                );
+                            }
+                            let omitted = plan.unmerged_commits as usize
+                                - plan
+                                    .unmerged_commit_details
+                                    .len()
+                                    .min(plan.unmerged_commits as usize);
+                            if omitted > 0 {
+                                warnings = warnings.child(div().pl(px(10.0)).child(small(
+                                    format!("+{omitted} older commits not shown"),
+                                    theme.text_muted,
+                                )));
+                            }
+                        }
                     }
                     if let Some(line) = co::unverifiable_label(plan) {
                         warnings = warnings.child(small(line, theme.danger));
@@ -439,6 +658,7 @@ impl Shell {
             || matches!(
                 verdict,
                 Some(CloseoutVerdict::Live | CloseoutVerdict::DirtyInspectionFailed)
+                    | Some(CloseoutVerdict::InUse)
             ))
         .then(|| {
             popover::btn_ghost(&theme, "Check again", "closeout-recheck")
@@ -451,7 +671,10 @@ impl Shell {
             .child(popover::dialog_title(&theme, title))
             .child(
                 div()
+                    .id("closeout-body-scroll")
                     .mt(px(8.0))
+                    .max_h(px((f32::from(viewport.height) - 190.0).max(220.0)))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap(px(8.0))

@@ -129,6 +129,12 @@ impl CheckoutChangeRequests {
         cwd: &Path,
         branch: Option<&str>,
     ) -> Result<BoxStream<'static, CheckoutChangeRequestStatus>, ChangeRequestError> {
+        // Change-request watches are started automatically for persisted chat
+        // metadata. A historical cwd is display state, not permission to run
+        // Git or `gh` inside a macOS privacy-managed folder.
+        if crate::repos::is_automatic_access_blocked(cwd) {
+            return Err(ChangeRequestError::RepositoryUnavailable);
+        }
         let identity = self
             .inner
             .repos
@@ -530,6 +536,28 @@ mod tests {
         );
         let snapshot = stream.next().await.expect("opening snapshot");
         assert_eq!(snapshot.branch, "feature/sidebar");
+    }
+
+    #[tokio::test]
+    async fn automatic_watch_rejects_privacy_managed_paths_before_repo_inspection() {
+        let lookup = FakeLookup::new(source("main"), [Ok(Some(pull_request(90)))]);
+        let service = service(lookup.clone(), Timing::default());
+        let home = crate::repos::home_dir();
+
+        for child in ["Music", "Pictures", "Documents"] {
+            let error = match service
+                .watch_for_branch(&home.join(child).join("historical-chat"), Some("main"))
+                .await
+            {
+                Ok(_) => panic!("privacy-managed cwd must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error, ChangeRequestError::RepositoryUnavailable);
+        }
+        assert_eq!(lookup.resolve_count(), 0);
+        assert!(!crate::repos::is_automatic_access_blocked(
+            &home.join("Projects").join("zeron")
+        ));
     }
 
     #[tokio::test]

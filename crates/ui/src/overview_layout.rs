@@ -68,6 +68,18 @@ fn rect_contains(a: FreeRect, b: FreeRect) -> bool {
 /// runs inside `packRects` itself — belt-and-suspenders against the rare
 /// placement that still comes out overlapping at scale.
 pub fn pack_rects(items: &[PackItem], gap: f32) -> PackResult {
+    pack_rects_with_width_bias(items, gap, 1.15)
+}
+
+/// Pack peer groups into a compact, slightly landscape cluster. Group boxes
+/// are visually much larger than leaf cards; the wider target lets three or
+/// four similarly sized peers form a two-dimensional block instead of
+/// missing the second column by a few pixels and collapsing into a tall line.
+pub fn pack_group_rects(items: &[PackItem], gap: f32) -> PackResult {
+    pack_rects_with_width_bias(items, gap, 1.5)
+}
+
+fn pack_rects_with_width_bias(items: &[PackItem], gap: f32, width_bias: f32) -> PackResult {
     if items.is_empty() {
         return PackResult {
             positions: HashMap::new(),
@@ -92,7 +104,7 @@ pub fn pack_rects(items: &[PackItem], gap: f32) -> PackResult {
 
     let total_area: f32 = padded.iter().map(|it| it.w * it.h).sum();
     let max_w = padded.iter().map(|it| it.w).fold(0.0f32, f32::max);
-    let target_width = total_area.sqrt() * 1.15;
+    let target_width = total_area.sqrt() * width_bias;
     let target_width = target_width.max(max_w);
 
     let mut free_rects: Vec<FreeRect> = vec![FreeRect {
@@ -351,6 +363,32 @@ mod tests {
             })
             .collect();
         assert_no_overlaps(&rects);
+    }
+
+    #[test]
+    fn group_packing_turns_four_peer_boxes_into_a_two_dimensional_cluster() {
+        let items: Vec<PackItem> = (0..4)
+            .map(|i| PackItem {
+                id: format!("g{i}"),
+                width: 200.0,
+                height: 142.0,
+            })
+            .collect();
+        let result = pack_group_rects(&items, 28.0);
+        let xs: std::collections::BTreeSet<i64> = result
+            .positions
+            .values()
+            .map(|position| position.x as i64)
+            .collect();
+        let ys: std::collections::BTreeSet<i64> = result
+            .positions
+            .values()
+            .map(|position| position.y as i64)
+            .collect();
+        assert!(xs.len() > 1, "expected multiple columns: {result:?}");
+        assert!(ys.len() > 1, "expected multiple rows: {result:?}");
+        assert_eq!(result.width, 428.0);
+        assert_eq!(result.height, 312.0);
     }
 
     #[test]

@@ -1302,6 +1302,9 @@ fn decode_history_avatar(encoded: &str) -> Option<Arc<Image>> {
 
 pub struct GitHistory {
     state: Entity<AppState>,
+    /// Immutable identity of the chat that owns this History surface. The
+    /// registry may update that chat's target, but global selection cannot.
+    owner_chat_id: Option<String>,
     started: bool,
     target_key: Option<String>,
     commits: Vec<GitHistoryCommit>,
@@ -1937,6 +1940,26 @@ impl Render for GitHistoryCount {
 
 impl GitHistory {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let owner_chat_id = state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.id.clone());
+        Self::for_owner(state, owner_chat_id, cx)
+    }
+
+    pub(crate) fn for_chat(
+        state: Entity<AppState>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::for_owner(state, Some(chat_id), cx)
+    }
+
+    fn for_owner(
+        state: Entity<AppState>,
+        owner_chat_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = cx.observe(&state, |this, _, cx| {
             if this.started {
                 this.ensure_loaded(cx);
@@ -1944,6 +1967,7 @@ impl GitHistory {
         });
         Self {
             state,
+            owner_chat_id,
             started: false,
             target_key: None,
             commits: Vec::new(),
@@ -2001,11 +2025,16 @@ impl GitHistory {
 
     fn context(&self, cx: &App) -> Option<(String, String, Option<String>)> {
         let state = self.state.read(cx);
-        let chat = state.selected_chat_row()?;
+        let owner_chat_id = self.owner_chat_id.as_deref()?;
+        let chat = state.chats.iter().find(|chat| chat.id == owner_chat_id)?;
         let cwd = chat.cwd.clone()?;
         let target = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
             .then(|| chat.device_id.clone());
-        let key = format!("{}|{cwd}", target.as_deref().unwrap_or("local"));
+        let key = format!(
+            "{}|{}|{cwd}",
+            target.as_deref().unwrap_or("local"),
+            chat.checkout_id.as_deref().unwrap_or("")
+        );
         Some((key, cwd, target))
     }
 
@@ -4505,6 +4534,33 @@ impl Render for GitHistory {
 mod tests {
     use super::*;
 
+    fn chat(id: &str, cwd: &str, checkout_id: &str) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: id.into(),
+            device_id: "device".into(),
+            title: None,
+            archived: false,
+            cwd: Some(cwd.into()),
+            branch: Some("main".into()),
+            checkout_id: Some(checkout_id.into()),
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+            parent_chat_id: None,
+            linked_pr_url: None,
+            linked_pr_source: None,
+            linked_ticket_id: None,
+            linked_ticket_source: None,
+        }
+    }
+
     struct HistorySearchFocusHarness {
         composer: Entity<ComposerInput>,
         search: Entity<GitHistorySearchControl>,
@@ -4575,6 +4631,38 @@ mod tests {
         assert!(git_history_matches("plsh grph", &candidate));
         assert!(git_history_matches("A1B2", &candidate));
         assert!(!git_history_matches("terminal", &candidate));
+    }
+
+    #[test]
+    fn history_context_is_owned_not_globally_selected() {
+        let mut app = gpui::TestApp::new();
+        app.update(|cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.chats = vec![
+                    chat("chat-a", "/repo/a", "checkout-a"),
+                    chat("chat-b", "/repo/b", "checkout-b"),
+                ];
+                state.selected_chat = Some("chat-b".into());
+                state
+            });
+            let history = cx.new(|cx| GitHistory::for_chat(state.clone(), "chat-a".into(), cx));
+            let (key, cwd, _) = history.read(cx).context(cx).expect("owned context");
+            assert_eq!(cwd, "/repo/a");
+            assert!(key.contains("checkout-a"));
+
+            state.update(cx, |state, _| {
+                state.selected_chat = Some("chat-a".into());
+                state
+                    .chats
+                    .iter_mut()
+                    .find(|chat| chat.id == "chat-b")
+                    .unwrap()
+                    .cwd = Some("/repo/b-updated".into());
+            });
+            let (_, cwd, _) = history.read(cx).context(cx).expect("same owner");
+            assert_eq!(cwd, "/repo/a");
+        });
     }
 
     #[test]

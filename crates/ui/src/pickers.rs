@@ -138,6 +138,55 @@ pub enum CheckoutPlan {
     NewWorktree { base: Option<String> },
 }
 
+/// Explicit Repo Map handoff for a new-chat draft. This cannot depend on the
+/// asynchronous ref catalog: the user may type and send before refs finish
+/// loading, but the draft must still land in the exact inspected worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DraftWorktreeTarget {
+    path: String,
+    branch: String,
+}
+
+/// Display-only projection of [`DraftWorktreeTarget`]. The target remains the
+/// sole source of truth for dispatch; this is derived on every render so a
+/// Repo Map handoff cannot silently drift from what the composer will send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DraftWorktreeScope {
+    pub path: String,
+    pub worktree_name: String,
+    pub repo_name: String,
+    pub branch: String,
+}
+
+impl DraftWorktreeScope {
+    fn from_target(target: &DraftWorktreeTarget, repo_name: String) -> Self {
+        let worktree_name = std::path::Path::new(&target.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(target.path.as_str())
+            .to_string();
+        Self {
+            path: target.path.clone(),
+            worktree_name,
+            repo_name,
+            branch: target.branch.clone(),
+        }
+    }
+
+    fn chip_label(&self) -> SharedString {
+        format!("Exact · {}", self.worktree_name).into()
+    }
+
+    fn tooltip(&self) -> SharedString {
+        format!(
+            "Pinned exact worktree · {} · {} @ {} · {} · Click to inspect, change, or unpin",
+            self.worktree_name, self.repo_name, self.branch, self.path
+        )
+        .into()
+    }
+}
+
 /// The fully-resolved run configuration the composer sends: concrete harness,
 /// model and reasoning (never a "default" passthrough once the catalog is
 /// loaded), plus the explicit non-default option picks.
@@ -617,6 +666,9 @@ pub struct Pickers {
     /// New-chat worktree chip pick (`Main checkout` default, one-shot per new
     /// chat — taken + reset by the composer's first send; never persisted).
     workspace_choice: WorkspaceChoice,
+    /// One-shot exact worktree selected from Repo Map. Cleared by any manual
+    /// checkout/ref choice and when the draft becomes an actual chat.
+    draft_worktree_target: Option<DraftWorktreeTarget>,
     /// Per-chat outcome of that pick (pending/decided), shown as a badge in
     /// the session footer. In-memory: it narrates this app session's sends.
     workspace_outcomes: HashMap<String, WorkspaceOutcome>,
@@ -695,6 +747,7 @@ impl Pickers {
                 this.config.reasoning = None;
                 // Every new chat starts at Ask (per-chat only, no global).
                 this.config.auto_approve = false;
+                this.draft_worktree_target = None;
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
@@ -712,6 +765,7 @@ impl Pickers {
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
                 this.workspace_choice = WorkspaceChoice::default();
+                this.draft_worktree_target = None;
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
@@ -811,6 +865,7 @@ impl Pickers {
             import_bulk_task: None,
             import_bulk_confirm_pending: None,
             workspace_choice: WorkspaceChoice::default(),
+            draft_worktree_target: None,
             workspace_outcomes: HashMap::new(),
             carried_auto_approve: None,
             _search_events: search_events,
@@ -1644,6 +1699,7 @@ impl Pickers {
         if self.state.read(cx).selected_chat_row().is_some() {
             return;
         }
+        self.draft_worktree_target = None;
         if row.worktree_path.is_some() {
             // Reuse the ref's existing worktree ("Current worktree") — the
             // t3code `reuseExistingWorktree` path.
@@ -1704,6 +1760,7 @@ impl Pickers {
                 pickers.switching = None;
                 match result {
                     Ok(_) => {
+                        pickers.draft_worktree_target = None;
                         pickers.config.branch = Some(ref_name);
                         pickers.animate_close(cx);
                         pickers.ensure_refs(true, cx);
@@ -1718,6 +1775,13 @@ impl Pickers {
     }
 
     fn pick_checkout(&mut self, kind: CheckoutKind, cx: &mut Context<Self>) {
+        let cleared_exact_target = self.draft_worktree_target.take().is_some();
+        if cleared_exact_target && kind == CheckoutKind::Local {
+            // "Current checkout" means the project's checkout, not the
+            // branch that happened to be carried by the old exact-path pin.
+            self.config.branch = None;
+            self.workspace_choice = WorkspaceChoice::MainCheckout;
+        }
         if kind == CheckoutKind::Local
             && self.config.checkout == CheckoutKind::NewWorktree
             && self.selected_ref_worktree().is_none()
@@ -2157,11 +2221,20 @@ impl Pickers {
 
     /// The existing worktree the picked ref is materialized in, if any.
     fn selected_ref_worktree(&self) -> Option<String> {
+        if let Some(target) = &self.draft_worktree_target {
+            return Some(target.path.clone());
+        }
         self.selected_ref().and_then(|r| r.worktree_path.clone())
     }
 
     /// The resolved on-send checkout action for a new session.
     pub fn checkout_plan(&self) -> CheckoutPlan {
+        if let Some(target) = &self.draft_worktree_target {
+            return CheckoutPlan::ReuseWorktree {
+                path: target.path.clone(),
+                branch: target.branch.clone(),
+            };
+        }
         match self.config.checkout {
             CheckoutKind::NewWorktree => CheckoutPlan::NewWorktree {
                 base: self.effective_ref_name(),
@@ -2175,6 +2248,56 @@ impl Pickers {
                     branch: self.effective_ref_name(),
                 },
             },
+        }
+    }
+
+    /// Visible proof of an exact Repo Map handoff. Kept as a projection of
+    /// the on-send target rather than separately cached UI state.
+    pub(crate) fn draft_worktree_scope(&self, cx: &App) -> Option<DraftWorktreeScope> {
+        let target = self.draft_worktree_target.as_ref()?;
+        let repo_name = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .map(|space| space.display_name().to_string())
+            .unwrap_or_else(|| "Unknown repository".into());
+        Some(DraftWorktreeScope::from_target(target, repo_name))
+    }
+
+    /// Return a Repo Map-pinned draft to the selected project's ordinary
+    /// checkout. Branch/ref and workspace-choice defaults are reset together
+    /// so no stale part of the exact-path handoff survives invisibly.
+    fn clear_draft_worktree_target(&mut self, cx: &mut Context<Self>) {
+        self.draft_worktree_target = None;
+        self.config.checkout = CheckoutKind::Local;
+        self.config.branch = None;
+        self.workspace_choice = WorkspaceChoice::MainCheckout;
+        self.animate_close(cx);
+        cx.notify();
+    }
+
+    /// Point a fresh-chat draft at an already materialized worktree. Used by
+    /// Repo Map as both an entry point and an audit escape hatch for unmatched
+    /// worktrees.
+    pub(crate) fn target_existing_worktree(
+        &mut self,
+        path: String,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let branch = branch.unwrap_or_else(|| "HEAD".into());
+        self.config.checkout = CheckoutKind::Local;
+        self.config.branch = Some(branch.clone());
+        self.workspace_choice = WorkspaceChoice::MainCheckout;
+        self.draft_worktree_target = Some(DraftWorktreeTarget { path, branch });
+        cx.notify();
+    }
+
+    /// A genuinely fresh draft must not inherit a Repo Map pin when the user
+    /// presses `+` while already sitting on an unsent draft.
+    pub(crate) fn reset_new_session_scope(&mut self, cx: &mut Context<Self>) {
+        if self.draft_worktree_target.is_some() {
+            self.clear_draft_worktree_target(cx);
         }
     }
 
@@ -2310,14 +2433,17 @@ impl Pickers {
 
     /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
     /// `resolveCurrentWorkspaceLabel`).
-    fn checkout_label(&self) -> &'static str {
+    fn checkout_label(&self) -> SharedString {
+        if let Some(target) = &self.draft_worktree_target {
+            return DraftWorktreeScope::from_target(target, String::new()).chip_label();
+        }
         match self.config.checkout {
-            CheckoutKind::NewWorktree => "New worktree",
+            CheckoutKind::NewWorktree => "New worktree".into(),
             CheckoutKind::Local => {
                 if self.selected_ref_worktree().is_some() {
-                    "Current worktree"
+                    "Current worktree".into()
                 } else {
-                    "Current checkout"
+                    "Current checkout".into()
                 }
             }
         }
@@ -3691,14 +3817,22 @@ impl Pickers {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
             _ => crate::icons::FOLDER_WITH_FILES,
         };
-        let checkout_chip = self.footer_chip(
-            PickerKind::Checkout,
-            "picker-checkout",
-            kind_icon,
-            SharedString::from(self.checkout_label()),
-            &theme,
-            cx,
-        );
+        let exact_scope = self.draft_worktree_scope(cx);
+        let checkout_chip = self
+            .footer_chip(
+                PickerKind::Checkout,
+                "picker-checkout",
+                kind_icon,
+                self.checkout_label(),
+                &theme,
+                cx,
+            )
+            .when(exact_scope.is_some(), |chip| {
+                chip.bg(theme.accent.opacity(0.12)).text_color(theme.accent)
+            })
+            .when_some(exact_scope.map(|scope| scope.tooltip()), |chip, tooltip| {
+                chip.tooltip(move |_, cx| cx.new(|_| WorkspaceChipTooltip(tooltip.clone())).into())
+            });
         let branch_chip = self.footer_chip(
             PickerKind::Branch,
             "picker-branch",
@@ -3860,14 +3994,22 @@ impl Pickers {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
             _ => crate::icons::FOLDER_WITH_FILES,
         };
-        let kind_chip = self.footer_chip(
-            PickerKind::Checkout,
-            "picker-checkout",
-            kind_icon,
-            SharedString::from(self.checkout_label()),
-            &theme,
-            cx,
-        );
+        let exact_scope = self.draft_worktree_scope(cx);
+        let kind_chip = self
+            .footer_chip(
+                PickerKind::Checkout,
+                "picker-checkout",
+                kind_icon,
+                self.checkout_label(),
+                &theme,
+                cx,
+            )
+            .when(exact_scope.is_some(), |chip| {
+                chip.bg(theme.accent.opacity(0.12)).text_color(theme.accent)
+            })
+            .when_some(exact_scope.map(|scope| scope.tooltip()), |chip, tooltip| {
+                chip.tooltip(move |_, cx| cx.new(|_| WorkspaceChipTooltip(tooltip.clone())).into())
+            });
         // Match the floating draft's adjacent checkout/ref pair, including
         // while the newly created session is waiting for its workspace row.
         let left = div()
@@ -4205,8 +4347,11 @@ impl Pickers {
     /// rows — "Current checkout"/"Current worktree" (local) and "New worktree".
     fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
+        let exact_scope = self.draft_worktree_scope(cx);
         let has_worktree = self.selected_ref_worktree().is_some();
-        let local_label: &'static str = if has_worktree {
+        let local_label: &'static str = if exact_scope.is_some() {
+            "Pinned exact worktree"
+        } else if has_worktree {
             "Current worktree"
         } else {
             "Current checkout"
@@ -4230,6 +4375,77 @@ impl Pickers {
             .flex()
             .flex_col()
             .gap(px(2.0))
+            .when_some(exact_scope, |popover, scope| {
+                popover.child(
+                    div()
+                        .mx(px(6.0))
+                        .mb(px(4.0))
+                        .p(px(8.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(theme.accent.opacity(0.28))
+                        .bg(theme.accent.opacity(0.08))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.accent)
+                                .child(
+                                    crate::icons::icon(crate::icons::FOLDER_WITH_FILES)
+                                        .size(px(12.0)),
+                                )
+                                .child("EXACT WORKTREE PIN"),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(scope.worktree_name.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format!(
+                                    "{} @ {}",
+                                    scope.repo_name, scope.branch
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(scope.path.clone())),
+                        )
+                        .child(
+                            div()
+                                .id("checkout-clear-exact-worktree")
+                                .mt(px(3.0))
+                                .px(px(7.0))
+                                .py(px(4.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_muted)
+                                .hover(|el| el.bg(theme.element_hover).text_color(theme.text))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_draft_worktree_target(cx);
+                                }))
+                                .child("Use project checkout instead"),
+                        ),
+                )
+            })
             .children(
                 options
                     .into_iter()
@@ -6320,6 +6536,95 @@ mod tests {
             assert_eq!(pickers.space_target(cx).as_deref(), Some("remote"));
             assert_eq!(pickers.selected_space_index(cx), 0); // empty device
             assert!(pickers.target_generation >= 2);
+        });
+    }
+
+    #[gpui::test]
+    fn exact_worktree_scope_survives_ref_hydration_and_manual_choices_clear_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![Space {
+                id: "repo-space".into(),
+                device_id: "local".into(),
+                path: "/src/zeron".into(),
+                name: Some("Zeron".into()),
+                git_detected: true,
+                git_checked_at: None,
+                checkout_id: None,
+                created_at: chrono::Utc::now(),
+            }]);
+            state.selected_space = Some("repo-space".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.target_existing_worktree(
+                "/src/zeron/.worktrees/pr-42".into(),
+                Some("review/pr-42".into()),
+                cx,
+            );
+            assert_eq!(
+                pickers.draft_worktree_scope(cx),
+                Some(DraftWorktreeScope {
+                    path: "/src/zeron/.worktrees/pr-42".into(),
+                    worktree_name: "pr-42".into(),
+                    repo_name: "Zeron".into(),
+                    branch: "review/pr-42".into(),
+                })
+            );
+
+            // A late ListRefs result is display/catalog data only. It cannot
+            // redirect or erase the exact Repo Map handoff.
+            pickers.refs = Loadable::Ready(vec![RepoRef {
+                name: "other".into(),
+                current: true,
+                worktree_path: None,
+            }]);
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::ReuseWorktree {
+                    path: "/src/zeron/.worktrees/pr-42".into(),
+                    branch: "review/pr-42".into(),
+                }
+            );
+
+            // The checkout popover's ordinary project-checkout selection is
+            // the explicit unpin path.
+            pickers.pick_checkout(CheckoutKind::Local, cx);
+            assert!(pickers.draft_worktree_scope(cx).is_none());
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::CurrentCheckout {
+                    branch: Some("other".into())
+                }
+            );
+
+            // Retarget, then choose a worktree through the existing ref UI:
+            // the manual choice replaces the exact pin rather than leaving a
+            // hidden override behind.
+            pickers.target_existing_worktree(
+                "/src/zeron/.worktrees/pr-42".into(),
+                Some("review/pr-42".into()),
+                cx,
+            );
+            let manual = RepoRef {
+                name: "feature/manual".into(),
+                current: false,
+                worktree_path: Some("/src/zeron/.worktrees/manual".into()),
+            };
+            pickers.refs = Loadable::Ready(vec![manual.clone()]);
+            pickers.pick_ref(manual, cx);
+            assert!(pickers.draft_worktree_scope(cx).is_none());
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::ReuseWorktree {
+                    path: "/src/zeron/.worktrees/manual".into(),
+                    branch: "feature/manual".into(),
+                }
+            );
         });
     }
 

@@ -43,6 +43,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use zeron_proto::GitHistoryCommit;
 
 use crate::EngineError;
 use crate::pr_ticket_cache::{extract_ticket_id, workspace_submodule_paths};
@@ -411,6 +412,10 @@ fn merge_claude_dir(src: &Path, dst: &Path, failures: &mut usize) {
 /// Cap on `PLAN_CHAT_CLOSEOUT`'s `dirtyFiles` list — the UI shows a preview,
 /// not an exhaustive status; `dirty` itself is exact.
 const DIRTY_FILES_CAP: usize = 20;
+/// Commit metadata returned with a close-out plan. The exact count remains
+/// separate so an unusually long-lived branch cannot make the RPC response
+/// unbounded; the UI labels the omitted tail.
+const UNMERGED_COMMITS_CAP: usize = 100;
 /// Close-out scans embedded repositories as well as the outer checkout. Keep
 /// recursive repository discovery bounded, but never return a partial clean
 /// result if that bound is reached.
@@ -425,6 +430,13 @@ const WORKSPACE_ROOT_MARKER: &str = ".workspace-root";
 
 /// `PLAN_CHAT_CLOSEOUT`'s response. Wire field names are pinned by
 /// [`tests::closeout_plan_wire_shape_is_camel_case`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseoutChatReference {
+    pub id: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CloseoutPlan {
@@ -443,10 +455,19 @@ pub struct CloseoutPlan {
     /// this state, even when `force` is requested.
     pub dirty_inspection_error: Option<String>,
     pub unmerged_commits: u32,
+    /// Newest-first metadata for the commits that would be discarded. Each
+    /// row can be opened through the existing commit-diff surface.
+    #[serde(default)]
+    pub unmerged_commit_details: Vec<GitHistoryCommit>,
     /// Non-null when reachability against the default branch could not be
     /// established. A non-forced close is refused in this state.
     pub merge_inspection_error: Option<String>,
     pub default_branch: Option<String>,
+    /// Other non-archived chats currently attached to this checkout. Planning
+    /// reports them for inspection; the close RPC rechecks and refuses while
+    /// any remain attached.
+    #[serde(default)]
+    pub shared_chats: Vec<CloseoutChatReference>,
 }
 
 /// `CLOSE_CHAT_WORKTREE`'s response.
@@ -491,8 +512,10 @@ fn not_a_worktree(worktree_path: String, chat_live: bool, reason: String) -> Ins
             dirty_files: Vec::new(),
             dirty_inspection_error: None,
             unmerged_commits: 0,
+            unmerged_commit_details: Vec::new(),
             merge_inspection_error: None,
             default_branch: None,
+            shared_chats: Vec::new(),
         },
         repo: None,
         canonical: None,
@@ -568,29 +591,31 @@ fn inspect_worktree(cwd: &Path, chat_live: bool) -> Inspection {
     };
     let dirty_count = dirty_entries.len();
 
-    let (unmerged_commits, unmerged_error) = match (&branch, &default) {
-        (Some(b), Some(d)) if b != d => match count_unmerged(&canonical, d, b) {
-            Ok(n) => (n, None),
-            Err(e) => (0, Some(e)),
+    let (unmerged_commits, unmerged_commit_details, unmerged_error) = match (&branch, &default) {
+        (Some(b), Some(d)) if b != d => match inspect_unmerged(&canonical, d, b) {
+            Ok((count, commits)) => (count, commits, None),
+            Err(e) => (0, Vec::new(), Some(e)),
         },
         // A detached HEAD can still contain commits that are reachable from
         // no branch. Compare that exact worktree HEAD against the default;
         // using `repo` here would inspect the main checkout's HEAD instead.
-        (None, Some(d)) => match count_unmerged(&canonical, d, "HEAD") {
-            Ok(n) => (n, None),
-            Err(e) => (0, Some(e)),
+        (None, Some(d)) => match inspect_unmerged(&canonical, d, "HEAD") {
+            Ok((count, commits)) => (count, commits, None),
+            Err(e) => (0, Vec::new(), Some(e)),
         },
         (Some(branch), None) => (
             0,
+            Vec::new(),
             Some(format!(
                 "could not resolve the default branch to verify `{branch}` is merged"
             )),
         ),
         (None, None) => (
             0,
+            Vec::new(),
             Some("could not resolve the default branch to verify detached HEAD is merged".into()),
         ),
-        _ => (0, None),
+        _ => (0, Vec::new(), None),
     };
 
     Inspection {
@@ -603,8 +628,10 @@ fn inspect_worktree(cwd: &Path, chat_live: bool) -> Inspection {
             dirty_files: dirty_entries.into_iter().take(DIRTY_FILES_CAP).collect(),
             dirty_inspection_error: dirty_inspection_error.clone(),
             unmerged_commits,
+            unmerged_commit_details,
             merge_inspection_error: unmerged_error.clone(),
             default_branch: default,
+            shared_chats: Vec::new(),
         },
         repo: Some(repo),
         canonical: Some(canonical),
@@ -751,13 +778,71 @@ fn discover_nested_git_repositories(root: &Path) -> Result<Vec<PathBuf>, String>
     Ok(found)
 }
 
-/// `git rev-list --count <default>..<branch>`.
-fn count_unmerged(repo: &Path, default: &str, branch: &str) -> Result<u32, String> {
+/// Exact reachability count plus bounded, newest-first commit metadata for
+/// `git rev-list <default>..<branch>`. Both are one inspection contract: a
+/// count without rows would still leave the destructive blocker opaque.
+fn inspect_unmerged(
+    repo: &Path,
+    default: &str,
+    branch: &str,
+) -> Result<(u32, Vec<GitHistoryCommit>), String> {
     let range = format!("{default}..{branch}");
-    run_git(repo, &["rev-list", "--count", &range])?
+    let count: u32 = run_git(repo, &["rev-list", "--count", &range])?
         .trim()
         .parse()
-        .map_err(|e| format!("could not parse commit count for {range}: {e}"))
+        .map_err(|e| format!("could not parse commit count for {range}: {e}"))?;
+    if count == 0 {
+        return Ok((0, Vec::new()));
+    }
+
+    let max_count = format!("--max-count={UNMERGED_COMMITS_CAP}");
+    let output = run_git(
+        repo,
+        &[
+            "log",
+            "--topo-order",
+            &max_count,
+            "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
+            &range,
+        ],
+    )?;
+    let fields: Vec<&str> = output.split('\0').collect();
+    let commits: Vec<GitHistoryCommit> = fields
+        .chunks(6)
+        .filter_map(|record| {
+            if record.len() != 6 {
+                return None;
+            }
+            let sha = record[0].trim_start_matches(['\r', '\n']);
+            if sha.is_empty() {
+                return None;
+            }
+            Some(GitHistoryCommit {
+                sha: sha.to_string(),
+                parent_shas: record[1]
+                    .split_ascii_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                subject: bounded_commit_field(record[2], 4_096),
+                author_name: bounded_commit_field(record[3], 512),
+                author_email: bounded_commit_field(record[4], 512),
+                authored_at: bounded_commit_field(record[5], 128),
+                refs: Vec::new(),
+            })
+        })
+        .collect();
+    let expected = usize::min(count as usize, UNMERGED_COMMITS_CAP);
+    if commits.len() != expected {
+        return Err(format!(
+            "could not parse commit details for {range}: expected {expected}, got {}",
+            commits.len()
+        ));
+    }
+    Ok((count, commits))
+}
+
+fn bounded_commit_field(value: &str, cap: usize) -> String {
+    value.chars().take(cap).collect()
 }
 
 /// Absolute, canonical form of a `git rev-parse <flag>` path (git prints
@@ -1536,8 +1621,21 @@ mod tests {
             dirty_files: vec!["a.txt".into()],
             dirty_inspection_error: None,
             unmerged_commits: 3,
+            unmerged_commit_details: vec![GitHistoryCommit {
+                sha: "0123456789abcdef".into(),
+                parent_shas: vec!["fedcba9876543210".into()],
+                subject: "inspect close-out work".into(),
+                author_name: "Test".into(),
+                author_email: "test@example.com".into(),
+                authored_at: "2026-10-06T12:00:00-04:00".into(),
+                refs: Vec::new(),
+            }],
             merge_inspection_error: None,
             default_branch: Some("main".into()),
+            shared_chats: vec![CloseoutChatReference {
+                id: "chat-2".into(),
+                title: "Other work".into(),
+            }],
         };
         let value = serde_json::to_value(&plan).unwrap();
         let obj = value.as_object().unwrap();
@@ -1554,6 +1652,8 @@ mod tests {
                 "dirtyInspectionError",
                 "isWorktree",
                 "mergeInspectionError",
+                "sharedChats",
+                "unmergedCommitDetails",
                 "unmergedCommits",
                 "worktreePath"
             ]
@@ -1569,8 +1669,17 @@ mod tests {
         assert_eq!(value["dirtyFiles"], serde_json::json!(["a.txt"]));
         assert_eq!(value["dirtyInspectionError"], serde_json::Value::Null);
         assert_eq!(value["unmergedCommits"], serde_json::json!(3));
+        assert_eq!(
+            value["unmergedCommitDetails"][0]["sha"],
+            serde_json::json!("0123456789abcdef")
+        );
         assert_eq!(value["mergeInspectionError"], serde_json::Value::Null);
         assert_eq!(value["defaultBranch"], serde_json::json!("main"));
+        assert_eq!(value["sharedChats"][0]["id"], serde_json::json!("chat-2"));
+        assert_eq!(
+            value["sharedChats"][0]["title"],
+            serde_json::json!("Other work")
+        );
 
         let detached = CloseoutPlan {
             branch: None,
@@ -1580,6 +1689,11 @@ mod tests {
         let value = serde_json::to_value(&detached).unwrap();
         assert_eq!(value["branch"], serde_json::Value::Null);
         assert_eq!(value["defaultBranch"], serde_json::Value::Null);
+
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("sharedChats");
+        let decoded: CloseoutPlan = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.shared_chats.is_empty());
     }
 
     #[test]
@@ -1772,6 +1886,14 @@ mod tests {
         assert!(plan.is_worktree);
         assert!(!plan.dirty);
         assert_eq!(plan.unmerged_commits, 2);
+        assert_eq!(plan.unmerged_commit_details.len(), 2);
+        assert_eq!(plan.unmerged_commit_details[0].subject, "b.txt");
+        assert_eq!(plan.unmerged_commit_details[1].subject, "a.txt");
+        assert!(
+            plan.unmerged_commit_details
+                .iter()
+                .all(|commit| commit.sha.len() == 40)
+        );
     }
 
     #[test]
@@ -1783,6 +1905,8 @@ mod tests {
         assert!(plan.is_worktree);
         assert_eq!(plan.branch, None);
         assert_eq!(plan.unmerged_commits, 1);
+        assert_eq!(plan.unmerged_commit_details.len(), 1);
+        assert_eq!(plan.unmerged_commit_details[0].subject, "a.txt");
         assert_eq!(plan.merge_inspection_error, None);
         let err = close_err(&wt, false);
         assert!(err.contains("1 unmerged commit on HEAD"), "{err}");
